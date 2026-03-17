@@ -312,4 +312,12 @@ Balance {round(balance,2)}
 
         await asyncio.sleep(CHECK_EVERY)
 
-asyncio.run(run())
+import asyncio
+import time
+
+while True:
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        print("BOT ERROR:", e)
+        time.sleep(5)
