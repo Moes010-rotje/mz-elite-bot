@@ -17,7 +17,7 @@ TG_CHAT = os.environ.get("TG_CHAT")
 
 # ─── SETTINGS ──────────────────────────────
 
-CHECK_EVERY = 60
+CHECK_EVERY = 10
 RISK_PCT = 0.01
 MIN_RR = 2
 MAX_TRADES = 4
