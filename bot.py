@@ -57,6 +57,7 @@ def session_filter():
 # ---------------- NEWS FILTER ----------------
 
 def news_filter():
+    return True
 
     try:
 
