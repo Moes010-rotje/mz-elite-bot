@@ -42,6 +42,35 @@ def tg(msg):
         pass
 
 
+# ---------------- HEARTBEAT ----------------
+
+last_status=0
+
+def heartbeat(balance,equity,positions):
+
+    global last_status
+
+    now=time.time()
+
+    if now-last_status < 600:
+        return
+
+    last_status=now
+
+    tg(f"""
+BOT STATUS
+
+Balance: {round(balance,2)}
+Equity: {round(equity,2)}
+
+Open trades: {len(positions)}
+
+Scanning assets: {len(SYMBOLS)}
+
+Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
+""")
+
+
 # ---------------- SESSION FILTER ----------------
 
 def session_filter():
@@ -75,7 +104,6 @@ def news_filter():
             if e["impact"]!="High":
                 continue
 
-            # FIXED timestamp bug
             if isinstance(e["date"], int):
                 t=datetime.fromtimestamp(e["date"])
             else:
@@ -179,6 +207,64 @@ def liquidity_sweep(df):
         return "buy"
 
     return None
+
+
+# ---------------- LIQUIDITY POOL ----------------
+
+def liquidity_pool(df):
+
+    highs=df.high.tail(20)
+    lows=df.low.tail(20)
+
+    if abs(highs.max()-highs.iloc[-1]) < 0.0001:
+        return "sell_liquidity"
+
+    if abs(lows.min()-lows.iloc[-1]) < 0.0001:
+        return "buy_liquidity"
+
+    return None
+
+
+# ---------------- ORDER BLOCK ----------------
+
+def order_block(df):
+
+    last=df.iloc[-2]
+
+    body=abs(last.close-last.open)
+
+    range_candle=last.high-last.low
+
+    if body/range_candle > 0.6:
+
+        if last.close > last.open:
+            return "bull"
+
+        else:
+            return "bear"
+
+    return None
+
+
+# ---------------- CORRELATION FILTER ----------------
+
+def correlation_filter(symbol,positions):
+
+    usd_pairs=["EURUSD","GBPUSD","USDJPY","USDCHF"]
+
+    if symbol not in usd_pairs:
+        return True
+
+    count=0
+
+    for p in positions:
+        if p["symbol"] in usd_pairs:
+            count+=1
+
+    if count >=2:
+        return False
+
+    return True
 
 
 # ---------------- HTF TREND ----------------
@@ -311,6 +397,7 @@ async def run():
             info=await conn.get_account_information()
 
             balance=info["balance"]
+            equity=info["equity"]
 
             if not check_daily(balance):
                 await asyncio.sleep(60)
@@ -318,11 +405,15 @@ async def run():
 
             positions=await conn.get_positions()
 
+            heartbeat(balance,equity,positions)
+
             await trailing(conn)
 
             for symbol in SYMBOLS:
 
-                # FIXED candle fetch
+                if not correlation_filter(symbol,positions):
+                    continue
+
                 candles=await account.get_historical_candles(symbol,"5m",200)
 
                 df=pd.DataFrame(candles)
@@ -332,6 +423,21 @@ async def run():
                 s=signal(df)
 
                 if not s:
+                    continue
+
+                liq=liquidity_pool(df)
+                ob=order_block(df)
+
+                if s=="buy" and liq!="buy_liquidity":
+                    continue
+
+                if s=="sell" and liq!="sell_liquidity":
+                    continue
+
+                if s=="buy" and ob!="bull":
+                    continue
+
+                if s=="sell" and ob!="bear":
                     continue
 
                 price=await conn.get_symbol_price(symbol)
