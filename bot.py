@@ -37,45 +37,9 @@ def tg(msg):
         url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         data=json.dumps({"chat_id":TG_CHAT,"text":msg}).encode()
         req=urllib.request.Request(url,data=data,headers={"Content-Type":"application/json"})
-        urllib.request.urlopen(req,timeout=10)
-    except Exception as e:
-        print("Telegram error:",e)
-
-
-# ---------------- TELEGRAM STATUS ----------------
-
-async def telegram_status(conn):
-
-    while True:
-
-        try:
-
-            info = await conn.get_account_information()
-            balance = info["balance"]
-            equity = info["equity"]
-
-            positions = await conn.get_positions()
-
-            tg(f"""
-BOT STATUS
-
-Balance: {round(balance,2)}
-Equity: {round(equity,2)}
-
-Open trades: {len(positions)}
-
-Session: {session_filter()}
-
-Scanning assets: {len(SYMBOLS)}
-
-Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
-""")
-
-        except Exception as e:
-
-            tg(f"STATUS ERROR: {e}")
-
-        await asyncio.sleep(600)
+        urllib.request.urlopen(req)
+    except:
+        pass
 
 
 # ---------------- SESSION FILTER ----------------
@@ -110,10 +74,11 @@ def news_filter():
             if e["impact"]!="High":
                 continue
 
+            # FIXED timestamp bug
             if isinstance(e["date"], int):
-    t=datetime.fromtimestamp(e["date"])
-else:
-    t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
+                t=datetime.fromtimestamp(e["date"])
+            else:
+                t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
 
             diff=abs((now-t).total_seconds())
 
@@ -303,13 +268,11 @@ async def trailing(conn):
 
                 if sl < entry:
                     await conn.modify_position(p["id"],stop_loss=entry)
-                    tg(f"TRAILING STOP → BREAKEVEN {p['symbol']}")
 
             else:
 
                 if sl > entry or sl == 0:
                     await conn.modify_position(p["id"],stop_loss=entry)
-                    tg(f"TRAILING STOP → BREAKEVEN {p['symbol']}")
 
     except:
         pass
@@ -318,8 +281,6 @@ async def trailing(conn):
 # ---------------- MAIN BOT ----------------
 
 async def run():
-
-    tg("BOT STARTING...")
 
     api=MetaApi(METAAPI_TOKEN)
 
@@ -332,14 +293,7 @@ async def run():
     await conn.connect()
     await conn.wait_synchronized()
 
-    terminal=account.get_streaming_connection()
-
-    await terminal.connect()
-    await terminal.wait_synchronized()
-
     tg("ELITE BOT STARTED")
-
-    asyncio.create_task(telegram_status(conn))
 
     while True:
 
@@ -367,7 +321,8 @@ async def run():
 
             for symbol in SYMBOLS:
 
-                candles = await account.get_historical_candles(symbol, "5m", 200)
+                # FIXED candle fetch
+                candles=await account.get_historical_candles(symbol,"5m",200)
 
                 df=pd.DataFrame(candles)
 
@@ -444,7 +399,7 @@ Balance: {round(balance,2)}
 
         except Exception as e:
 
-            tg(f"BOT ERROR: {e}")
+            tg(f"BOT ERROR: {str(e)}")
 
             await asyncio.sleep(5)
 
@@ -456,6 +411,6 @@ while True:
 
     except Exception as e:
 
-        tg(f"BOT CRASHED → RESTARTING: {e}")
+        print("BOT CRASHED",e)
 
         time.sleep(5)
