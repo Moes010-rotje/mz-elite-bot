@@ -8,9 +8,9 @@ import logging
 from datetime import datetime, date
 from metaapi_cloud_sdk import MetaApi
 
-CHECK_INTERVAL = 15
+CHECK_INTERVAL = 5
 RISK = 0.01
-MIN_RR = 2
+MIN_RR = 1.5
 DAILY_LOSS_LIMIT = 0.03
 MAX_TRADES_PER_ASSET = 4
 
@@ -41,7 +41,6 @@ def tg(msg):
     except:
         pass
 
-
 # ---------------- HEARTBEAT ----------------
 
 last_status=0
@@ -70,56 +69,21 @@ Scanning assets: {len(SYMBOLS)}
 Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
 """)
 
-
 # ---------------- SESSION FILTER ----------------
 
 def session_filter():
 
     h=datetime.utcnow().hour
 
-    london = 7 <= h <= 11
-    newyork = 13 <= h <= 17
+    london = 6 <= h <= 12
+    newyork = 13 <= h <= 20
 
     return london or newyork
-
 
 # ---------------- NEWS FILTER ----------------
 
 def news_filter():
     return True
-
-    try:
-
-        now=datetime.utcnow()
-
-        url="https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-
-        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla"})
-        res=urllib.request.urlopen(req)
-
-        events=json.loads(res.read().decode())
-
-        for e in events:
-
-            if e["impact"]!="High":
-                continue
-
-            if isinstance(e["date"], int):
-                t=datetime.fromtimestamp(e["date"])
-            else:
-                t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
-
-            diff=abs((now-t).total_seconds())
-
-            if diff < 1800:
-                tg("NEWS FILTER ACTIVE")
-                return False
-
-        return True
-
-    except:
-        return True
-
 
 # ---------------- SPREAD FILTER ----------------
 
@@ -135,7 +99,6 @@ def spread_ok(symbol,spread):
         return spread < 50
 
     return True
-
 
 # ---------------- INDICATORS ----------------
 
@@ -160,7 +123,6 @@ def indicators(df):
 
     return df
 
-
 # ---------------- MARKET STRUCTURE ----------------
 
 def market_structure(df):
@@ -175,7 +137,6 @@ def market_structure(df):
         return "bear"
 
     return None
-
 
 # ---------------- FVG ----------------
 
@@ -192,7 +153,6 @@ def fair_value_gap(df):
 
     return None
 
-
 # ---------------- LIQUIDITY SWEEP ----------------
 
 def liquidity_sweep(df):
@@ -208,65 +168,6 @@ def liquidity_sweep(df):
 
     return None
 
-
-# ---------------- LIQUIDITY POOL ----------------
-
-def liquidity_pool(df):
-
-    highs=df.high.tail(20)
-    lows=df.low.tail(20)
-
-    if abs(highs.max()-highs.iloc[-1]) < 0.0001:
-        return "sell_liquidity"
-
-    if abs(lows.min()-lows.iloc[-1]) < 0.0001:
-        return "buy_liquidity"
-
-    return None
-
-
-# ---------------- ORDER BLOCK ----------------
-
-def order_block(df):
-
-    last=df.iloc[-2]
-
-    body=abs(last.close-last.open)
-
-    range_candle=last.high-last.low
-
-    if body/range_candle > 0.6:
-
-        if last.close > last.open:
-            return "bull"
-
-        else:
-            return "bear"
-
-    return None
-
-
-# ---------------- CORRELATION FILTER ----------------
-
-def correlation_filter(symbol,positions):
-
-    usd_pairs=["EURUSD","GBPUSD","USDJPY","USDCHF"]
-
-    if symbol not in usd_pairs:
-        return True
-
-    count=0
-
-    for p in positions:
-        if p["symbol"] in usd_pairs:
-            count+=1
-
-    if count >=2:
-        return False
-
-    return True
-
-
 # ---------------- HTF TREND ----------------
 
 def htf_trend(df):
@@ -281,7 +182,6 @@ def htf_trend(df):
         return "bear"
 
     return None
-
 
 # ---------------- SIGNAL ----------------
 
@@ -302,7 +202,6 @@ def signal(df):
 
     return None
 
-
 # ---------------- LOT SIZE ----------------
 
 def lot_size(balance,sl_distance):
@@ -314,7 +213,6 @@ def lot_size(balance,sl_distance):
     lot=max(0.01,min(lot,5))
 
     return round(lot,2)
-
 
 # ---------------- DAILY LOSS ----------------
 
@@ -336,7 +234,6 @@ def check_daily(balance):
         return False
 
     return True
-
 
 # ---------------- TRAILING ----------------
 
@@ -364,7 +261,6 @@ async def trailing(conn):
     except:
         pass
 
-
 # ---------------- MAIN BOT ----------------
 
 async def run():
@@ -390,10 +286,6 @@ async def run():
                 await asyncio.sleep(60)
                 continue
 
-            if not news_filter():
-                await asyncio.sleep(60)
-                continue
-
             info=await conn.get_account_information()
 
             balance=info["balance"]
@@ -411,9 +303,6 @@ async def run():
 
             for symbol in SYMBOLS:
 
-                if not correlation_filter(symbol,positions):
-                    continue
-
                 candles=await account.get_historical_candles(symbol,"5m",200)
 
                 df=pd.DataFrame(candles)
@@ -423,21 +312,6 @@ async def run():
                 s=signal(df)
 
                 if not s:
-                    continue
-
-                liq=liquidity_pool(df)
-                ob=order_block(df)
-
-                if s=="buy" and liq!="buy_liquidity":
-                    continue
-
-                if s=="sell" and liq!="sell_liquidity":
-                    continue
-
-                if s=="buy" and ob!="bull":
-                    continue
-
-                if s=="sell" and ob!="bear":
                     continue
 
                 price=await conn.get_symbol_price(symbol)
@@ -509,7 +383,6 @@ Balance: {round(balance,2)}
             tg(f"BOT ERROR: {str(e)}")
 
             await asyncio.sleep(5)
-
 
 while True:
 
