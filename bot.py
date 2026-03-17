@@ -37,9 +37,45 @@ def tg(msg):
         url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         data=json.dumps({"chat_id":TG_CHAT,"text":msg}).encode()
         req=urllib.request.Request(url,data=data,headers={"Content-Type":"application/json"})
-        urllib.request.urlopen(req)
-    except:
-        pass
+        urllib.request.urlopen(req,timeout=10)
+    except Exception as e:
+        print("Telegram error:",e)
+
+
+# ---------------- TELEGRAM STATUS ----------------
+
+async def telegram_status(conn):
+
+    while True:
+
+        try:
+
+            info = await conn.get_account_information()
+            balance = info["balance"]
+            equity = info["equity"]
+
+            positions = await conn.get_positions()
+
+            tg(f"""
+BOT STATUS
+
+Balance: {round(balance,2)}
+Equity: {round(equity,2)}
+
+Open trades: {len(positions)}
+
+Session: {session_filter()}
+
+Scanning assets: {len(SYMBOLS)}
+
+Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
+""")
+
+        except Exception as e:
+
+            tg(f"STATUS ERROR: {e}")
+
+        await asyncio.sleep(600)
 
 
 # ---------------- SESSION FILTER ----------------
@@ -264,11 +300,13 @@ async def trailing(conn):
 
                 if sl < entry:
                     await conn.modify_position(p["id"],stop_loss=entry)
+                    tg(f"TRAILING STOP → BREAKEVEN {p['symbol']}")
 
             else:
 
                 if sl > entry or sl == 0:
                     await conn.modify_position(p["id"],stop_loss=entry)
+                    tg(f"TRAILING STOP → BREAKEVEN {p['symbol']}")
 
     except:
         pass
@@ -277,6 +315,8 @@ async def trailing(conn):
 # ---------------- MAIN BOT ----------------
 
 async def run():
+
+    tg("BOT STARTING...")
 
     api=MetaApi(METAAPI_TOKEN)
 
@@ -295,6 +335,8 @@ async def run():
     await terminal.wait_synchronized()
 
     tg("ELITE BOT STARTED")
+
+    asyncio.create_task(telegram_status(conn))
 
     while True:
 
@@ -399,7 +441,7 @@ Balance: {round(balance,2)}
 
         except Exception as e:
 
-            print("ERROR:",e)
+            tg(f"BOT ERROR: {e}")
 
             await asyncio.sleep(5)
 
@@ -411,6 +453,6 @@ while True:
 
     except Exception as e:
 
-        print("BOT CRASHED",e)
+        tg(f"BOT CRASHED → RESTARTING: {e}")
 
         time.sleep(5)
