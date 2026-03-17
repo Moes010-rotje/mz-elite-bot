@@ -1,34 +1,36 @@
 import asyncio
-import os
 import pandas as pd
-import logging
-import urllib.request
+import os
+import time
 import json
+import urllib.request
+import logging
 from datetime import datetime, date
 from metaapi_cloud_sdk import MetaApi
 
-# ─── ENV VARIABLES ─────────────────────────
-
-METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN")
-ACCOUNT_ID = os.environ.get("ACCOUNT_ID")
-
-TG_TOKEN = os.environ.get("TG_TOKEN")
-TG_CHAT = os.environ.get("TG_CHAT")
-
-# ─── SETTINGS ──────────────────────────────
-
-CHECK_EVERY = 10
-RISK_PCT = 0.01
+CHECK_INTERVAL = 15
+RISK = 0.01
 MIN_RR = 2
-MAX_TRADES = 4
-MAX_DAILY_LOSS = 0.03
+DAILY_LOSS_LIMIT = 0.03
+MAX_TRADES_PER_ASSET = 4
 
-# ─── LOGGING ───────────────────────────────
+SYMBOLS = [
+"XAUUSD","XAGUSD","BTCUSD",
+"EURUSD","GBPUSD","USDJPY","USDCHF",
+"NAS100","US30","US500"
+]
+
+METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
+ACCOUNT_ID = os.getenv("ACCOUNT_ID")
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT = os.getenv("TG_CHAT")
+
+trade_cooldown = {}
+daily = {"date":None,"start":0}
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("MZ_ELITE")
 
-# ─── TELEGRAM ──────────────────────────────
+# ---------------- TELEGRAM ----------------
 
 def tg(msg):
     try:
@@ -39,55 +41,45 @@ def tg(msg):
     except:
         pass
 
-# ─── ASSETS ────────────────────────────────
 
-ASSETS={
-"XAUUSD":{"pip":0.10,"decimals":2},
-"EURUSD":{"pip":0.0001,"decimals":5},
-"GBPUSD":{"pip":0.0001,"decimals":5},
-"USDJPY":{"pip":0.01,"decimals":3},
-"GBPJPY":{"pip":0.01,"decimals":3},
-"BTCUSD":{"pip":1.0,"decimals":2}
-}
+# ---------------- SESSION FILTER ----------------
 
-# ─── SESSION FILTER ────────────────────────
+def session_filter():
 
-def session():
     h=datetime.utcnow().hour
-    if 0<=h<7:return "asia"
-    if 7<=h<13:return "london"
-    if 13<=h<16:return "london_ny"
-    if 16<=h<21:return "ny"
-    return "closed"
 
-# ─── NEWS FILTER ───────────────────────────
+    london = 7 <= h <= 11
+    newyork = 13 <= h <= 17
+
+    return london or newyork
+
+
+# ---------------- NEWS FILTER ----------------
 
 def news_filter():
 
     try:
+
         now=datetime.utcnow()
 
         url="https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
         req=urllib.request.Request(url,headers={"User-Agent":"Mozilla"})
-        res=urllib.request.urlopen(req,timeout=5)
+        res=urllib.request.urlopen(req)
 
         events=json.loads(res.read().decode())
 
         for e in events:
 
-            if e.get("impact")!="High":
+            if e["impact"]!="High":
                 continue
 
-            try:
-                et=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
-            except:
-                continue
+            t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
 
-            diff=abs((now-et).total_seconds())
+            diff=abs((now-t).total_seconds())
 
-            if diff<1800:
-                tg(f"News filter actief\n{e.get('title')}")
+            if diff < 1800:
+                tg("NEWS FILTER ACTIVE")
                 return False
 
         return True
@@ -95,86 +87,194 @@ def news_filter():
     except:
         return True
 
-# ─── INDICATORS ────────────────────────────
 
-def indicators(c):
+# ---------------- SPREAD FILTER ----------------
 
-    df=pd.DataFrame(c)
+def spread_ok(symbol,spread):
 
-    df["ema20"]=df["close"].ewm(span=20).mean()
+    if symbol in ["EURUSD","GBPUSD","USDJPY","USDCHF"]:
+        return spread < 0.0003
 
-    delta=df["close"].diff()
+    if symbol in ["XAUUSD","XAGUSD"]:
+        return spread < 0.5
+
+    if symbol == "BTCUSD":
+        return spread < 50
+
+    return True
+
+
+# ---------------- INDICATORS ----------------
+
+def indicators(df):
+
+    df["ema12"]=df.close.ewm(span=12).mean()
+    df["ema26"]=df.close.ewm(span=26).mean()
+
+    df["macd"]=df.ema12-df.ema26
+    df["signal"]=df.macd.ewm(span=9).mean()
+
+    delta=df.close.diff()
 
     gain=delta.clip(lower=0).rolling(14).mean()
     loss=(-delta.clip(upper=0)).rolling(14).mean()
 
     rs=gain/loss
-
     df["rsi"]=100-(100/(1+rs))
 
-    e1=df["close"].ewm(span=12).mean()
-    e2=df["close"].ewm(span=26).mean()
-
-    df["macd"]=e1-e2
-    df["signal"]=df["macd"].ewm(span=9).mean()
-
-    df["hist"]=df["macd"]-df["signal"]
-
-    df["swing_high"]=df["high"].rolling(5).max()
-    df["swing_low"]=df["low"].rolling(5).min()
+    tr=df.high-df.low
+    df["atr"]=tr.rolling(14).mean()
 
     return df
 
-# ─── TREND ─────────────────────────────────
 
-def trend(df):
+# ---------------- MARKET STRUCTURE ----------------
 
-    if df["close"].iloc[-1] > df["ema20"].iloc[-1]:
+def market_structure(df):
+
+    h=df.high
+    l=df.low
+
+    if h.iloc[-1] > h.iloc[-2] and l.iloc[-1] > l.iloc[-2]:
         return "bull"
 
-    if df["close"].iloc[-1] < df["ema20"].iloc[-1]:
+    if h.iloc[-1] < h.iloc[-2] and l.iloc[-1] < l.iloc[-2]:
         return "bear"
 
     return None
 
-# ─── LOT SIZE ──────────────────────────────
 
-def calc_lot(balance, stop_distance, pip):
+# ---------------- FVG ----------------
 
-    risk_money = balance * RISK_PCT
+def fair_value_gap(df):
 
-    pips = stop_distance / pip
+    c1=df.iloc[-3]
+    c3=df.iloc[-1]
 
-    if pips <= 0:
-        return 0.01
+    if c1.high < c3.low:
+        return "bull"
 
-    lot = risk_money / (pips * 10)
-
-    return round(max(0.01,min(lot,5)),2)
-
-# ─── SIGNAL ────────────────────────────────
-
-def signal(df5, trend):
-
-    r=df5.iloc[-2]
-    r1=df5.iloc[-3]
-
-    macd_up=r["hist"]>0 and r1["hist"]<=0
-    macd_down=r["hist"]<0 and r1["hist"]>=0
-
-    if trend=="bull":
-
-        if macd_up and r["rsi"]>40:
-            return "buy"
-
-    if trend=="bear":
-
-        if macd_down and r["rsi"]<60:
-            return "sell"
+    if c1.low > c3.high:
+        return "bear"
 
     return None
 
-# ─── MAIN BOT ──────────────────────────────
+
+# ---------------- LIQUIDITY SWEEP ----------------
+
+def liquidity_sweep(df):
+
+    last=df.iloc[-1]
+    prev=df.iloc[-2]
+
+    if last.high > prev.high and last.close < prev.high:
+        return "sell"
+
+    if last.low < prev.low and last.close > prev.low:
+        return "buy"
+
+    return None
+
+
+# ---------------- HTF TREND ----------------
+
+def htf_trend(df):
+
+    ema50=df.close.ewm(span=50).mean()
+    ema200=df.close.ewm(span=200).mean()
+
+    if ema50.iloc[-1] > ema200.iloc[-1]:
+        return "bull"
+
+    if ema50.iloc[-1] < ema200.iloc[-1]:
+        return "bear"
+
+    return None
+
+
+# ---------------- SIGNAL ----------------
+
+def signal(df):
+
+    trend=market_structure(df)
+    fvg=fair_value_gap(df)
+    sweep=liquidity_sweep(df)
+    htf=htf_trend(df)
+
+    r=df.iloc[-1]
+
+    if trend=="bull" and fvg=="bull" and sweep=="buy" and r.rsi>50 and htf=="bull":
+        return "buy"
+
+    if trend=="bear" and fvg=="bear" and sweep=="sell" and r.rsi<50 and htf=="bear":
+        return "sell"
+
+    return None
+
+
+# ---------------- LOT SIZE ----------------
+
+def lot_size(balance,sl_distance):
+
+    risk_money=balance * RISK
+
+    lot=risk_money/(sl_distance*10)
+
+    lot=max(0.01,min(lot,5))
+
+    return round(lot,2)
+
+
+# ---------------- DAILY LOSS ----------------
+
+def check_daily(balance):
+
+    today=date.today()
+
+    if daily["date"]!=today:
+
+        daily["date"]=today
+        daily["start"]=balance
+
+    loss=(daily["start"]-balance)/daily["start"]
+
+    if loss >= DAILY_LOSS_LIMIT:
+
+        tg("DAILY LOSS LIMIT HIT")
+
+        return False
+
+    return True
+
+
+# ---------------- TRAILING ----------------
+
+async def trailing(conn):
+
+    try:
+
+        pos=await conn.get_positions()
+
+        for p in pos:
+
+            entry=p["openPrice"]
+            sl=p.get("stopLoss",0)
+
+            if p["type"]=="POSITION_TYPE_BUY":
+
+                if sl < entry:
+                    await conn.modify_position(p["id"],stop_loss=entry)
+
+            else:
+
+                if sl > entry or sl == 0:
+                    await conn.modify_position(p["id"],stop_loss=entry)
+
+    except:
+        pass
+
+
+# ---------------- MAIN BOT ----------------
 
 async def run():
 
@@ -189,95 +289,83 @@ async def run():
     await conn.connect()
     await conn.wait_synchronized()
 
-    terminal=account.get_terminal_connection()
+    terminal=account.get_streaming_connection()
 
     await terminal.connect()
     await terminal.wait_synchronized()
 
-    tg("MZ ELITE BOT STARTED")
-
-    daily_start=None
+    tg("ELITE BOT STARTED")
 
     while True:
 
         try:
 
-            if session()=="closed":
-                await asyncio.sleep(CHECK_EVERY)
+            if not session_filter():
+                await asyncio.sleep(60)
                 continue
 
             if not news_filter():
-                await asyncio.sleep(CHECK_EVERY)
+                await asyncio.sleep(60)
                 continue
 
             info=await conn.get_account_information()
 
             balance=info["balance"]
 
-            if daily_start is None:
-                daily_start=balance
-
-            loss=(daily_start-balance)/daily_start
-
-            if loss>=MAX_DAILY_LOSS:
-                tg("Daily loss limit bereikt")
-                await asyncio.sleep(600)
+            if not check_daily(balance):
+                await asyncio.sleep(60)
                 continue
 
             positions=await conn.get_positions()
 
-            if len(positions)>=MAX_TRADES:
-                await asyncio.sleep(CHECK_EVERY)
-                continue
+            await trailing(conn)
 
-            for symbol in ASSETS:
+            for symbol in SYMBOLS:
 
-                price=await conn.get_symbol_price(symbol)
+                candles=await terminal.get_historical_candles(symbol,"5m",None,200)
 
-                c5=await terminal.get_historical_candles(symbol,"5m",None,120)
+                df=pd.DataFrame(candles)
 
-                df5=indicators(c5)
+                df=indicators(df)
 
-                t=trend(df5)
-
-                s=signal(df5,t)
+                s=signal(df)
 
                 if not s:
                     continue
 
-                pip=ASSETS[symbol]["pip"]
-                dec=ASSETS[symbol]["decimals"]
+                price=await conn.get_symbol_price(symbol)
 
-                r=df5.iloc[-2]
+                spread=price["ask"]-price["bid"]
+
+                if not spread_ok(symbol,spread):
+                    continue
 
                 if s=="buy":
 
                     entry=price["ask"]
-
-                    sl=round(r["swing_low"]-pip,dec)
+                    sl=df.low.tail(10).min()
 
                     risk=entry-sl
 
-                    tp1=round(entry+risk,dec)
-                    tp2=round(entry+risk*2,dec)
+                    tp1=entry+risk
+                    tp2=entry+risk*2
 
                 else:
 
                     entry=price["bid"]
-
-                    sl=round(r["swing_high"]+pip,dec)
+                    sl=df.high.tail(10).max()
 
                     risk=sl-entry
 
-                    tp1=round(entry-risk,dec)
-                    tp2=round(entry-risk*2,dec)
+                    tp1=entry-risk
+                    tp2=entry-risk*2
 
                 rr=abs((tp2-entry)/risk)
 
                 if rr<MIN_RR:
                     continue
 
-                lot=calc_lot(balance,abs(risk),pip)
+                lot=lot_size(balance,abs(risk))
 
                 lot1=round(lot*0.5,2)
                 lot2=round(lot*0.5,2)
@@ -293,31 +381,36 @@ async def run():
                     await conn.create_market_sell_order(symbol,lot2,sl,tp2)
 
                 tg(f"""
-{s.upper()} {symbol}
+TRADE OPEN
 
-RR 1:{round(rr,1)}
+Symbol: {symbol}
+Type: {s}
 
-Entry {entry}
-SL {sl}
+Entry: {entry}
+SL: {sl}
+TP1: {tp1}
+TP2: {tp2}
 
-TP1 {tp1}
-TP2 {tp2}
-
-Balance {round(balance,2)}
+RR: {round(rr,2)}
+Balance: {round(balance,2)}
 """)
+
+            await asyncio.sleep(CHECK_INTERVAL)
 
         except Exception as e:
 
-            log.error(e)
+            print("ERROR:",e)
 
-        await asyncio.sleep(CHECK_EVERY)
+            await asyncio.sleep(5)
 
-import asyncio
-import time
 
 while True:
+
     try:
         asyncio.run(run())
+
     except Exception as e:
-        print("BOT ERROR:", e)
+
+        print("BOT CRASHED",e)
+
         time.sleep(5)
