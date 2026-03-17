@@ -25,8 +25,14 @@ ACCOUNT_ID = os.getenv("ACCOUNT_ID")
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT = os.getenv("TG_CHAT")
 
-trade_cooldown = {}
 daily = {"date":None,"start":0}
+last_status = 0
+
+CORRELATED = [
+["EURUSD","GBPUSD"],
+["NAS100","US500"],
+["XAUUSD","XAGUSD"]
+]
 
 logging.basicConfig(level=logging.INFO)
 
@@ -42,8 +48,6 @@ def tg(msg):
         pass
 
 # ---------------- HEARTBEAT ----------------
-
-last_status=0
 
 def heartbeat(balance,equity,positions):
 
@@ -64,7 +68,7 @@ Equity: {round(equity,2)}
 
 Open trades: {len(positions)}
 
-Scanning assets: {len(SYMBOLS)}
+Scanning: {len(SYMBOLS)} assets
 
 Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
 """)
@@ -80,11 +84,6 @@ def session_filter():
 
     return london or newyork
 
-# ---------------- NEWS FILTER ----------------
-
-def news_filter():
-    return True
-
 # ---------------- SPREAD FILTER ----------------
 
 def spread_ok(symbol,spread):
@@ -99,6 +98,21 @@ def spread_ok(symbol,spread):
         return spread < 50
 
     return True
+
+# ---------------- CORRELATION FILTER ----------------
+
+def correlation_block(symbol,positions):
+
+    for pair in CORRELATED:
+
+        if symbol in pair:
+
+            for p in positions:
+
+                if p["symbol"] in pair:
+                    return True
+
+    return False
 
 # ---------------- INDICATORS ----------------
 
@@ -302,6 +316,9 @@ async def run():
             await trailing(conn)
 
             for symbol in SYMBOLS:
+
+                if correlation_block(symbol,positions):
+                    continue
 
                 candles=await account.get_historical_candles(symbol,"5m",200)
 
