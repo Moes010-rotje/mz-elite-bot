@@ -364,7 +364,7 @@ async def run():
 
             for symbol in SYMBOLS:
 
-                candles = await conn.get_historical_candles(symbol, "5m", None, 200)
+                candles = await terminal.get_historical_candles(symbol, "5m", None, 200)
 
                 df=pd.DataFrame(candles)
 
