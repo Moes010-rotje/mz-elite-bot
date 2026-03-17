@@ -110,7 +110,10 @@ def news_filter():
             if e["impact"]!="High":
                 continue
 
-            t=datetime.fromtimestamp(e["date"]) if isinstance(e["date"],int) else datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
+            if isinstance(e["date"], int):
+    t=datetime.fromtimestamp(e["date"])
+else:
+    t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
 
             diff=abs((now-t).total_seconds())
 
