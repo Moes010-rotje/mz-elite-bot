@@ -91,7 +91,11 @@ def news_filter():
                 continue
 
             try:
-                t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
+                # ✅ FIXED HIER
+                if isinstance(e["date"], int):
+                    t=datetime.fromtimestamp(e["date"])
+                else:
+                    t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
             except:
                 continue
 
@@ -188,21 +192,18 @@ def signal(df, htf):
     trend=market_structure(df)
     gap=fvg(df)
 
-    # 🔥 STRONG (blijft)
     if htf=="bull" and trend=="bull" and gap=="bull":
         return "buy","SMC STRONG"
 
     if htf=="bear" and trend=="bear" and gap=="bear":
         return "sell","SMC STRONG"
 
-    # 🔥 FAST BREAKOUT
     if last.close > prev.high:
         return "buy","FAST BREAKOUT"
 
     if last.close < prev.low:
         return "sell","FAST BREAKOUT"
 
-    # 🔥 LOSSE RSI
     if last.rsi > 52:
         return "buy","RSI SCALP"
 
@@ -321,14 +322,12 @@ async def run():
                     entry=price["ask"]
                     sl=df.low.tail(10).min()
                     risk=entry-sl
-                    tp1=entry+risk
                     tp2=entry+risk*2
 
                 else:
                     entry=price["bid"]
                     sl=df.high.tail(10).max()
                     risk=sl-entry
-                    tp1=entry-risk
                     tp2=entry-risk*2
 
                 rr=abs((tp2-entry)/risk)
