@@ -7,75 +7,152 @@ import json
 import urllib.request
 import logging
 from datetime import datetime, date, timedelta, timezone
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Tuple
+from enum import Enum
 from metaapi_cloud_sdk import MetaApi
 
 # ================================================================
-#   PROFESSIONAL SMC BOT v2.1 — AGGRESSIVE MODE
-#   Features: Killzones | Displacement OB/FVG | Liquidity Sweep |
-#   Momentum Confirmatie | Dynamic Risk | Trade Grading |
-#   Partial TP | Trailing Stop | Cooldown | Regime Filter |
-#   Asia Range Mapping | Correct Lot Sizing per Instrument
+#   PROFESSIONAL SMC BOT v3.0
+#
+#   Gebouwd als een discretionaire trader denkt:
+#   1. HTF (1H) bepaalt bias (trend richting)
+#   2. MTF (15M) bevestigt structuur (BOS/CHoCH)
+#   3. LTF (5M) entry bij POI zone + confirmatie candle
+#
+#   Kernprincipes:
+#   - Nooit chasing → zones opslaan en WACHTEN op retest
+#   - Premium/Discount → alleen kopen in discount, verkopen in premium
+#   - Liquidity eerst → sweep VOOR entry, niet als entry zelf
+#   - Confirmatie verplicht → rejection wick of engulfing bij zone
+#   - Kwaliteit > Kwantiteit → minder trades, hoger winpercentage
 # ================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("SMC")
+
+# ==================== ENUMS & DATA CLASSES ====================
+
+class Direction(Enum):
+    BULL = "bull"
+    BEAR = "bear"
+
+class StructureType(Enum):
+    BOS = "bos"        # Break of Structure (trend continuation)
+    CHOCH = "choch"    # Change of Character (reversal)
+
+class ZoneType(Enum):
+    ORDER_BLOCK = "ob"
+    FAIR_VALUE_GAP = "fvg"
+
+class ZoneStatus(Enum):
+    FRESH = "fresh"          # Nog niet getest
+    TESTED = "tested"        # 1x getest, nog geldig
+    MITIGATED = "mitigated"  # Doorbroken, niet meer geldig
+
+@dataclass
+class SwingPoint:
+    index: int
+    price: float
+    type: str          # "high" of "low"
+    timestamp: float
+    broken: bool = False
+
+@dataclass
+class StructureBreak:
+    type: StructureType
+    direction: Direction
+    level: float
+    index: int
+    swing_broken: SwingPoint
+
+@dataclass
+class Zone:
+    type: ZoneType
+    direction: Direction
+    high: float
+    low: float
+    midpoint: float
+    created_at: float
+    status: ZoneStatus = ZoneStatus.FRESH
+    test_count: int = 0
+    structure_break: Optional[StructureBreak] = None
+    symbol: str = ""
+    timeframe: str = ""
+
+    @property
+    def is_valid(self) -> bool:
+        return self.status in (ZoneStatus.FRESH, ZoneStatus.TESTED)
+
+    def contains_price(self, price: float, buffer_pct: float = 0.0) -> bool:
+        buf = (self.high - self.low) * buffer_pct
+        return (self.low - buf) <= price <= (self.high + buf)
+
+@dataclass
+class TradeSetup:
+    symbol: str
+    direction: Direction
+    entry: float
+    stop_loss: float
+    tp1: float
+    tp2: float
+    zone: Zone
+    grade: str
+    score: float
+    risk_mult: float
+    reasons: List[str]
+    regime: str
+    rr: float
+    htf_bias: Optional[Direction] = None
+    mtf_structure: Optional[StructureBreak] = None
+    confirmation: str = ""
 
 # ==================== CONFIGURATIE ====================
 
 CHECK_INTERVAL = 5
-BASE_RISK = 0.01          # 1% basis risico per trade
-MIN_RR = 1.5              # minimale risk/reward (verlaagd voor meer trades)
-DAILY_LOSS_LIMIT = 0.03   # 3% daily loss limit
-WEEKLY_LOSS_LIMIT = 0.10  # 10% weekly loss limit
-MAX_TRADES_PER_ASSET = 3  # max 3 trades per asset
-MAX_TOTAL_TRADES = 10     # max 10 trades totaal open
-WEEKLY_RESET_DAY = 2      # Wednesday
-WEEKLY_RESET_HOUR = 22    # 22:00 UTC
-COOLDOWN_AFTER_LOSSES = 3 # na 3 verliezers op rij: cooldown
-COOLDOWN_MINUTES = 60     # 1 uur cooldown
+BASE_RISK = 0.01
+MIN_RR = 2.0              # Professioneel: minimaal 2R
+DAILY_LOSS_LIMIT = 0.025  # 2.5% strenger dan v2
+WEEKLY_LOSS_LIMIT = 0.06  # 6% strenger
+MAX_TRADES_PER_ASSET = 2
+MAX_TOTAL_TRADES = 6      # Minder trades, hogere kwaliteit
+COOLDOWN_AFTER_LOSSES = 2
+COOLDOWN_MINUTES = 90
+ZONE_MAX_AGE_HOURS = 24
+ZONE_MAX_TESTS = 1
+MAX_API_CALLS_PER_MIN = 30
 
-# ===== KILLZONES (UTC) =====
+SWING_LOOKBACK = 3
+MIN_REJECTION_WICK_RATIO = 0.6
+MIN_ENGULFING_BODY_RATIO = 1.3
+
 KILLZONES = {
     "asia":       {"start": 0,  "end": 7},
-    "london_kz":  {"start": 7,  "end": 10},
+    "london":     {"start": 7,  "end": 10},
     "london_ext": {"start": 10, "end": 13},
-    "ny_kz":      {"start": 13, "end": 16},
+    "new_york":   {"start": 13, "end": 16},
     "ny_pm":      {"start": 16, "end": 19},
 }
 
-# Alle killzones actief voor trading
-TRADING_KILLZONES = ["asia", "london_kz", "london_ext", "ny_kz", "ny_pm"]
+ENTRY_KILLZONES = ["london", "london_ext", "new_york"]
+NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30", "US500"]
 
-# Welke symbolen mogen traden per killzone
-KILLZONE_SYMBOLS = {
-    "asia":       ["USDJPY", "GBPJPY", "EURJPY", "BTCUSD", "XAUUSD"],
-    "london_kz":  "all",
-    "london_ext": "all",
-    "ny_kz":      "all",
-    "ny_pm":      ["XAUUSD", "NAS100", "US30", "US500", "BTCUSD"],
-}
-
-# Minimum grade per killzone
-KILLZONE_MIN_GRADE = {
-    "asia":       "A",
-    "london_kz":  "B",
-    "london_ext": "B+",
-    "ny_kz":      "B",
-    "ny_pm":      "B+",
-}
-
-# ===== SYMBOLEN MET CONTRACTSPECIFICATIES =====
 SYMBOL_SPECS = {
-    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "min_spread_atr_ratio": 0.20, "category": "metals"},
-    "XAGUSD":  {"pip_size": 0.01,   "pip_value_per_lot": 50,  "min_spread_atr_ratio": 0.20, "category": "metals"},
-    "BTCUSD":  {"pip_size": 1.0,    "pip_value_per_lot": 1,   "min_spread_atr_ratio": 0.25, "category": "crypto"},
-    "EURUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "min_spread_atr_ratio": 0.15, "category": "forex"},
-    "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "min_spread_atr_ratio": 0.15, "category": "forex"},
-    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "min_spread_atr_ratio": 0.15, "category": "forex"},
-    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "min_spread_atr_ratio": 0.15, "category": "forex"},
-    "USDCHF":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "min_spread_atr_ratio": 0.15, "category": "forex"},
-    "AUDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "min_spread_atr_ratio": 0.15, "category": "forex"},
-    "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "min_spread_atr_ratio": 0.15, "category": "forex"},
-    "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "min_spread_atr_ratio": 0.20, "category": "indices"},
-    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "min_spread_atr_ratio": 0.20, "category": "indices"},
-    "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "min_spread_atr_ratio": 0.20, "category": "indices"},
+    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 30,  "category": "metals"},
+    "BTCUSD":  {"pip_size": 1.0,    "pip_value_per_lot": 1,   "max_spread_pips": 50,  "category": "crypto"},
+    "EURUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 15,  "category": "forex"},
+    "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
+    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex"},
+    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 15,  "category": "forex"},
+    "AUDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 15,  "category": "forex"},
+    "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 20,  "category": "forex"},
+    "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 20,  "category": "indices"},
+    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 30,  "category": "indices"},
+    "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 15,  "category": "indices"},
 }
 
 SYMBOLS = list(SYMBOL_SPECS.keys())
@@ -85,109 +162,141 @@ ACCOUNT_ID = os.getenv("ACCOUNT_ID")
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT = os.getenv("TG_CHAT")
 
-# ==================== GLOBALE STATE ====================
-
-daily = {"date": None, "start": 0, "losses_in_row": 0, "cooldown_until": 0, "trades_today": 0}
-weekly = {"week": None, "loss": 0, "limit_hit": False, "start_balance": 0}
-last_status = 0
-open_signals = {}
-trade_journal = []
-asia_range_cache = {}
-
-correlation_pairs = [
-    ["EURUSD", "GBPUSD"],
-    ["NAS100", "US500"],
-    ["XAUUSD", "XAGUSD"],
-    ["USDJPY", "EURJPY"],
-    ["GBPUSD", "GBPJPY"],
+CORRELATION_GROUPS = [
+    {"EURUSD", "GBPUSD"},
+    {"NAS100", "US500"},
+    {"USDJPY", "EURJPY"},
+    {"GBPUSD", "GBPJPY"},
 ]
 
 GRADE_ORDER = ["D", "C", "B", "B+", "A", "A+"]
 
-logging.basicConfig(level=logging.INFO)
+# ==================== GLOBALE STATE ====================
+
+daily_state = {"date": None, "start_balance": 0, "losses_in_row": 0, "cooldown_until": 0, "trades_today": 0}
+weekly_state = {"week": None, "loss": 0, "limit_hit": False, "start_balance": 0}
+last_heartbeat = 0
+api_call_count = 0
+api_call_reset_time = 0
+zone_store: Dict[str, List[Zone]] = {}
+trade_journal: List[dict] = []
+asia_range_cache: Dict[str, dict] = {}
+recent_signals: Dict[str, float] = {}
+connection_healthy = True
+last_connection_check = 0
 
 # ==================== TELEGRAM ====================
 
-def tg(msg):
+def tg(msg: str):
+    if not TG_TOKEN or not TG_CHAT:
+        return
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data = json.dumps({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}).encode()
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        payload = json.dumps({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}).encode()
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
     except Exception as e:
-        print(f"❌ TG error: {e}")
+        log.warning(f"Telegram error: {e}")
 
+# ==================== RATE LIMITER ====================
 
-def test_telegram():
-    print(f"\n{'='*50}\n🔍 TELEGRAM TEST\n{'='*50}")
-    print(f"TG_TOKEN: {TG_TOKEN[:5]}...{TG_TOKEN[-5:] if TG_TOKEN else 'MISSING'}")
-    print(f"TG_CHAT: {TG_CHAT}")
+async def rate_limited_call(coro):
+    global api_call_count, api_call_reset_time
+    now = time.time()
+    if now - api_call_reset_time > 60:
+        api_call_count = 0
+        api_call_reset_time = now
+    if api_call_count >= MAX_API_CALLS_PER_MIN:
+        wait = 60 - (now - api_call_reset_time)
+        if wait > 0:
+            log.info(f"Rate limit: wacht {wait:.0f}s")
+            await asyncio.sleep(wait)
+        api_call_count = 0
+        api_call_reset_time = time.time()
+    api_call_count += 1
+    return await coro
+
+# ==================== CONNECTION HEALTH ====================
+
+async def check_connection_health(conn) -> bool:
+    global connection_healthy, last_connection_check
+    now = time.time()
+    if now - last_connection_check < 120:
+        return connection_healthy
+    last_connection_check = now
     try:
-        tg("🧪 BOT GESTART — Professional SMC Bot v2.1 AGGRESSIVE")
-        print("✅ Telegram werkt")
-        return True
+        info = await asyncio.wait_for(conn.get_account_information(), timeout=10)
+        if info and "balance" in info:
+            connection_healthy = True
+            return True
     except Exception as e:
-        print(f"❌ Telegram mislukt: {e}")
-        return False
+        log.error(f"Connection health check failed: {e}")
+        connection_healthy = False
+    return connection_healthy
 
 # ==================== HEARTBEAT ====================
 
 async def send_heartbeat(conn):
-    global last_status
+    global last_heartbeat
     now = time.time()
-    if now - last_status < 600:
+    if now - last_heartbeat < 600:
         return
-    last_status = now
+    last_heartbeat = now
 
     try:
-        info = await conn.get_account_information()
+        info = await rate_limited_call(conn.get_account_information())
         balance = info["balance"]
         equity = info["equity"]
-        positions = await conn.get_positions()
+        positions = await rate_limited_call(conn.get_positions())
     except Exception as e:
-        print(f"Heartbeat error: {e}")
+        log.error(f"Heartbeat error: {e}")
         return
 
     pl = equity - balance
     pl_pct = (pl / balance) * 100 if balance > 0 else 0
     kz = get_current_killzone()
-    daily_loss = ((daily["start"] - balance) / daily["start"] * 100) if daily["start"] > 0 else 0
+    daily_loss = ((daily_state["start_balance"] - balance) / daily_state["start_balance"] * 100) if daily_state["start_balance"] > 0 else 0
+    total_zones = sum(len([z for z in zones if z.is_valid]) for zones in zone_store.values())
 
-    msg = f"""<b>💓 HEARTBEAT</b>
+    msg = f"""<b>💓 SMC v3.0 HEARTBEAT</b>
 
-💰 Balance: ${balance:.2f}
-📊 Equity: ${equity:.2f}
-📈 P&L: {pl:.2f} ({pl_pct:.2f}%)
+💰 Balance: ${balance:,.2f}
+📊 Equity: ${equity:,.2f}
+📈 P&L: ${pl:,.2f} ({pl_pct:+.2f}%)
 
-🎯 Open: {len(positions)}
-🕐 Killzone: {kz.upper() if kz else 'GEEN'}
+🎯 Open trades: {len(positions)}
+🗺️ Active zones: {total_zones}
+🕐 Killzone: {kz.upper() if kz else 'NONE'}
+
 📅 Daily loss: {daily_loss:.2f}%
-📆 Weekly loss: {weekly['loss']*100:.2f}%
-🔥 Losses in row: {daily['losses_in_row']}
-📊 Trades vandaag: {daily['trades_today']}
+📆 Weekly loss: {weekly_state['loss']*100:.2f}%
+🔥 Losses in row: {daily_state['losses_in_row']}
+📊 Trades today: {daily_state['trades_today']}
 
-⏰ {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M:%S')} UTC"""
+⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"""
     tg(msg)
 
-# ==================== KILLZONE FILTER ====================
+# ==================== KILLZONE & SESSION ====================
 
-def get_current_killzone():
-    hour = datetime.now(timezone.utc).replace(tzinfo=None).hour
-    for name, data in KILLZONES.items():
-        if data["start"] <= hour < data["end"]:
+def get_current_killzone() -> Optional[str]:
+    hour = datetime.now(timezone.utc).hour
+    for name, times in KILLZONES.items():
+        if times["start"] <= hour < times["end"]:
             return name
     return None
 
 
-def is_symbol_allowed_in_killzone(symbol):
-    """Check of symbool mag traden in huidige killzone"""
+def is_entry_allowed(symbol: str) -> Tuple[bool, Optional[str]]:
     kz = get_current_killzone()
-    if not kz or kz not in TRADING_KILLZONES:
-        return None
-    allowed = KILLZONE_SYMBOLS.get(kz, "all")
-    if allowed != "all" and symbol not in allowed:
-        return None
-    return kz
+    if not kz:
+        return False, None
+    if kz == "asia":
+        return False, kz
+    if kz == "ny_pm":
+        return (symbol in NY_PM_SYMBOLS), kz
+    if kz in ENTRY_KILLZONES:
+        return True, kz
+    return False, kz
 
 # ==================== ASIA RANGE ====================
 
@@ -197,117 +306,130 @@ async def update_asia_range(account):
         if symbol in asia_range_cache and asia_range_cache[symbol]["date"] == today:
             continue
         try:
-            candles = await account.get_historical_candles(symbol, "15m", 50)
+            candles = await rate_limited_call(account.get_historical_candles(symbol, "15m", 60))
             if not candles or len(candles) < 10:
                 continue
             df = pd.DataFrame(candles)
-            if "time" in df.columns:
-                # Handle both int (unix ms), int (unix s), and string timestamps
-                def parse_hour(t):
-                    try:
-                        if isinstance(t, (int, float)):
-                            # Als het een unix timestamp is (ms of s)
-                            if t > 1e10:
-                                t = t / 1000  # milliseconds naar seconds
-                            return datetime.utcfromtimestamp(t).hour
-                        else:
-                            return pd.to_datetime(t, utc=True).hour
-                    except Exception:
-                        return -1
+            if "time" not in df.columns:
+                continue
 
-                df["hour"] = df["time"].apply(parse_hour)
-                asia = df[(df["hour"] >= 0) & (df["hour"] < 7)]
-                if len(asia) >= 4:
-                    asia_range_cache[symbol] = {
-                        "high": asia["high"].max(),
-                        "low": asia["low"].min(),
-                        "date": today,
-                    }
-        except Exception:
-            continue
+            def parse_ts(t):
+                try:
+                    if isinstance(t, (int, float)):
+                        if t > 1e10:
+                            t = t / 1000
+                        return datetime.utcfromtimestamp(t)
+                    return pd.to_datetime(t, utc=True).replace(tzinfo=None)
+                except Exception:
+                    return None
 
-# ==================== WEEKLY / DAILY LIMIETEN ====================
+            df["dt"] = df["time"].apply(parse_ts)
+            df = df.dropna(subset=["dt"])
+            today_start = datetime.combine(today, datetime.min.time())
+            asia_end = today_start + timedelta(hours=7)
+            asia = df[(df["dt"] >= today_start) & (df["dt"] < asia_end)]
 
-def check_weekly(balance):
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if len(asia) >= 4:
+                asia_range_cache[symbol] = {
+                    "high": float(asia["high"].max()),
+                    "low": float(asia["low"].min()),
+                    "mid": float((asia["high"].max() + asia["low"].min()) / 2),
+                    "date": today,
+                }
+                log.info(f"Asia range {symbol}: {asia_range_cache[symbol]['low']:.5f} - {asia_range_cache[symbol]['high']:.5f}")
+        except Exception as e:
+            log.debug(f"Asia range error {symbol}: {e}")
+
+# ==================== RISK MANAGEMENT ====================
+
+def check_weekly(balance: float) -> bool:
+    now = datetime.now(timezone.utc)
     cw = now.isocalendar()[1]
-    if weekly["week"] != cw:
-        if now.weekday() == WEEKLY_RESET_DAY and now.hour >= WEEKLY_RESET_HOUR:
-            weekly.update({"week": cw, "loss": 0, "limit_hit": False, "start_balance": balance})
-            tg("📊 WEEKLY RESET")
-    return not weekly["limit_hit"]
+    if weekly_state["week"] != cw:
+        weekly_state.update({"week": cw, "loss": 0, "limit_hit": False, "start_balance": balance})
+        tg("📊 <b>WEEKLY RESET</b>")
+    return not weekly_state["limit_hit"]
 
 
-def update_weekly_loss(balance):
-    if weekly["start_balance"] > 0:
-        loss = (weekly["start_balance"] - balance) / weekly["start_balance"]
-        if loss > weekly["loss"]:
-            weekly["loss"] = loss
+def update_weekly_loss(balance: float):
+    if weekly_state["start_balance"] > 0:
+        loss = (weekly_state["start_balance"] - balance) / weekly_state["start_balance"]
+        if loss > weekly_state["loss"]:
+            weekly_state["loss"] = loss
             if loss >= WEEKLY_LOSS_LIMIT:
-                weekly["limit_hit"] = True
-                tg(f"⚠️ WEEKLY LIMIET ({loss*100:.1f}%)")
+                weekly_state["limit_hit"] = True
+                tg(f"🚨 <b>WEEKLY LIMIT</b>: {loss*100:.1f}%")
 
 
-def check_daily(balance):
+def check_daily(balance: float) -> bool:
     today = date.today()
-    if daily["date"] != today:
-        daily.update({"date": today, "start": balance, "losses_in_row": 0, "cooldown_until": 0, "trades_today": 0})
+    if daily_state["date"] != today:
+        daily_state.update({"date": today, "start_balance": balance, "losses_in_row": 0, "cooldown_until": 0, "trades_today": 0})
         return True
-    if daily["start"] == 0:
-        daily["start"] = balance
+    if daily_state["start_balance"] == 0:
+        daily_state["start_balance"] = balance
         return True
-    loss = (daily["start"] - balance) / daily["start"]
+    loss = (daily_state["start_balance"] - balance) / daily_state["start_balance"]
     if loss >= DAILY_LOSS_LIMIT:
-        tg(f"⚠️ DAILY LIMIET: {loss*100:.2f}%")
+        tg(f"🚨 <b>DAILY LIMIT</b>: {loss*100:.2f}%")
         return False
     return True
 
-# ==================== COOLDOWN ====================
 
-def check_cooldown():
+def check_cooldown() -> Tuple[bool, int]:
     now = time.time()
-    if daily["cooldown_until"] > now:
-        return False, int((daily["cooldown_until"] - now) / 60)
+    if daily_state["cooldown_until"] > now:
+        return False, int((daily_state["cooldown_until"] - now) / 60)
     return True, 0
 
 
-def register_trade_result(is_win):
+def register_trade_result(is_win: bool, profit: float = 0):
     if is_win:
-        daily["losses_in_row"] = 0
+        daily_state["losses_in_row"] = 0
     else:
-        daily["losses_in_row"] += 1
-        if daily["losses_in_row"] >= COOLDOWN_AFTER_LOSSES:
-            daily["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
-            tg(f"🧊 COOLDOWN: {COOLDOWN_MINUTES}min na {daily['losses_in_row']} losses")
+        daily_state["losses_in_row"] += 1
+        if daily_state["losses_in_row"] >= COOLDOWN_AFTER_LOSSES:
+            daily_state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
+            tg(f"🧊 <b>COOLDOWN {COOLDOWN_MINUTES}min</b> na {daily_state['losses_in_row']} losses")
 
-# ==================== DYNAMIC RISK ====================
 
-def get_dynamic_risk(balance):
-    base = BASE_RISK
-    if daily["losses_in_row"] >= 1:
-        base *= 0.5
-    if daily["start"] > 0:
-        cur_loss = (daily["start"] - balance) / daily["start"]
+def get_dynamic_risk(balance: float) -> float:
+    risk = BASE_RISK
+    if daily_state["losses_in_row"] >= 1:
+        risk *= 0.5
+    if daily_state["start_balance"] > 0:
+        cur_loss = (daily_state["start_balance"] - balance) / daily_state["start_balance"]
         if cur_loss >= 0.015:
-            base *= 0.5
-    return max(base, 0.0025)
+            risk *= 0.5
+    return max(risk, 0.002)
+
+
+def check_correlation(symbol: str, positions: list) -> bool:
+    for group in CORRELATION_GROUPS:
+        if symbol in group:
+            others = group - {symbol}
+            for other in others:
+                if any(p["symbol"] == other for p in positions):
+                    return False
+    return True
 
 # ==================== SPREAD FILTER ====================
 
-async def check_spread(conn, symbol, atr):
+async def check_spread(conn, symbol: str) -> Tuple[bool, float]:
     try:
-        price = await conn.get_symbol_price(symbol)
+        price = await rate_limited_call(conn.get_symbol_price(symbol))
         spread = price["ask"] - price["bid"]
         spec = SYMBOL_SPECS[symbol]
-        if spread > atr * spec["min_spread_atr_ratio"]:
+        spread_pips = spread / spec["pip_size"]
+        if spread_pips > spec["max_spread_pips"]:
             return False, spread
         return True, spread
     except Exception:
         return False, 0
 
-# ==================== NIEUWS FILTER ====================
+# ==================== NEWS FILTER ====================
 
-async def news_filter():
+async def news_filter() -> bool:
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -320,8 +442,8 @@ async def news_filter():
             try:
                 t = event["date"].split('+')[0].replace('Z', '')
                 et = datetime.strptime(t, "%Y-%m-%dT%H:%M:%S")
-                if abs((now - et).total_seconds()) <= 1800:
-                    tg(f"📰 NEWS: {event.get('title','?')}")
+                if abs((now - et).total_seconds()) <= 900:
+                    tg(f"📰 <b>NEWS BLOCK</b>: {event.get('title','?')}")
                     return False
             except Exception:
                 continue
@@ -329,29 +451,18 @@ async def news_filter():
     except Exception:
         return True
 
-# ==================== CORRELATIE FILTER ====================
-
-def check_correlation(symbol, positions):
-    for pair in correlation_pairs:
-        if symbol in pair:
-            other = pair[0] if pair[1] == symbol else pair[1]
-            if any(p["symbol"] == other for p in positions):
-                return False
-            if any(other in k for k in open_signals):
-                return False
-    return True
-
 # ==================== INDICATOREN ====================
 
-def calculate_indicators(df):
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
     df["ema200"] = df["close"].ewm(span=200).mean()
 
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss_s = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss_s
+    rs = gain / loss_s.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
     exp1 = df["close"].ewm(span=12).mean()
@@ -365,292 +476,502 @@ def calculate_indicators(df):
         np.maximum(abs(df["high"] - df["close"].shift()), abs(df["low"] - df["close"].shift()))
     )
     df["atr"] = df["tr"].rolling(14).mean()
+
+    df["body"] = abs(df["close"] - df["open"])
+    df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
+    df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
+    df["candle_range"] = df["high"] - df["low"]
     return df
 
-# ==================== SMC DETECTIE ====================
+# ==================== SWING POINT DETECTIE ====================
 
-def detect_displacement(df, lookback=5):
-    """Impulsive candle > 2x gemiddelde body die structuur breekt"""
-    if len(df) < lookback + 5:
+def detect_swing_points(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> List[SwingPoint]:
+    """Fractal swing detection: high/low hoger/lager dan N candles links en rechts"""
+    swings = []
+    if len(df) < lookback * 2 + 1:
+        return swings
+
+    for i in range(lookback, len(df) - lookback):
+        is_high = all(
+            df["high"].iloc[i] > df["high"].iloc[i - j] and df["high"].iloc[i] > df["high"].iloc[i + j]
+            for j in range(1, lookback + 1)
+        )
+        if is_high:
+            ts = df["time"].iloc[i] if "time" in df.columns else i
+            swings.append(SwingPoint(
+                index=i, price=float(df["high"].iloc[i]),
+                type="high", timestamp=float(ts) if isinstance(ts, (int, float)) else i
+            ))
+
+        is_low = all(
+            df["low"].iloc[i] < df["low"].iloc[i - j] and df["low"].iloc[i] < df["low"].iloc[i + j]
+            for j in range(1, lookback + 1)
+        )
+        if is_low:
+            ts = df["time"].iloc[i] if "time" in df.columns else i
+            swings.append(SwingPoint(
+                index=i, price=float(df["low"].iloc[i]),
+                type="low", timestamp=float(ts) if isinstance(ts, (int, float)) else i
+            ))
+
+    return sorted(swings, key=lambda s: s.index)
+
+# ==================== MARKET STRUCTURE (BOS / CHoCH) ====================
+
+def analyze_structure(df: pd.DataFrame, swings: List[SwingPoint]) -> Optional[StructureBreak]:
+    """
+    BOS = continuation break (trend volgt door)
+    CHoCH = reversal break (trend wisselt)
+    Gebaseerd op swing highs/lows sequence
+    """
+    if len(swings) < 4:
         return None
-    avg_body = abs(df["close"] - df["open"]).tail(20).mean()
 
-    for i in range(-lookback, 0):
+    highs = [s for s in swings if s.type == "high"]
+    lows = [s for s in swings if s.type == "low"]
+
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+
+    current_price = float(df["close"].iloc[-1])
+    last_candle_high = float(df["high"].iloc[-1])
+    last_candle_low = float(df["low"].iloc[-1])
+
+    recent_highs = highs[-3:]
+    recent_lows = lows[-3:]
+
+    was_bullish = len(recent_highs) >= 2 and recent_highs[-1].price > recent_highs[-2].price
+    was_bearish = len(recent_highs) >= 2 and recent_highs[-1].price < recent_highs[-2].price
+
+    last_sh = highs[-1]
+    if last_candle_high > last_sh.price and current_price > last_sh.price:
+        stype = StructureType.CHOCH if was_bearish else StructureType.BOS
+        return StructureBreak(
+            type=stype, direction=Direction.BULL,
+            level=last_sh.price, index=last_sh.index, swing_broken=last_sh
+        )
+
+    last_sl = lows[-1]
+    if last_candle_low < last_sl.price and current_price < last_sl.price:
+        stype = StructureType.CHOCH if was_bullish else StructureType.BOS
+        return StructureBreak(
+            type=stype, direction=Direction.BEAR,
+            level=last_sl.price, index=last_sl.index, swing_broken=last_sl
+        )
+
+    return None
+
+# ==================== PREMIUM / DISCOUNT ====================
+
+def get_premium_discount(df: pd.DataFrame, swings: List[SwingPoint]) -> Optional[str]:
+    """Boven 61.8% = premium, onder 38.2% = discount, midden = equilibrium"""
+    highs = [s for s in swings if s.type == "high"]
+    lows = [s for s in swings if s.type == "low"]
+    if not highs or not lows:
+        return None
+
+    swing_high = max(s.price for s in highs[-5:])
+    swing_low = min(s.price for s in lows[-5:])
+    if swing_high <= swing_low:
+        return None
+
+    current = float(df["close"].iloc[-1])
+    position = (current - swing_low) / (swing_high - swing_low)
+
+    if position >= 0.618:
+        return "premium"
+    elif position <= 0.382:
+        return "discount"
+    return "equilibrium"
+
+# ==================== ORDER BLOCK DETECTIE ====================
+
+def detect_order_blocks(df: pd.DataFrame, structure: Optional[StructureBreak]) -> List[Zone]:
+    """OB = laatste tegenovergestelde candle VOOR displacement die structuur brak"""
+    zones = []
+    if not structure or len(df) < 20:
+        return zones
+
+    avg_body = float(df["body"].tail(20).mean())
+    search_start = max(0, structure.index - 2)
+    search_end = min(len(df), structure.index + 5)
+
+    for i in range(search_start, search_end):
+        if i >= len(df):
+            break
         c = df.iloc[i]
         body = abs(c["close"] - c["open"])
-        if body < avg_body * 1.8:  # verlaagd van 2.0 naar 1.8
+        if body < avg_body * 2.0:
             continue
-        if c["close"] > c["open"] and c["close"] > df.iloc[i-1]["high"]:
-            return {"type": "bull", "index": i, "candle": c}
-        if c["close"] < c["open"] and c["close"] < df.iloc[i-1]["low"]:
-            return {"type": "bear", "index": i, "candle": c}
-    return None
 
+        if structure.direction == Direction.BULL and c["close"] > c["open"]:
+            for j in range(i - 1, max(i - 6, 0), -1):
+                ob_c = df.iloc[j]
+                if ob_c["close"] < ob_c["open"]:
+                    zones.append(Zone(
+                        type=ZoneType.ORDER_BLOCK, direction=Direction.BULL,
+                        high=float(ob_c["high"]), low=float(ob_c["low"]),
+                        midpoint=float((ob_c["high"] + ob_c["low"]) / 2),
+                        created_at=time.time(), structure_break=structure,
+                    ))
+                    break
 
-def find_order_block(df, displacement):
-    """Laatste tegenovergestelde candle VOOR displacement"""
-    if not displacement:
-        return None
-    idx = displacement["index"]
-    for i in range(idx - 1, max(idx - 8, -len(df)), -1):  # zoek 8 candles terug (was 6)
-        c = df.iloc[i]
-        if displacement["type"] == "bull" and c["close"] < c["open"]:
-            return {"type": "bull", "high": c["high"], "low": c["low"], "index": i}
-        if displacement["type"] == "bear" and c["close"] > c["open"]:
-            return {"type": "bear", "high": c["high"], "low": c["low"], "index": i}
-    return None
+        elif structure.direction == Direction.BEAR and c["close"] < c["open"]:
+            for j in range(i - 1, max(i - 6, 0), -1):
+                ob_c = df.iloc[j]
+                if ob_c["close"] > ob_c["open"]:
+                    zones.append(Zone(
+                        type=ZoneType.ORDER_BLOCK, direction=Direction.BEAR,
+                        high=float(ob_c["high"]), low=float(ob_c["low"]),
+                        midpoint=float((ob_c["high"] + ob_c["low"]) / 2),
+                        created_at=time.time(), structure_break=structure,
+                    ))
+                    break
 
+    return zones
 
-def find_fvg(df, lookback=8):
-    """
-    Correct FVG:
-    Bullish: candle1.high < candle3.low
-    Bearish: candle1.low > candle3.high
-    """
+# ==================== FVG DETECTIE ====================
+
+def detect_fvgs(df: pd.DataFrame, lookback: int = 10) -> List[Zone]:
+    """Bullish FVG: c1.high < c3.low | Bearish FVG: c1.low > c3.high"""
+    zones = []
     if len(df) < lookback + 2:
-        return None
-    avg_body = abs(df["close"] - df["open"]).tail(20).mean()
+        return zones
 
-    for i in range(-1, -lookback, -1):
-        if abs(i) + 2 > len(df):
-            break
-        c1, c2, c3 = df.iloc[i-2], df.iloc[i-1], df.iloc[i]
+    avg_body = float(df["body"].tail(20).mean())
 
-        # Bullish FVG
-        if c3["low"] > c1["high"]:
-            if abs(c2["close"] - c2["open"]) > avg_body * 1.3:  # verlaagd van 1.5
-                return {"type": "bull", "top": c3["low"], "bottom": c1["high"],
-                        "mid": (c3["low"] + c1["high"]) / 2}
-        # Bearish FVG
-        if c3["high"] < c1["low"]:
-            if abs(c2["close"] - c2["open"]) > avg_body * 1.3:
-                return {"type": "bear", "top": c1["low"], "bottom": c3["high"],
-                        "mid": (c1["low"] + c3["high"]) / 2}
-    return None
+    for i in range(len(df) - 1, max(len(df) - lookback, 2), -1):
+        c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
+        mid_body = abs(c2["close"] - c2["open"])
 
+        if c3["low"] > c1["high"] and mid_body > avg_body * 1.5:
+            zones.append(Zone(
+                type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
+                high=float(c3["low"]), low=float(c1["high"]),
+                midpoint=float((c3["low"] + c1["high"]) / 2),
+                created_at=time.time(),
+            ))
+        elif c3["high"] < c1["low"] and mid_body > avg_body * 1.5:
+            zones.append(Zone(
+                type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
+                high=float(c1["low"]), low=float(c3["high"]),
+                midpoint=float((c1["low"] + c3["high"]) / 2),
+                created_at=time.time(),
+            ))
 
-def find_liquidity_sweep(df, symbol):
-    """Sweep van equal highs/lows, Asia range, swing points"""
-    if len(df) < 10:
+    return zones
+
+# ==================== LIQUIDITY SWEEP ====================
+
+def detect_liquidity_sweep(df: pd.DataFrame, symbol: str, swings: List[SwingPoint]) -> Optional[dict]:
+    """Sweep = price breekt door level EN keert hard terug (rejection wick)"""
+    if len(df) < 15:
         return None
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    atr = df["atr"].iloc[-1] if "atr" in df.columns else (df["high"] - df["low"]).tail(14).mean()
-    tolerance = atr * 0.15  # verhoogd van 0.1 voor meer detecties
-
-    highs = df["high"].tail(20)
-    lows = df["low"].tail(20)
+    atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else float((df["high"] - df["low"]).tail(14).mean())
+    highs = [s for s in swings if s.type == "high"]
+    lows = [s for s in swings if s.type == "low"]
+    tolerance = atr * 0.1
 
     # Equal Highs sweep
-    for i in range(len(highs) - 6, len(highs) - 2):
-        if i < 0:
-            continue
-        for j in range(i+1, min(i+6, len(highs) - 1)):
-            if abs(highs.iloc[i] - highs.iloc[j]) < tolerance:
-                eq = max(highs.iloc[i], highs.iloc[j])
-                if last["high"] > eq and last["close"] < eq:
-                    return {"type": "bear", "level": eq, "reason": "equal_highs"}
+    for i in range(len(highs) - 1):
+        for j in range(i + 1, len(highs)):
+            if abs(highs[i].price - highs[j].price) < tolerance:
+                eq_level = max(highs[i].price, highs[j].price)
+                if last["high"] > eq_level and last["close"] < eq_level:
+                    wick = last["high"] - max(last["close"], last["open"])
+                    if wick > atr * 0.3:
+                        return {"type": "bear", "level": eq_level, "reason": "equal_highs_sweep", "strength": "strong"}
 
     # Equal Lows sweep
-    for i in range(len(lows) - 6, len(lows) - 2):
-        if i < 0:
-            continue
-        for j in range(i+1, min(i+6, len(lows) - 1)):
-            if abs(lows.iloc[i] - lows.iloc[j]) < tolerance:
-                eq = min(lows.iloc[i], lows.iloc[j])
-                if last["low"] < eq and last["close"] > eq:
-                    return {"type": "bull", "level": eq, "reason": "equal_lows"}
+    for i in range(len(lows) - 1):
+        for j in range(i + 1, len(lows)):
+            if abs(lows[i].price - lows[j].price) < tolerance:
+                eq_level = min(lows[i].price, lows[j].price)
+                if last["low"] < eq_level and last["close"] > eq_level:
+                    wick = min(last["close"], last["open"]) - last["low"]
+                    if wick > atr * 0.3:
+                        return {"type": "bull", "level": eq_level, "reason": "equal_lows_sweep", "strength": "strong"}
 
     # Asia Range sweep
     if symbol in asia_range_cache:
         ar = asia_range_cache[symbol]
         if last["high"] > ar["high"] and last["close"] < ar["high"]:
-            return {"type": "bear", "level": ar["high"], "reason": "asia_high"}
+            wick = last["high"] - max(last["close"], last["open"])
+            if wick > atr * 0.2:
+                return {"type": "bear", "level": ar["high"], "reason": "asia_high_sweep", "strength": "medium"}
         if last["low"] < ar["low"] and last["close"] > ar["low"]:
-            return {"type": "bull", "level": ar["low"], "reason": "asia_low"}
+            wick = min(last["close"], last["open"]) - last["low"]
+            if wick > atr * 0.2:
+                return {"type": "bull", "level": ar["low"], "reason": "asia_low_sweep", "strength": "medium"}
 
-    # Swing sweep
-    sh = df["high"].tail(15).iloc[:-1].max()  # uitgebreid van 10 naar 15
-    sl_val = df["low"].tail(15).iloc[:-1].min()
-    if last["high"] > sh and last["close"] < prev["close"]:
-        return {"type": "bear", "level": sh, "reason": "swing_high"}
-    if last["low"] < sl_val and last["close"] > prev["close"]:
-        return {"type": "bull", "level": sl_val, "reason": "swing_low"}
+    # Swing point sweep
+    if len(highs) >= 2:
+        recent_sh = highs[-1]
+        if last["high"] > recent_sh.price and last["close"] < prev["close"] and last["close"] < recent_sh.price:
+            return {"type": "bear", "level": recent_sh.price, "reason": "swing_high_sweep", "strength": "weak"}
+    if len(lows) >= 2:
+        recent_sl = lows[-1]
+        if last["low"] < recent_sl.price and last["close"] > prev["close"] and last["close"] > recent_sl.price:
+            return {"type": "bull", "level": recent_sl.price, "reason": "swing_low_sweep", "strength": "weak"}
 
     return None
 
+# ==================== CONFIRMATION CANDLE ====================
 
-def market_structure_shift(df):
-    """MSS op hogere timeframe"""
-    if len(df) < 8:
+def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Optional[str]:
+    """
+    Verplichte confirmatie bij zone:
+    1. Rejection wick (60%+ wick ratio)
+    2. Engulfing (body > 1.3x vorige)
+    3. Pin bar (kleine body, grote wick)
+    """
+    if len(df) < 3:
         return None
-    h = df["high"].tolist()
-    l = df["low"].tolist()
-    c = df["close"].tolist()
 
-    # Bullish MSS
-    if l[-3] < l[-4] and l[-2] < l[-3] and c[-1] > h[-2]:
-        return "bull"
-    # Bearish MSS
-    if h[-3] > h[-4] and h[-2] > h[-3] and c[-1] < l[-2]:
-        return "bear"
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    # Extra: single MSS (minder streng voor meer signals)
-    if l[-2] < l[-3] and c[-1] > h[-2]:
-        return "bull"
-    if h[-2] > h[-3] and c[-1] < l[-2]:
-        return "bear"
+    if direction == Direction.BULL:
+        lw = float(last["lower_wick"])
+        cr = float(last["candle_range"])
+        if cr > 0 and lw / cr >= MIN_REJECTION_WICK_RATIO:
+            if last["close"] > last["open"] and zone.contains_price(float(last["low"]), 0.2):
+                return "rejection_wick"
+
+        if (last["close"] > last["open"] and prev["close"] < prev["open"]
+                and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
+                and last["close"] > prev["open"] and last["open"] < prev["close"]):
+            if zone.contains_price(float(last["low"]), 0.3):
+                return "engulfing"
+
+        body = float(last["body"])
+        if cr > 0 and body / cr < 0.3 and lw / cr > 0.5 and last["close"] > last["open"]:
+            return "pin_bar"
+
+    elif direction == Direction.BEAR:
+        uw = float(last["upper_wick"])
+        cr = float(last["candle_range"])
+        if cr > 0 and uw / cr >= MIN_REJECTION_WICK_RATIO:
+            if last["close"] < last["open"] and zone.contains_price(float(last["high"]), 0.2):
+                return "rejection_wick"
+
+        if (last["close"] < last["open"] and prev["close"] > prev["open"]
+                and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
+                and last["close"] < prev["open"] and last["open"] > prev["close"]):
+            if zone.contains_price(float(last["high"]), 0.3):
+                return "engulfing"
+
+        body = float(last["body"])
+        if cr > 0 and body / cr < 0.3 and uw / cr > 0.5 and last["close"] < last["open"]:
+            return "pin_bar"
 
     return None
+
+# ==================== ZONE MANAGEMENT ====================
+
+def store_zones(symbol: str, new_zones: List[Zone]):
+    if symbol not in zone_store:
+        zone_store[symbol] = []
+    now = time.time()
+    max_age = ZONE_MAX_AGE_HOURS * 3600
+    for z in new_zones:
+        z.symbol = symbol
+        zone_store[symbol].append(z)
+    zone_store[symbol] = [z for z in zone_store[symbol] if z.is_valid and (now - z.created_at) < max_age]
+    if len(zone_store[symbol]) > 10:
+        zone_store[symbol] = zone_store[symbol][-10:]
+
+
+def find_active_zone(symbol: str, price: float, direction: Direction) -> Optional[Zone]:
+    if symbol not in zone_store:
+        return None
+    for zone in zone_store[symbol]:
+        if not zone.is_valid or zone.direction != direction:
+            continue
+        if zone.contains_price(price, buffer_pct=0.15):
+            return zone
+    return None
+
+
+def mark_zone_tested(zone: Zone):
+    zone.test_count += 1
+    if zone.test_count > ZONE_MAX_TESTS:
+        zone.status = ZoneStatus.MITIGATED
+    else:
+        zone.status = ZoneStatus.TESTED
+
+
+def update_zone_status(symbol: str, df: pd.DataFrame):
+    if symbol not in zone_store:
+        return
+    current_price = float(df["close"].iloc[-1])
+    for zone in zone_store[symbol]:
+        if not zone.is_valid:
+            continue
+        if zone.direction == Direction.BULL and current_price < zone.low:
+            zone.status = ZoneStatus.MITIGATED
+        elif zone.direction == Direction.BEAR and current_price > zone.high:
+            zone.status = ZoneStatus.MITIGATED
 
 # ==================== MARKET REGIME ====================
 
-def detect_market_regime(df):
+def detect_regime(df: pd.DataFrame) -> str:
     if len(df) < 30:
         return "unknown"
-    atr = df["atr"].iloc[-1]
-    ema_dist = abs(df["ema50"].iloc[-1] - df["ema200"].iloc[-1])
+    atr = float(df["atr"].iloc[-1])
+    atr_avg = float(df["atr"].tail(20).mean())
+    ema_dist = abs(float(df["ema50"].iloc[-1]) - float(df["ema200"].iloc[-1]))
     ratio = ema_dist / atr if atr > 0 else 0
-    above = (df["close"].tail(10) > df["ema50"].tail(10)).sum()
+    above_ema = (df["close"].tail(10) > df["ema50"].tail(10)).sum()
+    vol_expanding = atr > atr_avg * 1.2
 
-    if ratio > 2 and (above >= 8 or above <= 2):
+    if ratio > 2 and (above_ema >= 8 or above_ema <= 2) and vol_expanding:
         return "trending"
-    elif ratio < 0.5:
+    elif ratio < 0.5 and not vol_expanding:
         return "ranging"
     return "transitioning"
 
-# ==================== HTF BIAS ====================
+# ==================== HTF BIAS (1H) ====================
 
-async def get_htf_bias(account, symbol):
-    """1H trend bias — versoepeld voor meer signalen"""
+async def get_htf_bias(account, symbol: str) -> Optional[Direction]:
     try:
-        candles = await account.get_historical_candles(symbol, "1h", 100)
-        if not candles or len(candles) < 50:
+        candles = await rate_limited_call(account.get_historical_candles(symbol, "1h", 120))
+        if not candles or len(candles) < 60:
             return None
         df = pd.DataFrame(candles)
         df = calculate_indicators(df)
 
-        ema50 = df["ema50"].iloc[-1]
-        ema200 = df["ema200"].iloc[-1]
-        price = df["close"].iloc[-1]
+        price = float(df["close"].iloc[-1])
+        ema50 = float(df["ema50"].iloc[-1])
+        ema200 = float(df["ema200"].iloc[-1])
 
-        # Sterk
         if price > ema50 > ema200:
-            return "bull"
+            return Direction.BULL
         if price < ema50 < ema200:
-            return "bear"
-        # Matig
-        if ema50 > ema200 and price > ema200:
-            return "bull"
-        if ema50 < ema200 and price < ema200:
-            return "bear"
-        # Zwak: alleen EMA50 richting
-        if price > ema50:
-            return "bull"
-        if price < ema50:
-            return "bear"
-
+            return Direction.BEAR
+        if ema50 > ema200 * 1.001 and price > ema200:
+            return Direction.BULL
+        if ema50 < ema200 * 0.999 and price < ema200:
+            return Direction.BEAR
         return None
     except Exception:
         return None
 
-# ==================== CANDLE CLOSE TIMING ====================
-
-def is_candle_just_closed(tf_min=5):
-    """Check eerste 60 sec na candle close"""
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    if now.minute % tf_min == 0 and now.second < 60:
-        return True
-    return False
-
 # ==================== TRADE GRADING ====================
 
-def grade_setup(htf_bias, mss, displacement, ob, fvg, liquidity_sweep, regime, momentum):
+def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount, regime, direction):
     """
-    A+ = alles aligned (9+)    → 1.0x risk
-    A  = sterk (7+)            → 0.75x risk
-    B+ = goed (5.5+)           → 0.6x risk
-    B  = degelijk (4+)         → 0.5x risk
-    C  = minimum (3+)          → 0.25x risk
-    D  = skip (<3)             → 0x
+    Verplicht: Zone + Confirmatie (zonder = D)
+    A+ >= 10 | A >= 8 | B+ >= 6 | B >= 5 | C < 5 = skip
     """
     score = 0
     reasons = []
 
-    if htf_bias:
-        score += 2; reasons.append("HTF")
-    if mss:
-        score += 2; reasons.append("MSS")
-    if displacement:
-        score += 2; reasons.append("DISP")
-    if ob:
-        score += 1.5; reasons.append("OB")
-    if fvg:
-        score += 1.5; reasons.append("FVG")
-    if liquidity_sweep:
-        score += 2.5; reasons.append(f"SWEEP({liquidity_sweep.get('reason','?')})")
-    if momentum:
-        score += 1; reasons.append("MOM")
-    if regime == "trending":
-        score += 1; reasons.append("TREND")
-    if regime == "ranging":
-        score -= 1; reasons.append("RANGE⚠️")
+    if not zone or not confirmation:
+        return "D", 0, 0, ["NO_ZONE" if not zone else "NO_CONFIRM"]
 
-    if score >= 9:
+    reasons.append(f"ZONE({zone.type.value})")
+    score += 2.0
+    reasons.append(f"CONFIRM({confirmation})")
+    score += 2.0
+
+    if htf_bias:
+        score += 2.5
+        reasons.append("HTF_ALIGNED")
+
+    if structure:
+        if structure.type == StructureType.CHOCH:
+            score += 2.0
+            reasons.append("CHoCH")
+        else:
+            score += 1.5
+            reasons.append("BOS")
+
+    if sweep:
+        strength = sweep.get("strength", "weak")
+        pts = {"strong": 2.5, "medium": 1.5, "weak": 0.5}.get(strength, 0.5)
+        score += pts
+        reasons.append(f"SWEEP_{strength.upper()}({sweep['reason']})")
+
+    if premium_discount:
+        if (direction == Direction.BULL and premium_discount == "discount") or \
+           (direction == Direction.BEAR and premium_discount == "premium"):
+            score += 1.5
+            reasons.append("P/D_ALIGNED")
+        elif premium_discount == "equilibrium":
+            score -= 0.5
+            reasons.append("EQ⚠️")
+
+    if regime == "trending":
+        score += 1.0
+        reasons.append("TRENDING")
+    elif regime == "ranging":
+        score -= 1.0
+        reasons.append("RANGING⚠️")
+
+    if zone.type == ZoneType.ORDER_BLOCK and zone.structure_break:
+        score += 0.5
+        reasons.append("OB+STRUCT")
+
+    if score >= 10:
         return "A+", 1.0, score, reasons
-    elif score >= 7:
+    elif score >= 8:
         return "A", 0.75, score, reasons
-    elif score >= 5.5:
+    elif score >= 6:
         return "B+", 0.6, score, reasons
-    elif score >= 4:
+    elif score >= 5:
         return "B", 0.5, score, reasons
-    elif score >= 3:
-        return "C", 0.25, score, reasons
-    else:
-        return "D", 0, score, reasons
+    return "C", 0, score, reasons
 
 # ==================== LOT SIZE ====================
 
-def calculate_lot_size(balance, sl_distance, symbol, risk_pct):
+def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct: float) -> float:
     if sl_distance <= 0:
-        return 0.01
+        return 0
     spec = SYMBOL_SPECS.get(symbol)
     if not spec:
-        return 0.01
+        return 0
     sl_pips = sl_distance / spec["pip_size"]
     risk_amount = balance * risk_pct
     denom = sl_pips * spec["pip_value_per_lot"]
     if denom <= 0:
-        return 0.01
+        return 0
     lot = risk_amount / denom
-    return round(max(0.01, min(lot, 5)), 2)
+    return round(max(0.01, min(lot, 3.0)), 2)
 
-# ==================== SL / TP LEVELS ====================
+# ==================== SL / TP BEREKENING ====================
 
-def calculate_levels(signal_type, entry, df, symbol):
-    atr = df["atr"].iloc[-1]
-    min_sl = atr * 1.0
+def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: pd.DataFrame):
+    """SL achter zone, TP1 op 2R, TP2 op 3R"""
+    atr = float(df["atr"].iloc[-1])
+    buffer = atr * 0.15
 
-    if signal_type == "buy":
-        swing_low = df["low"].tail(10).min()
-        sl = min(swing_low, entry - min_sl) - atr * 0.2
-        dist = entry - sl
-        tp1 = entry + dist * 1.5
-        tp2 = entry + dist * 2.5
+    if direction == Direction.BULL:
+        sl = zone.low - buffer
+        sl_dist = entry - sl
+        if sl_dist < atr * 0.5:
+            sl = entry - atr * 0.5
+            sl_dist = entry - sl
+        tp1 = entry + sl_dist * 2.0
+        tp2 = entry + sl_dist * 3.0
     else:
-        swing_high = df["high"].tail(10).max()
-        sl = max(swing_high, entry + min_sl) + atr * 0.2
-        dist = sl - entry
-        tp1 = entry - dist * 1.5
-        tp2 = entry - dist * 2.5
+        sl = zone.high + buffer
+        sl_dist = sl - entry
+        if sl_dist < atr * 0.5:
+            sl = entry + atr * 0.5
+            sl_dist = sl - entry
+        tp1 = entry - sl_dist * 2.0
+        tp2 = entry - sl_dist * 3.0
 
-    return sl, tp1, tp2, abs(dist)
+    return sl, tp1, tp2, sl_dist
 
 # ==================== POSITION MANAGEMENT ====================
 
-async def manage_positions(conn, positions):
-    """Partial TP op 1.5x risk, break-even, trailing na 2x risk"""
+async def manage_positions(conn, positions: list):
+    """Partial bij 1.5R + BE, trailing bij 2.5R"""
     for pos in positions:
         try:
             symbol = pos["symbol"]
@@ -662,52 +983,45 @@ async def manage_positions(conn, positions):
             sl = pos.get("stopLoss", 0)
             tp = pos.get("takeProfit", 0)
 
-            if cur_p <= 0 or vol <= 0 or not SYMBOL_SPECS.get(symbol):
+            if cur_p <= 0 or vol <= 0 or symbol not in SYMBOL_SPECS:
                 continue
 
-            if "BUY" in ptype:
-                profit_dist = cur_p - open_p
-            else:
-                profit_dist = open_p - cur_p
-
+            is_buy = "BUY" in ptype
+            profit_dist = (cur_p - open_p) if is_buy else (open_p - cur_p)
             sl_dist = abs(open_p - sl) if sl else 0
             if sl_dist <= 0:
                 continue
 
-            # TP1: partial close 50% + break-even
-            tp1_dist = sl_dist * 1.5
-            if profit_dist >= tp1_dist and vol > 0.01:
+            if profit_dist >= sl_dist * 1.5 and vol > 0.02:
                 partial = round(vol * 0.5, 2)
                 if partial >= 0.01:
                     try:
-                        await conn.close_position_partially(pid, partial)
-                        buf = sl_dist * 0.1
-                        new_sl = open_p + buf if "BUY" in ptype else open_p - buf
-                        await conn.modify_position(pid, stop_loss=new_sl, take_profit=tp)
-                        tg(f"✅ PARTIAL: {symbol} 50% gesloten, SL→BE")
+                        await rate_limited_call(conn.close_position_partially(pid, partial))
+                        be_buf = sl_dist * 0.15
+                        new_sl = (open_p + be_buf) if is_buy else (open_p - be_buf)
+                        await rate_limited_call(conn.modify_position(pid, stop_loss=new_sl, take_profit=tp))
+                        tg(f"✅ <b>PARTIAL TP</b>: {symbol} 50% @ 1.5R, SL→BE+")
                     except Exception as e:
-                        print(f"Partial error {symbol}: {e}")
+                        log.warning(f"Partial error {symbol}: {e}")
 
-            # Trailing na 2x risk
-            elif profit_dist >= sl_dist * 2.0:
-                trail = sl_dist * 0.5
-                if "BUY" in ptype:
-                    new_sl = cur_p - trail
+            elif profit_dist >= sl_dist * 2.5:
+                trail_dist = sl_dist * 1.0
+                if is_buy:
+                    new_sl = cur_p - trail_dist
                     if sl and new_sl > sl:
                         try:
-                            await conn.modify_position(pid, stop_loss=new_sl, take_profit=tp)
+                            await rate_limited_call(conn.modify_position(pid, stop_loss=new_sl, take_profit=tp))
                         except Exception:
                             pass
                 else:
-                    new_sl = cur_p + trail
+                    new_sl = cur_p + trail_dist
                     if sl and new_sl < sl:
                         try:
-                            await conn.modify_position(pid, stop_loss=new_sl, take_profit=tp)
+                            await rate_limited_call(conn.modify_position(pid, stop_loss=new_sl, take_profit=tp))
                         except Exception:
                             pass
-
         except Exception as e:
-            print(f"Pos mgmt error: {e}")
+            log.warning(f"Position management error: {e}")
 
 # ==================== CLOSED TRADE TRACKING ====================
 
@@ -715,236 +1029,260 @@ async def check_closed_trades(conn):
     try:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        history = await conn.get_deals_by_time_range(start, now)
+        history = await rate_limited_call(conn.get_deals_by_time_range(start, now))
         if not history:
             return
         for deal in history[-5:]:
             profit = deal.get("profit", 0)
             did = deal.get("id", "")
             dk = f"deal_{did}"
-            if dk in open_signals:
+            if dk in recent_signals:
                 continue
             if profit != 0:
-                open_signals[dk] = time.time()
-                register_trade_result(profit > 0)
+                recent_signals[dk] = time.time()
+                register_trade_result(profit > 0, profit)
                 emoji = "💰" if profit > 0 else "💔"
-                tg(f"{emoji} TRADE {'WON' if profit>0 else 'LOST'}: {'+'if profit>0 else ''}{profit:.2f}")
-    except Exception:
-        pass
+                tg(f"{emoji} <b>TRADE {'WON' if profit>0 else 'LOST'}</b>: {'+'if profit>0 else ''}{profit:.2f}")
+    except Exception as e:
+        log.debug(f"Closed trades error: {e}")
+
+# ==================== CANDLE CLOSE CHECK ====================
+
+def is_candle_just_closed(tf_min: int = 5) -> bool:
+    now = datetime.now(timezone.utc)
+    return now.minute % tf_min == 0 and now.second < 45
 
 # ==================== HOOFDSTRATEGIE ====================
 
-async def analyze_symbol(account, conn, symbol, positions, balance):
+async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> Optional[TradeSetup]:
     """
-    Complete SMC analyse — AGGRESSIVE
-    Minimum 2 confirmaties, momentum als extra signaal
+    Top-down:
+    1. HTF (1H) bias
+    2. MTF (15M) structuur + zones opslaan
+    3. LTF (5M) entry bij zone + confirmatie
+    4. Premium/Discount filter
+    5. Grade en valideer
     """
     try:
-        candles_5m = await account.get_historical_candles(symbol, "5m", 100)
-        candles_15m = await account.get_historical_candles(symbol, "15m", 100)
+        # Stap 1: HTF Bias
+        htf_bias = await get_htf_bias(account, symbol)
 
-        if not candles_5m or not candles_15m:
-            return None, None, None
+        # Stap 2: MTF (15M)
+        candles_15m = await rate_limited_call(account.get_historical_candles(symbol, "15m", 100))
+        if not candles_15m or len(candles_15m) < 40:
+            return None
+
+        df_15m = pd.DataFrame(candles_15m)
+        df_15m = calculate_indicators(df_15m)
+        swings_15m = detect_swing_points(df_15m)
+        structure_15m = analyze_structure(df_15m, swings_15m)
+        regime = detect_regime(df_15m)
+
+        if structure_15m:
+            new_obs = detect_order_blocks(df_15m, structure_15m)
+            for ob in new_obs:
+                ob.timeframe = "15m"
+            store_zones(symbol, new_obs)
+
+        new_fvgs = detect_fvgs(df_15m)
+        for fvg in new_fvgs:
+            fvg.timeframe = "15m"
+        store_zones(symbol, new_fvgs)
+
+        # Stap 3: LTF (5M)
+        candles_5m = await rate_limited_call(account.get_historical_candles(symbol, "5m", 100))
+        if not candles_5m or len(candles_5m) < 50:
+            return None
 
         df_5m = pd.DataFrame(candles_5m)
-        df_15m = pd.DataFrame(candles_15m)
-
-        if len(df_5m) < 50 or len(df_15m) < 30:
-            return None, None, None
-
         df_5m = calculate_indicators(df_5m)
-        df_15m = calculate_indicators(df_15m)
+        swings_5m = detect_swing_points(df_5m)
 
-        # 1. HTF Bias
-        htf = await get_htf_bias(account, symbol)
+        update_zone_status(symbol, df_5m)
 
-        # 2. Market Regime
-        regime = detect_market_regime(df_15m)
+        structure_5m = analyze_structure(df_5m, swings_5m)
+        if structure_5m:
+            new_obs_5m = detect_order_blocks(df_5m, structure_5m)
+            for ob in new_obs_5m:
+                ob.timeframe = "5m"
+            store_zones(symbol, new_obs_5m)
 
-        # 3. MSS op 15M
-        mss = market_structure_shift(df_15m)
+        new_fvgs_5m = detect_fvgs(df_5m)
+        for fvg in new_fvgs_5m:
+            fvg.timeframe = "5m"
+        store_zones(symbol, new_fvgs_5m)
 
-        # 4. SMC op 5M
-        disp = detect_displacement(df_5m)
-        ob = find_order_block(df_5m, disp) if disp else None
-        fvg = find_fvg(df_5m)
-        sweep = find_liquidity_sweep(df_5m, symbol)
+        sweep = detect_liquidity_sweep(df_5m, symbol, swings_5m)
+        pd_zone = get_premium_discount(df_15m, swings_15m)
+        current_price = float(df_5m["close"].iloc[-1])
 
-        # 5. Momentum (RSI + MACD + EMA)
-        rsi = df_5m["rsi"].iloc[-1]
-        mhist = df_5m["macd_hist"].iloc[-1]
-        mhist_prev = df_5m["macd_hist"].iloc[-2]
-        price = df_5m["close"].iloc[-1]
-        ema50 = df_5m["ema50"].iloc[-1]
+        # Bepaal richting
+        direction = None
+        if htf_bias == Direction.BULL and (not structure_15m or structure_15m.direction == Direction.BULL):
+            direction = Direction.BULL
+        elif htf_bias == Direction.BEAR and (not structure_15m or structure_15m.direction == Direction.BEAR):
+            direction = Direction.BEAR
+        elif structure_15m and structure_15m.type == StructureType.CHOCH:
+            direction = structure_15m.direction
+        elif htf_bias:
+            direction = htf_bias
 
-        mom_bull = (50 < rsi < 75) and (mhist > mhist_prev) and (price > ema50)
-        mom_bear = (25 < rsi < 50) and (mhist < mhist_prev) and (price < ema50)
+        if not direction:
+            return None
 
-        # 6. Tel confirmaties
-        bull = sum([
-            htf == "bull",
-            mss == "bull",
-            bool(disp and disp["type"] == "bull"),
-            bool(fvg and fvg["type"] == "bull"),
-            bool(sweep and sweep["type"] == "bull"),
-            mom_bull,
-        ])
-        bear = sum([
-            htf == "bear",
-            mss == "bear",
-            bool(disp and disp["type"] == "bear"),
-            bool(fvg and fvg["type"] == "bear"),
-            bool(sweep and sweep["type"] == "bear"),
-            mom_bear,
-        ])
+        # P/D filter
+        if direction == Direction.BULL and pd_zone == "premium":
+            return None
+        if direction == Direction.BEAR and pd_zone == "discount":
+            return None
 
-        # Minimum 2 confirmaties
-        if bull >= 2 and bull > bear:
-            direction = "buy"
-        elif bear >= 2 and bear > bull:
-            direction = "sell"
-        else:
-            return None, None, None
+        # Zoek zone
+        active_zone = find_active_zone(symbol, current_price, direction)
+        if not active_zone:
+            return None
 
-        # 7. Grade
-        d = "bull" if direction == "buy" else "bear"
+        # Check confirmatie
+        confirmation = check_confirmation(df_5m, direction, active_zone)
+        if not confirmation:
+            return None
+
+        # Spread
+        spread_ok, spread = await check_spread(conn, symbol)
+        if not spread_ok:
+            return None
+
+        # Grade
         grade, risk_mult, score, reasons = grade_setup(
-            htf == d,
-            mss == d,
-            disp and disp["type"] == d,
-            ob,
-            fvg and fvg["type"] == d,
-            sweep if sweep and sweep["type"] == d else None,
-            regime,
-            mom_bull if d == "bull" else mom_bear,
+            htf_bias=(htf_bias == direction),
+            structure=structure_15m if structure_15m and structure_15m.direction == direction else structure_5m,
+            zone=active_zone, confirmation=confirmation,
+            sweep=sweep if sweep and sweep["type"] == direction.value else None,
+            premium_discount=pd_zone, regime=regime, direction=direction,
         )
 
-        # Skip D
-        if grade == "D":
-            return None, None, None
+        if grade in ("C", "D"):
+            return None
 
-        # Killzone grade filter
-        kz = get_current_killzone()
-        min_g = KILLZONE_MIN_GRADE.get(kz, "B")
-        if GRADE_ORDER.index(grade) < GRADE_ORDER.index(min_g):
-            return None, None, None
+        # Levels
+        price_data = await rate_limited_call(conn.get_symbol_price(symbol))
+        entry = price_data["ask"] if direction == Direction.BULL else price_data["bid"]
+        sl, tp1, tp2, sl_dist = calculate_trade_levels(direction, entry, active_zone, df_5m)
 
-        # 8. Spread check
-        atr = df_5m["atr"].iloc[-1]
-        ok, spread = await check_spread(conn, symbol, atr)
-        if not ok:
-            return None, None, None
+        rr = abs((tp2 - entry) / sl_dist) if sl_dist > 0 else 0
+        if rr < MIN_RR:
+            return None
 
-        return direction, grade, {
-            "direction": direction, "grade": grade, "risk_mult": risk_mult,
-            "score": score, "reasons": reasons, "regime": regime,
-            "df_5m": df_5m, "spread": spread, "atr": atr, "htf_bias": htf,
-        }
+        mark_zone_tested(active_zone)
+
+        return TradeSetup(
+            symbol=symbol, direction=direction, entry=entry,
+            stop_loss=sl, tp1=tp1, tp2=tp2, zone=active_zone,
+            grade=grade, score=score, risk_mult=risk_mult,
+            reasons=reasons, regime=regime, rr=rr,
+            htf_bias=htf_bias, mtf_structure=structure_15m,
+            confirmation=confirmation,
+        )
 
     except Exception as e:
-        print(f"Analyse error {symbol}: {e}")
-        return None, None, None
+        log.error(f"Analyse error {symbol}: {e}")
+        return None
 
 # ==================== TRADE EXECUTIE ====================
 
-async def execute_trade(conn, symbol, direction, grade, details, balance):
-    df = details["df_5m"]
-    risk_pct = get_dynamic_risk(balance) * details["risk_mult"]
+async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
+    risk_pct = get_dynamic_risk(balance) * setup.risk_mult
+    sl_dist = abs(setup.entry - setup.stop_loss)
+    lot = calculate_lot_size(balance, sl_dist, setup.symbol, risk_pct)
 
-    price = await conn.get_symbol_price(symbol)
-    entry = price["ask"] if direction == "buy" else price["bid"]
-
-    sl, tp1, tp2, sl_dist = calculate_levels(direction, entry, df, symbol)
-
-    rr = abs((tp2 - entry) / sl_dist) if sl_dist > 0 else 0
-    if rr < MIN_RR:
-        return False
-
-    lot = calculate_lot_size(balance, sl_dist, symbol, risk_pct)
     if lot < 0.01:
         return False
 
     try:
-        if direction == "buy":
-            await conn.create_market_buy_order(symbol, lot, sl, tp2)
+        if setup.direction == Direction.BULL:
+            await rate_limited_call(conn.create_market_buy_order(setup.symbol, lot, setup.stop_loss, setup.tp2))
         else:
-            await conn.create_market_sell_order(symbol, lot, sl, tp2)
+            await rate_limited_call(conn.create_market_sell_order(setup.symbol, lot, setup.stop_loss, setup.tp2))
     except Exception as e:
-        tg(f"❌ ORDER FAIL: {symbol} — {e}")
+        tg(f"❌ <b>ORDER FAIL</b>: {setup.symbol} — {e}")
         return False
 
-    daily["trades_today"] += 1
+    daily_state["trades_today"] += 1
 
     trade_journal.append({
-        "time": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), "symbol": symbol,
-        "direction": direction, "grade": grade, "entry": entry,
-        "sl": sl, "tp1": tp1, "tp2": tp2, "lot": lot, "rr": rr,
-        "risk_pct": risk_pct, "reasons": details["reasons"],
-        "regime": details["regime"], "spread": details["spread"],
+        "time": datetime.now(timezone.utc).isoformat(),
+        "symbol": setup.symbol, "direction": setup.direction.value,
+        "grade": setup.grade, "score": setup.score,
+        "entry": setup.entry, "sl": setup.stop_loss,
+        "tp1": setup.tp1, "tp2": setup.tp2,
+        "lot": lot, "rr": setup.rr, "risk_pct": risk_pct,
+        "reasons": setup.reasons, "regime": setup.regime,
+        "confirmation": setup.confirmation, "zone_type": setup.zone.type.value,
     })
 
     kz = get_current_killzone()
-    r = " | ".join(details["reasons"])
+    r = " | ".join(setup.reasons)
+    de = "🟢" if setup.direction == Direction.BULL else "🔴"
 
-    tg(f"""<b>✅ TRADE GEOPEND</b>
+    tg(f"""<b>{de} TRADE OPENED — Grade {setup.grade}</b>
 
-📌 {symbol} — Grade: <b>{grade}</b>
-📈 {direction.upper()} | KZ: {kz.upper() if kz else '?'}
+📌 {setup.symbol} | {setup.direction.value.upper()}
+🕐 KZ: {kz.upper() if kz else '?'}
+🔍 Regime: {setup.regime.upper()}
 
-💰 Entry: {entry:.5f}
-🛑 SL: {sl:.5f}
-🎯 TP1: {tp1:.5f} (50%)
-🎯 TP2: {tp2:.5f} (runner)
+💰 Entry: {setup.entry:.5f}
+🛑 SL: {setup.stop_loss:.5f}
+🎯 TP1: {setup.tp1:.5f} (50% partial)
+🎯 TP2: {setup.tp2:.5f} (runner)
 
-📊 RR: 1:{rr:.1f} | Lots: {lot}
-💵 Risk: {risk_pct*100:.2f}% | Score: {details['score']}
-🔍 {details['regime'].upper()} | {r}
-💰 Bal: ${balance:.2f}
+📊 RR: 1:{setup.rr:.1f} | Lots: {lot}
+💵 Risk: {risk_pct*100:.2f}%
+✅ Confirm: {setup.confirmation}
+🗺️ Zone: {setup.zone.type.value} ({setup.zone.timeframe})
 
-⏰ {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M:%S')} UTC""")
+📋 Score: {setup.score:.1f} | {r}
+💰 Balance: ${balance:,.2f}""")
 
     return True
 
 # ==================== DIAGNOSTIEK ====================
 
 async def run_diagnostics(conn, account):
-    print(f"\n{'='*60}")
-    print("🔍 DIAGNOSTIEK — SMC Bot v2.1 AGGRESSIVE")
-    print(f"{'='*60}")
+    log.info("=" * 60)
+    log.info("DIAGNOSTICS — SMC Bot v3.0")
+    log.info("=" * 60)
 
     try:
         info = await conn.get_account_information()
-        print(f"\n📊 Balance: ${info['balance']} | Equity: ${info['equity']}")
+        log.info(f"Balance: ${info['balance']} | Equity: ${info['equity']}")
     except Exception as e:
-        print(f"❌ Account error: {e}")
+        log.error(f"Account error: {e}")
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
     kz = get_current_killzone()
-    print(f"\n🕐 {now.strftime('%H:%M:%S')} UTC | KZ: {kz or 'GEEN'}")
-    print(f"📈 Symbols: {len(SYMBOLS)} | Max trades: {MAX_TOTAL_TRADES}")
-    print(f"🎯 Min RR: {MIN_RR} | Killzones: {', '.join(TRADING_KILLZONES)}")
-    print(f"\n📈 SYMBOOL CHECK:")
-    print("-" * 60)
+    log.info(f"Time: {now.strftime('%H:%M:%S')} UTC | Killzone: {kz or 'NONE'}")
+    log.info(f"Symbols: {len(SYMBOLS)} | Entry KZs: {', '.join(ENTRY_KILLZONES)}")
+    log.info(f"Min RR: {MIN_RR} | Max trades: {MAX_TOTAL_TRADES}")
 
     for s in SYMBOLS:
         try:
-            candles = await account.get_historical_candles(s, "5m", 50)
-            status = f"✅ {len(candles)}c" if candles and len(candles) >= 20 else "❌ data"
-            p = await conn.get_symbol_price(s)
+            candles = await rate_limited_call(account.get_historical_candles(s, "5m", 20))
+            status = f"OK {len(candles)}c" if candles and len(candles) >= 10 else "FAIL"
+            p = await rate_limited_call(conn.get_symbol_price(s))
             spread = p["ask"] - p["bid"]
-            allowed = is_symbol_allowed_in_killzone(s)
-            kz_status = f"✅ {allowed}" if allowed else "⏭️ blocked"
-            print(f"  {s:10} | {status} | spread: {spread:.5f} | {kz_status}")
+            spec = SYMBOL_SPECS[s]
+            spread_pips = spread / spec["pip_size"]
+            allowed, _ = is_entry_allowed(s)
+            log.info(f"  {s:10} | {status} | spread: {spread_pips:.1f} pips | entry: {'YES' if allowed else 'NO'}")
         except Exception as e:
-            print(f"  {s:10} | ❌ {e}")
+            log.info(f"  {s:10} | ERROR {e}")
 
-    print(f"\n{'='*60}\n")
+    log.info("=" * 60)
 
 # ==================== HOOFDLOOP ====================
 
 async def run():
     try:
-        print("🔄 Verbinden met MetaAPI...")
+        log.info("Connecting to MetaAPI...")
         api = MetaApi(METAAPI_TOKEN)
         account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
         await account.wait_connected()
@@ -952,41 +1290,73 @@ async def run():
         conn = account.get_rpc_connection()
         await conn.connect()
 
-        print("🔄 Synchroniseren...")
+        log.info("Synchronizing...")
         await conn.wait_synchronized(timeout_in_seconds=120)
-        print("✅ Gesynchroniseerd!")
+        log.info("Synchronized!")
 
         await asyncio.sleep(2)
-        test_telegram()
 
-        global last_status
-        last_status = time.time()
+        global last_heartbeat
+        last_heartbeat = 0
 
         await run_diagnostics(conn, account)
 
-        tg(f"""🚀 <b>SMC BOT v2.1 AGGRESSIVE GESTART</b>
+        tg(f"""🚀 <b>SMC BOT v3.0 GESTART</b>
 
-📊 {len(SYMBOLS)} symbols | {len(TRADING_KILLZONES)} killzones
+📊 {len(SYMBOLS)} symbols | Entry KZs: {', '.join(ENTRY_KILLZONES)}
 🎯 Min RR: {MIN_RR} | Max trades: {MAX_TOTAL_TRADES}
-⚡ Displacement OB/FVG | Liquidity Sweep | Momentum | Dynamic Risk | Grading | Partial TP | Trailing | Cooldown | Regime Filter""")
 
-        # === MAIN LOOP ===
+⚡ <b>Strategie:</b>
+• Top-down: 1H bias → 15M structuur → 5M entry
+• Zone-based: OB/FVG opslaan → wachten op retest
+• Confirmatie verplicht: rejection wick / engulfing / pin bar
+• Premium/Discount filter
+• BOS/CHoCH structuur analyse""")
+
         while True:
             try:
-                info = await conn.get_account_information()
-                balance = info["balance"]
-                equity = info["equity"]
-                positions = await conn.get_positions()
-
-                update_weekly_loss(balance)
                 await send_heartbeat(conn)
-                await check_closed_trades(conn)
 
-                # === FILTERS ===
-                if not check_weekly(balance):
+                if not await check_connection_health(conn):
+                    log.warning("Connection unhealthy, reconnecting...")
+                    try:
+                        await conn.connect()
+                        await conn.wait_synchronized(timeout_in_seconds=60)
+                        log.info("Reconnected!")
+                    except Exception as e:
+                        log.error(f"Reconnect failed: {e}")
+                        await asyncio.sleep(30)
+                        continue
+
+                kz = get_current_killzone()
+
+                if kz == "asia":
+                    await update_asia_range(account)
                     await asyncio.sleep(60)
                     continue
 
+                if kz not in ENTRY_KILLZONES and kz != "ny_pm":
+                    info = await rate_limited_call(conn.get_account_information())
+                    positions = await rate_limited_call(conn.get_positions())
+                    if positions:
+                        await manage_positions(conn, positions)
+                    await asyncio.sleep(30)
+                    continue
+
+                info = await rate_limited_call(conn.get_account_information())
+                balance = info["balance"]
+                equity = info["equity"]
+                positions = await rate_limited_call(conn.get_positions())
+
+                update_weekly_loss(balance)
+                await check_closed_trades(conn)
+
+                if positions:
+                    await manage_positions(conn, positions)
+
+                if not check_weekly(balance):
+                    await asyncio.sleep(60)
+                    continue
                 if not check_daily(balance):
                     await asyncio.sleep(60)
                     continue
@@ -996,98 +1366,73 @@ async def run():
                     await asyncio.sleep(60)
                     continue
 
-                # Globale killzone check
-                kz = get_current_killzone()
-                if kz not in TRADING_KILLZONES:
-                    await asyncio.sleep(30)
-                    continue
-
-                # Candle close timing
                 if not is_candle_just_closed(5):
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
-                # News
                 if not await news_filter():
                     await asyncio.sleep(60)
                     continue
 
-                # Max trades
                 if len(positions) >= MAX_TOTAL_TRADES:
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
-                # Asia range update
-                await update_asia_range(account)
-
-                # Position management
-                await manage_positions(conn, positions)
-
-                # === ANALYZE ALL SYMBOLS ===
                 for symbol in SYMBOLS:
-                    # Killzone symbol filter
-                    if not is_symbol_allowed_in_killzone(symbol):
+                    allowed, _ = is_entry_allowed(symbol)
+                    if not allowed:
                         continue
-
-                    # Max per asset
                     if sum(1 for p in positions if p["symbol"] == symbol) >= MAX_TRADES_PER_ASSET:
                         continue
-
-                    # Correlatie
                     if not check_correlation(symbol, positions):
                         continue
 
-                    # Dubbel signaal
-                    sig_key = f"{symbol}_{int(time.time()/300)}"  # max 1 trade per 5 min per symbol
-                    if sig_key in open_signals:
+                    sig_key = f"{symbol}_{int(time.time()/900)}"
+                    if sig_key in recent_signals:
                         continue
 
-                    # ANALYSE
-                    direction, grade, details = await analyze_symbol(
-                        account, conn, symbol, positions, balance
-                    )
-                    if not direction:
+                    setup = await analyze_and_find_setup(account, conn, symbol, positions, balance)
+                    if not setup:
                         continue
 
-                    # EXECUTE
-                    success = await execute_trade(conn, symbol, direction, grade, details, balance)
+                    success = await execute_trade(conn, setup, balance)
                     if success:
-                        open_signals[sig_key] = time.time()
+                        recent_signals[sig_key] = time.time()
 
                     await asyncio.sleep(1)
 
-                # Cleanup
                 now = time.time()
-                for k in list(open_signals.keys()):
-                    if now - open_signals[k] > 3600:
-                        del open_signals[k]
+                for k in list(recent_signals.keys()):
+                    if now - recent_signals[k] > 7200:
+                        del recent_signals[k]
 
                 await asyncio.sleep(CHECK_INTERVAL)
 
             except Exception as e:
-                print(f"Loop error: {e}")
+                log.error(f"Loop error: {e}")
                 await asyncio.sleep(10 if "timed out" in str(e).lower() else 5)
 
     except Exception as e:
-        print(f"❌ FATAL: {e}")
-        tg(f"❌ FATAL: {str(e)[:100]}")
+        log.critical(f"FATAL: {e}")
+        tg(f"❌ <b>FATAL</b>: {str(e)[:100]}")
         raise e
 
 # ==================== START ====================
 
 if __name__ == "__main__":
-    print(f"\n{'='*50}")
-    print("🚀 PROFESSIONAL SMC BOT v2.1 — AGGRESSIVE MODE")
-    print(f"{'='*50}\n")
+    log.info("=" * 50)
+    log.info("PROFESSIONAL SMC BOT v3.0")
+    log.info("Zone-based | Confirmation Required | Top-Down")
+    log.info("=" * 50)
 
     while True:
         try:
             asyncio.run(run())
         except KeyboardInterrupt:
-            tg("🛑 BOT GESTOPT")
-            print("\n🛑 Gestopt")
+            tg("🛑 <b>BOT GESTOPT</b>")
+            log.info("Stopped by user")
             break
         except Exception as e:
-            tg(f"💥 CRASH: {str(e)[:80]}")
-            print(f"Crash: {e}\nRestart in 5s...")
-            time.sleep(5)
+            tg(f"💥 <b>CRASH</b>: {str(e)[:80]}")
+            log.error(f"Crash: {e} — Restart in 10s...")
+            time.sleep(10)
