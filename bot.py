@@ -166,13 +166,13 @@ async def send_heartbeat(conn):
 🔥 Losses in row: {daily['losses_in_row']}
 📊 Trades vandaag: {daily['trades_today']}
 
-⏰ {datetime.utcnow().strftime('%H:%M:%S')} UTC"""
+⏰ {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M:%S')} UTC"""
     tg(msg)
 
 # ==================== KILLZONE FILTER ====================
 
 def get_current_killzone():
-    hour = datetime.utcnow().hour
+    hour = datetime.now(timezone.utc).replace(tzinfo=None).hour
     for name, data in KILLZONES.items():
         if data["start"] <= hour < data["end"]:
             return name
@@ -202,7 +202,20 @@ async def update_asia_range(account):
                 continue
             df = pd.DataFrame(candles)
             if "time" in df.columns:
-                df["hour"] = pd.to_datetime(df["time"]).dt.hour
+                # Handle both int (unix ms), int (unix s), and string timestamps
+                def parse_hour(t):
+                    try:
+                        if isinstance(t, (int, float)):
+                            # Als het een unix timestamp is (ms of s)
+                            if t > 1e10:
+                                t = t / 1000  # milliseconds naar seconds
+                            return datetime.utcfromtimestamp(t).hour
+                        else:
+                            return pd.to_datetime(t, utc=True).hour
+                    except Exception:
+                        return -1
+
+                df["hour"] = df["time"].apply(parse_hour)
                 asia = df[(df["hour"] >= 0) & (df["hour"] < 7)]
                 if len(asia) >= 4:
                     asia_range_cache[symbol] = {
@@ -216,7 +229,7 @@ async def update_asia_range(account):
 # ==================== WEEKLY / DAILY LIMIETEN ====================
 
 def check_weekly(balance):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     cw = now.isocalendar()[1]
     if weekly["week"] != cw:
         if now.weekday() == WEEKLY_RESET_DAY and now.hour >= WEEKLY_RESET_HOUR:
@@ -300,7 +313,7 @@ async def news_filter():
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         res = urllib.request.urlopen(req, timeout=10)
         events = json.loads(res.read().decode())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         for event in events:
             if event.get("impact") != "High":
                 continue
@@ -546,7 +559,7 @@ async def get_htf_bias(account, symbol):
 
 def is_candle_just_closed(tf_min=5):
     """Check eerste 60 sec na candle close"""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     if now.minute % tf_min == 0 and now.second < 60:
         return True
     return False
@@ -700,7 +713,7 @@ async def manage_positions(conn, positions):
 
 async def check_closed_trades(conn):
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         history = await conn.get_deals_by_time_range(start, now)
         if not history:
@@ -863,7 +876,7 @@ async def execute_trade(conn, symbol, direction, grade, details, balance):
     daily["trades_today"] += 1
 
     trade_journal.append({
-        "time": datetime.utcnow().isoformat(), "symbol": symbol,
+        "time": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), "symbol": symbol,
         "direction": direction, "grade": grade, "entry": entry,
         "sl": sl, "tp1": tp1, "tp2": tp2, "lot": lot, "rr": rr,
         "risk_pct": risk_pct, "reasons": details["reasons"],
@@ -888,7 +901,7 @@ async def execute_trade(conn, symbol, direction, grade, details, balance):
 🔍 {details['regime'].upper()} | {r}
 💰 Bal: ${balance:.2f}
 
-⏰ {datetime.utcnow().strftime('%H:%M:%S')} UTC""")
+⏰ {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%H:%M:%S')} UTC""")
 
     return True
 
@@ -905,7 +918,7 @@ async def run_diagnostics(conn, account):
     except Exception as e:
         print(f"❌ Account error: {e}")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     kz = get_current_killzone()
     print(f"\n🕐 {now.strftime('%H:%M:%S')} UTC | KZ: {kz or 'GEEN'}")
     print(f"📈 Symbols: {len(SYMBOLS)} | Max trades: {MAX_TOTAL_TRADES}")
@@ -1025,7 +1038,7 @@ async def run():
                         continue
 
                     # Dubbel signaal
-                    sig_key = f"{symbol}_{int(time.time()/1800)}"
+                    sig_key = f"{symbol}_{int(time.time()/300)}"  # max 1 trade per 5 min per symbol
                     if sig_key in open_signals:
                         continue
 
