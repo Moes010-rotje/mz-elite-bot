@@ -1,23 +1,35 @@
 import asyncio
 import pandas as pd
+import numpy as np
 import os
 import time
 import json
 import urllib.request
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from metaapi_cloud_sdk import MetaApi
 
-CHECK_INTERVAL = 2
-RISK = 0.01
-MIN_RR = 1.2
-DAILY_LOSS_LIMIT = 0.03
-MAX_TRADES_PER_ASSET = 6
+# ==================== CONFIGURATIE ====================
+
+CHECK_INTERVAL = 2  # seconden
+RISK = 0.01  # 1% risico per trade
+MIN_RR = 2.0  # minimale risk/reward ratio (1:2)
+DAILY_LOSS_LIMIT = 0.03  # 3% daily loss limit
+MAX_TRADES_PER_ASSET = 4  # max 4 trades per asset (aangepast)
+WEEKLY_RESET_DAY = 2  # Wednesday (0=Monday, 2=Wednesday)
+WEEKLY_RESET_HOUR = 22  # 22:00 UTC
+
+# Sessie tijden (UTC)
+SESSIONS = {
+    "asia": {"start": 0, "end": 7, "symbols": ["USDJPY", "GBPJPY", "BTCUSD"]},
+    "london": {"start": 7, "end": 16, "symbols": "all"},
+    "ny": {"start": 13, "end": 21, "symbols": "all"}
+}
 
 SYMBOLS = [
-"XAUUSD","XAGUSD","BTCUSD",
-"EURUSD","GBPUSD","USDJPY","USDCHF",
-"NAS100","US30","US500"
+    "XAUUSD", "XAGUSD", "BTCUSD",
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF",
+    "NAS100", "US30", "US500"
 ]
 
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
@@ -25,347 +37,759 @@ ACCOUNT_ID = os.getenv("ACCOUNT_ID")
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT = os.getenv("TG_CHAT")
 
-daily = {"date":None,"start":0}
-last_status = 0
+# ==================== GLOBALE VARIABELEN ====================
 
-CORRELATED = [
-["EURUSD","GBPUSD"],
-["NAS100","US500"],
-["XAUUSD","XAGUSD"]
+daily = {"date": None, "start": 0}
+weekly = {"week": None, "loss": 0, "limit_hit": False}
+last_status = 0
+open_signals = {}  # Bijhouden welke signalen al zijn gebruikt
+correlation_pairs = [
+    ["EURUSD", "GBPUSD"],
+    ["NAS100", "US500"],
+    ["XAUUSD", "XAGUSD"]
 ]
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------------- TELEGRAM ----------------
+# ==================== TELEGRAM ====================
 
 def tg(msg):
+    """Stuur notificatie via Telegram"""
     try:
-        url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data=json.dumps({"chat_id":TG_CHAT,"text":msg}).encode()
-        req=urllib.request.Request(url,data=data,headers={"Content-Type":"application/json"})
-        urllib.request.urlopen(req)
-    except:
-        print("TG ERROR")
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        data = json.dumps({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
-# ---------------- HEARTBEAT ----------------
+# ==================== HEARTBEAT ====================
 
-def heartbeat(balance,equity,positions):
-
+def heartbeat(balance, equity, positions):
+    """Stuur elke 10 minuten statusupdate"""
     global last_status
-
-    if time.time() - last_status >= 600:
-
+    
+    if time.time() - last_status >= 600:  # 10 minuten
         last_status = time.time()
+        
+        # Bereken P&L
+        pl = equity - balance
+        pl_pct = (pl / balance) * 100 if balance > 0 else 0
+        
+        # Bepaal huidige sessie
+        current_hour = datetime.utcnow().hour
+        session = "outside"
+        for s_name, s_data in SESSIONS.items():
+            if s_data["start"] <= current_hour < s_data["end"]:
+                session = s_name
+                break
+        
+        msg = f"""
+<b>🤖 BOT STATUS</b>
 
-        tg(f"""
-BOT STATUS
+💰 Balance: ${round(balance, 2)}
+📊 Equity: ${round(equity, 2)}
+📈 P&L: {round(pl, 2)} ({round(pl_pct, 2)}%)
 
-Balance: {round(balance,2)}
-Equity: {round(equity,2)}
+🎯 Open trades: {len(positions)}
+🕐 Sessie: {session.upper()}
+📅 Daily loss: {round((daily['start']-balance)/daily['start']*100, 2)}%
+📆 Weekly loss: {round(weekly['loss']*100, 2)}%
 
-Open trades: {len(positions)}
+⏰ {datetime.utcnow().strftime('%H:%M:%S')} UTC
+"""
+        tg(msg)
 
-Scanning: {len(SYMBOLS)} assets
+# ==================== WEEKLY LIMIET ====================
 
-Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
-""")
+def check_weekly():
+    """Check of weekly limit is bereikt (reset Wednesday 22:00 UTC)"""
+    now = datetime.utcnow()
+    current_week = now.isocalendar()[1]
+    
+    # Reset op Wednesday 22:00 UTC
+    if weekly["week"] != current_week:
+        if now.weekday() == WEEKLY_RESET_DAY and now.hour >= WEEKLY_RESET_HOUR:
+            weekly["week"] = current_week
+            weekly["loss"] = 0
+            weekly["limit_hit"] = False
+            tg("📊 WEEKLY LIMIT RESET")
+    
+    return not weekly["limit_hit"]
 
-# ---------------- SESSION ----------------
+def update_weekly_loss(current_balance, start_balance):
+    """Update weekly loss op basis van huidige drawdown"""
+    if start_balance > 0:
+        loss = (start_balance - current_balance) / start_balance
+        if loss > weekly["loss"]:
+            weekly["loss"] = loss
 
-def session_filter():
-    return True
+# ==================== SESSIE FILTER ====================
 
-# ---------------- NEWS ----------------
+def get_current_session():
+    """Bepaal huidige handelssessie"""
+    now = datetime.utcnow()
+    hour = now.hour
+    
+    for session_name, session_data in SESSIONS.items():
+        if session_data["start"] <= hour < session_data["end"]:
+            return session_name
+    return None
 
-def news_filter():
-    try:
-        url="https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla"})
-        res=urllib.request.urlopen(req)
-
-        events=json.loads(res.read().decode())
-        now=datetime.utcnow()
-
-        for e in events:
-            if e.get("impact")!="High":
-                continue
-
-            try:
-                # ✅ FIXED HIER
-                if isinstance(e["date"], int):
-                    t=datetime.fromtimestamp(e["date"])
-                else:
-                    t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
-            except:
-                continue
-
-            if abs((now-t).total_seconds()) < 1800:
-                tg("NEWS FILTER ACTIVE")
-                return False
-
-        return True
-
-    except:
-        return True
-
-# ---------------- CORRELATION ----------------
-
-def correlation_block(symbol,positions):
-    for pair in CORRELATED:
-        if symbol in pair:
-            for p in positions:
-                if p["symbol"] in pair:
-                    return True
+def session_filter(symbol):
+    """Check of asset mag worden verhandeld in huidige sessie"""
+    session = get_current_session()
+    if not session:
+        return False
+    
+    session_data = SESSIONS[session]
+    if session_data["symbols"] == "all" or symbol in session_data["symbols"]:
+        return session
+    
     return False
 
-# ---------------- MAX TRADES ----------------
+# ==================== NIEUWS FILTER ====================
 
-def max_trades_filter(symbol,positions):
-    return sum(1 for p in positions if p["symbol"] == symbol) >= MAX_TRADES_PER_ASSET
+async def news_filter():
+    """Check voor high-impact nieuws (30 min voor/na)"""
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        res = urllib.request.urlopen(req, timeout=10)
+        
+        events = json.loads(res.read().decode())
+        now = datetime.utcnow()
+        
+        for event in events:
+            if event.get("impact") != "High":
+                continue
+            
+            try:
+                # Parse event tijd
+                event_time = datetime.strptime(event["date"], "%Y-%m-%dT%H:%M:%S%z")
+                event_time = event_time.replace(tzinfo=None)
+                
+                # Check 30 min voor en na
+                time_diff = (now - event_time).total_seconds()
+                if -1800 <= time_diff <= 1800:  # 30 min in seconden
+                    tg(f"📰 NIEUWSFILTER: {event.get('title', 'Unknown')} - {event_time.strftime('%H:%M')} UTC")
+                    return False
+                    
+            except:
+                continue
+        
+        return True
+        
+    except Exception as e:
+        print(f"News filter error: {e}")
+        return True  # Bij fout, gewoon doorgaan
 
-# ---------------- INDICATORS ----------------
+# ==================== CORRELATIE FILTER ====================
 
-def indicators(df):
-
-    df["ema50"]=df.close.ewm(span=50).mean()
-    df["ema200"]=df.close.ewm(span=200).mean()
-
-    delta=df.close.diff()
-    gain=delta.clip(lower=0).rolling(14).mean()
-    loss=(-delta.clip(upper=0)).rolling(14).mean()
-
-    rs=gain/loss
-    df["rsi"]=100-(100/(1+rs))
-
-    return df
-
-# ---------------- EXTRA SMC ----------------
-
-def market_structure(df):
-    if df.high.iloc[-1] > df.high.iloc[-2] and df.low.iloc[-1] > df.low.iloc[-2]:
-        return "bull"
-    if df.high.iloc[-1] < df.high.iloc[-2] and df.low.iloc[-1] < df.low.iloc[-2]:
-        return "bear"
-    return None
-
-def liquidity_sweep(df):
-    last=df.iloc[-1]
-    prev=df.iloc[-2]
-
-    if last.high > prev.high and last.close < prev.high:
-        return "sell"
-    if last.low < prev.low and last.close > prev.low:
-        return "buy"
-    return None
-
-def fvg(df):
-    c1=df.iloc[-3]
-    c3=df.iloc[-1]
-
-    if c1.high < c3.low:
-        return "bull"
-    if c1.low > c3.high:
-        return "bear"
-    return None
-
-# ---------------- MULTI TF ----------------
-
-async def multi_tf(account,symbol):
-    candles=await account.get_historical_candles(symbol,"1h",100)
-    df=pd.DataFrame(candles)
-    df["ema50"]=df.close.ewm(span=50).mean()
-    df["ema200"]=df.close.ewm(span=200).mean()
-
-    if df.ema50.iloc[-1] > df.ema200.iloc[-1]:
-        return "bull"
-    if df.ema50.iloc[-1] < df.ema200.iloc[-1]:
-        return "bear"
-    return None
-
-# ---------------- SIGNAL ----------------
-
-def signal(df, htf):
-
-    last=df.iloc[-1]
-    prev=df.iloc[-2]
-
-    trend=market_structure(df)
-    gap=fvg(df)
-
-    if htf=="bull" and trend=="bull" and gap=="bull":
-        return "buy","SMC STRONG"
-
-    if htf=="bear" and trend=="bear" and gap=="bear":
-        return "sell","SMC STRONG"
-
-    if last.close > prev.high:
-        return "buy","FAST BREAKOUT"
-
-    if last.close < prev.low:
-        return "sell","FAST BREAKOUT"
-
-    if last.rsi > 52:
-        return "buy","RSI SCALP"
-
-    if last.rsi < 48:
-        return "sell","RSI SCALP"
-
-    return None,None
-
-# ---------------- LOT ----------------
-
-def lot_size(balance,sl_distance):
-    lot=(balance*RISK)/(sl_distance*10)
-    return round(max(0.01,min(lot,5)),2)
-
-# ---------------- DAILY ----------------
-
-def check_daily(balance):
-
-    today=date.today()
-
-    if daily["date"]!=today:
-        daily["date"]=today
-        daily["start"]=balance
-
-    loss=(daily["start"]-balance)/daily["start"]
-
-    if loss >= DAILY_LOSS_LIMIT:
-        tg("DAILY LOSS LIMIT HIT")
-        return False
-
+def get_best_correlated_setup(symbol, positions):
+    """Kies beste setup van gecorreleerde paren"""
+    for pair in correlation_pairs:
+        if symbol in pair:
+            # Tel open posities in dit paar
+            pair_positions = [p for p in positions if p["symbol"] in pair]
+            
+            # Als er al een positie open is in dit paar, geen nieuwe
+            if len(pair_positions) >= 1:
+                return False
+            
+            # Anders, check of we al een signaal hebben voor het andere paar
+            other_symbol = pair[0] if pair[1] == symbol else pair[1]
+            if other_symbol in open_signals:
+                # Vergelijk setup kwaliteit (kan worden uitgebreid)
+                return False
+    
     return True
 
-# ---------------- TRAILING ----------------
+# ==================== INDICATOREN ====================
 
-async def trailing(conn):
+def calculate_indicators(df):
+    """Bereken alle technische indicatoren"""
+    
+    # EMA's
+    df["ema50"] = df.close.ewm(span=50).mean()
+    df["ema200"] = df.close.ewm(span=200).mean()
+    
+    # RSI
+    delta = df.close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+    
+    # MACD
+    exp1 = df.close.ewm(span=12).mean()
+    exp2 = df.close.ewm(span=26).mean()
+    df["macd"] = exp1 - exp2
+    df["macd_signal"] = df["macd"].ewm(span=9).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    
+    # ATR voor trailing stops
+    df["tr"] = np.maximum(
+        df.high - df.low,
+        np.maximum(
+            abs(df.high - df.close.shift()),
+            abs(df.low - df.close.shift())
+        )
+    )
+    df["atr"] = df["tr"].rolling(14).mean()
+    
+    return df
+
+# ==================== SMC INDICATOREN ====================
+
+def find_order_blocks(df):
+    """Identificeer Order Blocks"""
+    if len(df) < 5:
+        return None
+    
+    last_5 = df.tail(5)
+    
+    # Bullish Order Block: sterke up candle na consolidatie
+    if (last_5.iloc[-2].close > last_5.iloc[-3].high and  # Breakout
+        last_5.iloc[-3].close < last_5.iloc[-4].close):   # Vorige candle was bearish
+        return "bull"
+    
+    # Bearish Order Block: sterke down candle na consolidatie
+    if (last_5.iloc[-2].close < last_5.iloc[-3].low and   # Breakdown
+        last_5.iloc[-3].close > last_5.iloc[-4].close):   # Vorige candle was bullish
+        return "bear"
+    
+    return None
+
+def find_fair_value_gap(df):
+    """Identificeer Fair Value Gaps"""
+    if len(df) < 4:
+        return None
+    
+    c1 = df.iloc[-4]
+    c2 = df.iloc[-3]
+    c3 = df.iloc[-2]
+    
+    # Bullish FVG: gap tussen c1 high en c3 low
+    if c2.low > c1.high and c3.low > c2.high:
+        if c3.low > c1.high:
+            return "bull"
+    
+    # Bearish FVG: gap tussen c1 low en c3 high  
+    if c2.high < c1.low and c3.high < c2.low:
+        if c3.high < c1.low:
+            return "bear"
+    
+    return None
+
+def find_liquidity_sweep(df):
+    """Identificeer Liquidity Sweeps"""
+    if len(df) < 3:
+        return None
+    
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    
+    # Bullish liquidity sweep: lagere low dan vorige, dan sluiten boven vorige high
+    if last.low < prev2.low and last.close > prev.high:
+        return "bull"
+    
+    # Bearish liquidity sweep: hogere high dan vorige, dan sluiten onder vorige low
+    if last.high > prev2.high and last.close < prev.low:
+        return "bear"
+    
+    return None
+
+def market_structure(df):
+    """Bepaal marktstructuur (HH/HL of LH/LL)"""
+    if len(df) < 5:
+        return None
+    
+    highs = df.high.tail(5).tolist()
+    lows = df.low.tail(5).tolist()
+    
+    # Hogere highs en hogere lows = uptrend
+    if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+        if highs[-2] > highs[-3] and lows[-2] > lows[-3]:
+            return "bull"
+    
+    # Lagere highs en lagere lows = downtrend
+    if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+        if highs[-2] < highs[-3] and lows[-2] < lows[-3]:
+            return "bear"
+    
+    return None
+
+def break_of_structure(df):
+    """Check voor Break of Structure"""
+    if len(df) < 3:
+        return None
+    
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # Bullish BOS: doorbreken vorige high
+    if last.high > prev.high and last.close > prev.high:
+        return "bull"
+    
+    # Bearish BOS: doorbreken vorige low
+    if last.low < prev.low and last.close < prev.low:
+        return "bear"
+    
+    return None
+
+# ==================== MULTI-TIMEFRAME ====================
+
+async def get_htf_trend(account, symbol, timeframe="1h"):
+    """Bepaal trend op hoger timeframe"""
     try:
-        pos=await conn.get_positions()
-        for p in pos:
-            entry=p["openPrice"]
-            sl=p.get("stopLoss",0)
-
-            if p["type"]=="POSITION_TYPE_BUY" and sl < entry:
-                await conn.modify_position(p["id"],stop_loss=entry)
-                tg(f"TRAILING ACTIVATED: {p['symbol']}")
-
-            if p["type"]=="POSITION_TYPE_SELL" and (sl > entry or sl == 0):
-                await conn.modify_position(p["id"],stop_loss=entry)
-                tg(f"TRAILING ACTIVATED: {p['symbol']}")
+        candles = await account.get_historical_candles(symbol, timeframe, 100)
+        df = pd.DataFrame(candles)
+        df["ema50"] = df.close.ewm(span=50).mean()
+        df["ema200"] = df.close.ewm(span=200).mean()
+        
+        # Trend op basis van EMA
+        if df.ema50.iloc[-1] > df.ema200.iloc[-1]:
+            return "bull"
+        elif df.ema50.iloc[-1] < df.ema200.iloc[-1]:
+            return "bear"
+        
+        return None
     except:
-        pass
+        return None
 
-# ---------------- MAIN ----------------
+# ==================== STRATEGIEËN ====================
+
+async def smc_strong_setup(account, symbol, df_5m, df_15m):
+    """SMC Strong: 1H + 15M + 5M aligned"""
+    
+    # Haal 1h trend op
+    htf_trend = await get_htf_trend(account, symbol, "1h")
+    if not htf_trend:
+        return None, None
+    
+    # Analyseer 15m
+    df_15m = calculate_indicators(df_15m)
+    ms_15m = market_structure(df_15m)
+    ob_15m = find_order_blocks(df_15m)
+    fvg_15m = find_fair_value_gap(df_15m)
+    
+    # Analyseer 5m
+    ms_5m = market_structure(df_5m)
+    ls_5m = find_liquidity_sweep(df_5m)
+    bos_5m = break_of_structure(df_5m)
+    fvg_5m = find_fair_value_gap(df_5m)
+    
+    # Bullish setup
+    if (htf_trend == "bull" and 
+        ms_15m == "bull" and 
+        (ls_5m == "bull" or bos_5m == "bull" or fvg_5m == "bull")):
+        return "buy", "SMC STRONG"
+    
+    # Bearish setup
+    if (htf_trend == "bear" and 
+        ms_15m == "bear" and 
+        (ls_5m == "bear" or bos_5m == "bear" or fvg_5m == "bear")):
+        return "sell", "SMC STRONG"
+    
+    return None, None
+
+async def smc_normal_setup(account, symbol, df_5m, df_15m):
+    """SMC Normal: 15M + 5M aligned"""
+    
+    # Analyseer 15m
+    df_15m = calculate_indicators(df_15m)
+    ms_15m = market_structure(df_15m)
+    
+    # Analyseer 5m  
+    ms_5m = market_structure(df_5m)
+    ls_5m = find_liquidity_sweep(df_5m)
+    bos_5m = break_of_structure(df_5m)
+    fvg_5m = find_fair_value_gap(df_5m)
+    
+    # Bullish setup
+    if (ms_15m == "bull" and 
+        (ls_5m == "bull" or bos_5m == "bull" or fvg_5m == "bull")):
+        return "buy", "SMC NORMAL"
+    
+    # Bearish setup
+    if (ms_15m == "bear" and 
+        (ls_5m == "bear" or bos_5m == "bear" or fvg_5m == "bear")):
+        return "sell", "SMC NORMAL"
+    
+    return None, None
+
+async def london_breakout(account, symbol, df_5m):
+    """London Breakout (07:00-10:00 UTC)"""
+    
+    now = datetime.utcnow()
+    if not (7 <= now.hour < 10):
+        return None, None
+    
+    # Zoek naar breakout van eerste 30 min range
+    if len(df_5m) < 12:  # 30 min = 6 candles van 5m
+        return None, None
+    
+    first_6 = df_5m.head(6)
+    range_high = first_6.high.max()
+    range_low = first_6.low.min()
+    
+    last = df_5m.iloc[-1]
+    
+    # Bullish breakout
+    if last.close > range_high and last.volume > first_6.volume.mean() * 1.2:
+        return "buy", "LONDON BREAKOUT"
+    
+    # Bearish breakout
+    if last.close < range_low and last.volume > first_6.volume.mean() * 1.2:
+        return "sell", "LONDON BREAKOUT"
+    
+    return None, None
+
+async def ny_breakout(account, symbol, df_5m):
+    """NY Breakout (13:00-16:00 UTC)"""
+    
+    now = datetime.utcnow()
+    if not (13 <= now.hour < 16):
+        return None, None
+    
+    # Zoek naar breakout van eerste 30 min range
+    if len(df_5m) < 12:
+        return None, None
+    
+    first_6 = df_5m.head(6)
+    range_high = first_6.high.max()
+    range_low = first_6.low.min()
+    
+    last = df_5m.iloc[-1]
+    
+    # Bullish breakout
+    if last.close > range_high and last.volume > first_6.volume.mean() * 1.2:
+        return "buy", "NY BREAKOUT"
+    
+    # Bearish breakout
+    if last.close < range_low and last.volume > first_6.volume.mean() * 1.2:
+        return "sell", "NY BREAKOUT"
+    
+    return None, None
+
+# ==================== TRADE MANAGEMENT ====================
+
+def calculate_lot_size(balance, sl_distance):
+    """Dynamische lotsize (1% risico)"""
+    if sl_distance <= 0:
+        return 0.01
+    
+    # Voor XAUUSD andere berekening
+    lot = (balance * RISK) / (sl_distance * 10)
+    return round(max(0.01, min(lot, 5)), 2)
+
+def calculate_levels(signal_type, entry, df, atr_value):
+    """Bereken SL, TP1 en TP2"""
+    
+    if signal_type == "buy":
+        # SL op recente swing low
+        sl = df.low.tail(10).min()
+        
+        # Dynamische afstand
+        distance = entry - sl
+        
+        # TP levels
+        tp1 = entry + distance      # 1:1
+        tp2 = entry + distance * 2   # 1:2
+        
+    else:  # sell
+        # SL op recente swing high
+        sl = df.high.tail(10).max()
+        
+        # Dynamische afstand
+        distance = sl - entry
+        
+        # TP levels
+        tp1 = entry - distance      # 1:1
+        tp2 = entry - distance * 2   # 1:2
+    
+    return sl, tp1, tp2, distance
+
+async def partial_close(conn, position_id, symbol, signal_type, tp1_level):
+    """Sluit 50% op TP1"""
+    try:
+        # Controleer huidige prijs
+        price = await conn.get_symbol_price(symbol)
+        
+        if signal_type == "buy":
+            if price["bid"] >= tp1_level:
+                # Sluit 50%
+                await conn.close_position_partially(position_id, 0.5)
+                tg(f"🎯 TP1 HIT: {symbol} - 50% gesloten")
+                return True
+        else:
+            if price["ask"] <= tp1_level:
+                # Sluit 50%
+                await conn.close_position_partially(position_id, 0.5)
+                tg(f"🎯 TP1 HIT: {symbol} - 50% gesloten")
+                return True
+                
+    except Exception as e:
+        print(f"Partial close error: {e}")
+    
+    return False
+
+async def smart_trailing(conn, position, atr_value):
+    """Slimme trailing stop naar breakeven na TP1"""
+    try:
+        entry = position["openPrice"]
+        sl = position.get("stopLoss", 0)
+        symbol = position["symbol"]
+        
+        price = await conn.get_symbol_price(symbol)
+        
+        if position["type"] == "POSITION_TYPE_BUY":
+            current_price = price["bid"]
+            
+            # Verplaats SL naar breakeven + 1xATR na winst
+            if current_price > entry + atr_value * 1.5:
+                new_sl = entry + atr_value
+                if sl < new_sl:
+                    await conn.modify_position(position["id"], stop_loss=round(new_sl, 5))
+                    tg(f"🔒 TRAILING: {symbol} - SL naar breakeven + {round(atr_value, 2)}")
+        
+        else:  # sell
+            current_price = price["ask"]
+            
+            # Verplaats SL naar breakeven - 1xATR na winst
+            if current_price < entry - atr_value * 1.5:
+                new_sl = entry - atr_value
+                if sl > new_sl or sl == 0:
+                    await conn.modify_position(position["id"], stop_loss=round(new_sl, 5))
+                    tg(f"🔒 TRAILING: {symbol} - SL naar breakeven - {round(atr_value, 2)}")
+                    
+    except Exception as e:
+        print(f"Trailing error: {e}")
+
+# ==================== DAILY LIMIET ====================
+
+def check_daily(balance):
+    """Check of daily loss limit is bereikt"""
+    today = date.today()
+    
+    if daily["date"] != today:
+        daily["date"] = today
+        daily["start"] = balance
+    
+    loss = (daily["start"] - balance) / daily["start"]
+    
+    if loss >= DAILY_LOSS_LIMIT:
+        tg(f"⚠️ DAILY LIMIET BEREIKT: {round(loss*100, 2)}%")
+        return False
+    
+    return True
+
+# ==================== POSITIE MANAGEMENT ====================
+
+async def manage_positions(conn, positions):
+    """Beheer open posities (TP1, trailing)"""
+    for position in positions:
+        try:
+            # Haal ATR op voor deze positie
+            symbol = position["symbol"]
+            candles = await conn.get_account().get_historical_candles(symbol, "5m", 20)
+            df = pd.DataFrame(candles)
+            df = calculate_indicators(df)
+            atr = df.atr.iloc[-1]
+            
+            # Check TP1
+            tp1_hit = await partial_close(
+                conn, 
+                position["id"], 
+                symbol, 
+                "buy" if position["type"] == "POSITION_TYPE_BUY" else "sell",
+                position.get("takeProfit", 0)  # Dit moet worden aangepast
+            )
+            
+            # Pas trailing toe
+            await smart_trailing(conn, position, atr)
+            
+        except Exception as e:
+            print(f"Position management error: {e}")
+
+# ==================== HOOFDLOOP ====================
 
 async def run():
-
-    api=MetaApi(METAAPI_TOKEN)
-    account=await api.metatrader_account_api.get_account(ACCOUNT_ID)
-
+    """Hoofdloopt van de bot"""
+    
+    # Verbind met MetaAPI
+    api = MetaApi(METAAPI_TOKEN)
+    account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
+    
     await account.wait_connected()
-
-    conn=account.get_rpc_connection()
+    
+    conn = account.get_rpc_connection()
     await conn.connect()
     await conn.wait_synchronized()
-
-    tg("PRO BOT STARTED")
-
+    
+    tg("🚀 SONNET 4.6 GESTART")
+    
     while True:
-
         try:
-
-            info=await conn.get_account_information()
-            balance=info["balance"]
-            equity=info["equity"]
-
-            positions=await conn.get_positions()
-
-            heartbeat(balance,equity,positions)
-
-            if not session_filter():
-                await asyncio.sleep(30)
-                continue
-
-            if not news_filter():
+            # Account informatie
+            info = await conn.get_account_information()
+            balance = info["balance"]
+            equity = info["equity"]
+            
+            positions = await conn.get_positions()
+            
+            # Update weekly loss
+            update_weekly_loss(balance, daily["start"] if daily["start"] > 0 else balance)
+            
+            # Heartbeat
+            heartbeat(balance, equity, positions)
+            
+            # Filters
+            if not check_weekly():
                 await asyncio.sleep(60)
                 continue
-
+                
             if not check_daily(balance):
                 await asyncio.sleep(60)
                 continue
-
-            await trailing(conn)
-
+                
+            if not await news_filter():
+                await asyncio.sleep(60)
+                continue
+            
+            # Beheer open posities
+            await manage_positions(conn, positions)
+            
+            # Scan symbolen voor nieuwe signalen
             for symbol in SYMBOLS:
-
-                if correlation_block(symbol,positions):
+                
+                # Check sessie
+                current_session = session_filter(symbol)
+                if not current_session:
                     continue
-
-                if max_trades_filter(symbol,positions):
+                
+                # Check correlatie
+                if not get_best_correlated_setup(symbol, positions):
                     continue
-
-                candles=await account.get_historical_candles(symbol,"5m",200)
-                df=pd.DataFrame(candles)
-
-                df=indicators(df)
-
-                htf=await multi_tf(account,symbol)
-
-                s,setup=signal(df,htf)
-
-                if not s:
+                
+                # Check max trades
+                symbol_positions = [p for p in positions if p["symbol"] == symbol]
+                if len(symbol_positions) >= MAX_TRADES_PER_ASSET:
                     continue
-
-                price=await conn.get_symbol_price(symbol)
-
-                if s=="buy":
-                    entry=price["ask"]
-                    sl=df.low.tail(10).min()
-                    risk=entry-sl
-                    tp2=entry+risk*2
-
+                
+                # Haal candles op
+                candles_5m = await account.get_historical_candles(symbol, "5m", 100)
+                candles_15m = await account.get_historical_candles(symbol, "15m", 100)
+                
+                df_5m = pd.DataFrame(candles_5m)
+                df_15m = pd.DataFrame(candles_15m)
+                
+                if len(df_5m) < 50 or len(df_15m) < 30:
+                    continue
+                
+                # Bereken indicatoren
+                df_5m = calculate_indicators(df_5m)
+                df_15m = calculate_indicators(df_15m)
+                
+                # Probeer verschillende strategieën
+                signal = None
+                setup_name = None
+                
+                # SMC Strong (1e prioriteit)
+                signal, setup_name = await smc_strong_setup(account, symbol, df_5m, df_15m)
+                
+                # SMC Normal (2e prioriteit)
+                if not signal:
+                    signal, setup_name = await smc_normal_setup(account, symbol, df_5m, df_15m)
+                
+                # London Breakout (3e prioriteit)
+                if not signal and current_session == "london":
+                    signal, setup_name = await london_breakout(account, symbol, df_5m)
+                
+                # NY Breakout (3e prioriteit)
+                if not signal and current_session == "ny":
+                    signal, setup_name = await ny_breakout(account, symbol, df_5m)
+                
+                if not signal:
+                    continue
+                
+                # Controleer of signaal al is gebruikt (laatste 30 min)
+                signal_key = f"{symbol}_{signal}_{int(time.time()/1800)}"
+                if signal_key in open_signals:
+                    continue
+                
+                # Prijsinformatie
+                price = await conn.get_symbol_price(symbol)
+                
+                # Bereken levels
+                if signal == "buy":
+                    entry = price["ask"]
+                    sl, tp1, tp2, distance = calculate_levels("buy", entry, df_5m, df_5m.atr.iloc[-1])
                 else:
-                    entry=price["bid"]
-                    sl=df.high.tail(10).max()
-                    risk=sl-entry
-                    tp2=entry-risk*2
-
-                rr=abs((tp2-entry)/risk)
-
+                    entry = price["bid"]
+                    sl, tp1, tp2, distance = calculate_levels("sell", entry, df_5m, df_5m.atr.iloc[-1])
+                
+                # Check minimale RR
+                rr = abs((tp2 - entry) / distance)
                 if rr < MIN_RR:
                     continue
-
-                lot=lot_size(balance,abs(risk))
-
-                if s=="buy":
-                    await conn.create_market_buy_order(symbol,lot,sl,tp2)
+                
+                # Bereken lotsize
+                lot = calculate_lot_size(balance, abs(distance))
+                
+                # Open trade
+                if signal == "buy":
+                    order = await conn.create_market_buy_order(symbol, lot, sl, tp2)
                 else:
-                    await conn.create_market_sell_order(symbol,lot,sl,tp2)
+                    order = await conn.create_market_sell_order(symbol, lot, sl, tp2)
+                
+                # Sla signaal op
+                open_signals[signal_key] = time.time()
+                
+                # Opruimen oude signalen (ouder dan 30 min)
+                current_time = time.time()
+                for key in list(open_signals.keys()):
+                    if current_time - open_signals[key] > 1800:
+                        del open_signals[key]
+                
+                # Notificatie
+                msg = f"""
+<b>✅ TRADE GEOPEND</b>
 
-                tg(f"""
-TRADE OPEN
+📌 {symbol} - {setup_name}
+📈 Type: {signal.upper()}
+💵 Sessie: {current_session.upper()}
 
-Symbol: {symbol}
-Type: {s}
-Setup: {setup}
+💰 Entry: {round(entry, 5)}
+🛑 SL: {round(sl, 5)}
+🎯 TP1: {round(tp1, 5)} (50%)
+🎯 TP2: {round(tp2, 5)} (50%)
 
-Entry: {entry}
-SL: {sl}
-TP: {tp2}
+📊 RR: 1:{round(rr, 2)}
+📦 Lots: {lot}
+💵 Balance: ${round(balance, 2)}
 
-RR: {round(rr,2)}
-Balance: {round(balance,2)}
-""")
-
+⏰ {datetime.utcnow().strftime('%H:%M:%S')} UTC
+"""
+                tg(msg)
+                
+                # Wacht even tussen trades
+                await asyncio.sleep(2)
+            
             await asyncio.sleep(CHECK_INTERVAL)
-
+            
         except Exception as e:
-            tg(f"BOT ERROR: {str(e)}")
+            tg(f"❌ FOUT: {str(e)}")
             await asyncio.sleep(5)
 
-while True:
-    try:
-        asyncio.run(run())
-    except Exception as e:
-        tg(f"CRASH: {str(e)}")
-        time.sleep(5)
+# ==================== START ====================
+
+if __name__ == "__main__":
+    while True:
+        try:
+            asyncio.run(run())
+        except Exception as e:
+            tg(f"💥 CRASH: {str(e)}")
+            time.sleep(5)
