@@ -8,11 +8,11 @@ import logging
 from datetime import datetime, date
 from metaapi_cloud_sdk import MetaApi
 
-CHECK_INTERVAL = 5
+CHECK_INTERVAL = 2
 RISK = 0.01
-MIN_RR = 1.5
+MIN_RR = 1.2
 DAILY_LOSS_LIMIT = 0.03
-MAX_TRADES_PER_ASSET = 4
+MAX_TRADES_PER_ASSET = 6
 
 SYMBOLS = [
 "XAUUSD","XAGUSD","BTCUSD",
@@ -45,7 +45,7 @@ def tg(msg):
         req=urllib.request.Request(url,data=data,headers={"Content-Type":"application/json"})
         urllib.request.urlopen(req)
     except:
-        pass
+        print("TG ERROR")
 
 # ---------------- HEARTBEAT ----------------
 
@@ -53,14 +53,11 @@ def heartbeat(balance,equity,positions):
 
     global last_status
 
-    now=time.time()
+    if time.time() - last_status >= 600:
 
-    if now-last_status < 600:
-        return
+        last_status = time.time()
 
-    last_status=now
-
-    tg(f"""
+        tg(f"""
 BOT STATUS
 
 Balance: {round(balance,2)}
@@ -73,178 +70,167 @@ Scanning: {len(SYMBOLS)} assets
 Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
 """)
 
-# ---------------- SESSION FILTER ----------------
+# ---------------- SESSION ----------------
 
 def session_filter():
-
-    h=datetime.utcnow().hour
-
-    london = 6 <= h <= 12
-    newyork = 13 <= h <= 20
-
-    return london or newyork
-
-# ---------------- SPREAD FILTER ----------------
-
-def spread_ok(symbol,spread):
-
-    if symbol in ["EURUSD","GBPUSD","USDJPY","USDCHF"]:
-        return spread < 0.0003
-
-    if symbol in ["XAUUSD","XAGUSD"]:
-        return spread < 0.5
-
-    if symbol == "BTCUSD":
-        return spread < 50
-
     return True
 
-# ---------------- CORRELATION FILTER ----------------
+# ---------------- NEWS ----------------
+
+def news_filter():
+    try:
+        url="https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        req=urllib.request.Request(url,headers={"User-Agent":"Mozilla"})
+        res=urllib.request.urlopen(req)
+
+        events=json.loads(res.read().decode())
+        now=datetime.utcnow()
+
+        for e in events:
+            if e.get("impact")!="High":
+                continue
+
+            try:
+                t=datetime.strptime(e["date"],"%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
+            except:
+                continue
+
+            if abs((now-t).total_seconds()) < 1800:
+                tg("NEWS FILTER ACTIVE")
+                return False
+
+        return True
+
+    except:
+        return True
+
+# ---------------- CORRELATION ----------------
 
 def correlation_block(symbol,positions):
-
     for pair in CORRELATED:
-
         if symbol in pair:
-
             for p in positions:
-
                 if p["symbol"] in pair:
                     return True
-
     return False
+
+# ---------------- MAX TRADES ----------------
+
+def max_trades_filter(symbol,positions):
+    return sum(1 for p in positions if p["symbol"] == symbol) >= MAX_TRADES_PER_ASSET
 
 # ---------------- INDICATORS ----------------
 
 def indicators(df):
 
-    df["ema12"]=df.close.ewm(span=12).mean()
-    df["ema26"]=df.close.ewm(span=26).mean()
-
-    df["macd"]=df.ema12-df.ema26
-    df["signal"]=df.macd.ewm(span=9).mean()
+    df["ema50"]=df.close.ewm(span=50).mean()
+    df["ema200"]=df.close.ewm(span=200).mean()
 
     delta=df.close.diff()
-
     gain=delta.clip(lower=0).rolling(14).mean()
     loss=(-delta.clip(upper=0)).rolling(14).mean()
 
     rs=gain/loss
     df["rsi"]=100-(100/(1+rs))
 
-    tr=df.high-df.low
-    df["atr"]=tr.rolling(14).mean()
-
     return df
 
-# ---------------- MARKET STRUCTURE ----------------
+# ---------------- EXTRA SMC ----------------
 
 def market_structure(df):
-
-    h=df.high
-    l=df.low
-
-    if h.iloc[-1] > h.iloc[-2] and l.iloc[-1] > l.iloc[-2]:
+    if df.high.iloc[-1] > df.high.iloc[-2] and df.low.iloc[-1] > df.low.iloc[-2]:
         return "bull"
-
-    if h.iloc[-1] < h.iloc[-2] and l.iloc[-1] < l.iloc[-2]:
+    if df.high.iloc[-1] < df.high.iloc[-2] and df.low.iloc[-1] < df.low.iloc[-2]:
         return "bear"
-
     return None
-
-# ---------------- FVG ----------------
-
-def fair_value_gap(df):
-
-    c1=df.iloc[-3]
-    c3=df.iloc[-1]
-
-    if c1.high < c3.low:
-        return "bull"
-
-    if c1.low > c3.high:
-        return "bear"
-
-    return None
-
-# ---------------- LIQUIDITY SWEEP ----------------
 
 def liquidity_sweep(df):
-
     last=df.iloc[-1]
     prev=df.iloc[-2]
 
     if last.high > prev.high and last.close < prev.high:
         return "sell"
-
     if last.low < prev.low and last.close > prev.low:
         return "buy"
-
     return None
 
-# ---------------- HTF TREND ----------------
+def fvg(df):
+    c1=df.iloc[-3]
+    c3=df.iloc[-1]
 
-def htf_trend(df):
-
-    ema50=df.close.ewm(span=50).mean()
-    ema200=df.close.ewm(span=200).mean()
-
-    if ema50.iloc[-1] > ema200.iloc[-1]:
+    if c1.high < c3.low:
         return "bull"
-
-    if ema50.iloc[-1] < ema200.iloc[-1]:
+    if c1.low > c3.high:
         return "bear"
+    return None
 
+# ---------------- MULTI TF ----------------
+
+async def multi_tf(account,symbol):
+    candles=await account.get_historical_candles(symbol,"1h",100)
+    df=pd.DataFrame(candles)
+    df["ema50"]=df.close.ewm(span=50).mean()
+    df["ema200"]=df.close.ewm(span=200).mean()
+
+    if df.ema50.iloc[-1] > df.ema200.iloc[-1]:
+        return "bull"
+    if df.ema50.iloc[-1] < df.ema200.iloc[-1]:
+        return "bear"
     return None
 
 # ---------------- SIGNAL ----------------
 
-def signal(df):
+def signal(df, htf):
+
+    last=df.iloc[-1]
+    prev=df.iloc[-2]
 
     trend=market_structure(df)
-    fvg=fair_value_gap(df)
-    sweep=liquidity_sweep(df)
-    htf=htf_trend(df)
+    gap=fvg(df)
 
-    r=df.iloc[-1]
+    # 🔥 STRONG (blijft)
+    if htf=="bull" and trend=="bull" and gap=="bull":
+        return "buy","SMC STRONG"
 
-    if trend=="bull" and fvg=="bull" and sweep=="buy" and r.rsi>50 and htf=="bull":
-        return "buy"
+    if htf=="bear" and trend=="bear" and gap=="bear":
+        return "sell","SMC STRONG"
 
-    if trend=="bear" and fvg=="bear" and sweep=="sell" and r.rsi<50 and htf=="bear":
-        return "sell"
+    # 🔥 FAST BREAKOUT
+    if last.close > prev.high:
+        return "buy","FAST BREAKOUT"
 
-    return None
+    if last.close < prev.low:
+        return "sell","FAST BREAKOUT"
 
-# ---------------- LOT SIZE ----------------
+    # 🔥 LOSSE RSI
+    if last.rsi > 52:
+        return "buy","RSI SCALP"
+
+    if last.rsi < 48:
+        return "sell","RSI SCALP"
+
+    return None,None
+
+# ---------------- LOT ----------------
 
 def lot_size(balance,sl_distance):
+    lot=(balance*RISK)/(sl_distance*10)
+    return round(max(0.01,min(lot,5)),2)
 
-    risk_money=balance * RISK
-
-    lot=risk_money/(sl_distance*10)
-
-    lot=max(0.01,min(lot,5))
-
-    return round(lot,2)
-
-# ---------------- DAILY LOSS ----------------
+# ---------------- DAILY ----------------
 
 def check_daily(balance):
 
     today=date.today()
 
     if daily["date"]!=today:
-
         daily["date"]=today
         daily["start"]=balance
 
     loss=(daily["start"]-balance)/daily["start"]
 
     if loss >= DAILY_LOSS_LIMIT:
-
         tg("DAILY LOSS LIMIT HIT")
-
         return False
 
     return True
@@ -252,73 +238,60 @@ def check_daily(balance):
 # ---------------- TRAILING ----------------
 
 async def trailing(conn):
-
     try:
-
         pos=await conn.get_positions()
-
         for p in pos:
-
             entry=p["openPrice"]
             sl=p.get("stopLoss",0)
 
-            if p["type"]=="POSITION_TYPE_BUY":
+            if p["type"]=="POSITION_TYPE_BUY" and sl < entry:
+                await conn.modify_position(p["id"],stop_loss=entry)
+                tg(f"TRAILING ACTIVATED: {p['symbol']}")
 
-                if sl < entry:
-                    await conn.modify_position(p["id"],stop_loss=entry)
-
-            else:
-
-                if sl > entry or sl == 0:
-                    await conn.modify_position(p["id"],stop_loss=entry)
-
+            if p["type"]=="POSITION_TYPE_SELL" and (sl > entry or sl == 0):
+                await conn.modify_position(p["id"],stop_loss=entry)
+                tg(f"TRAILING ACTIVATED: {p['symbol']}")
     except:
         pass
 
-# ---------------- MAIN BOT ----------------
+# ---------------- MAIN ----------------
 
 async def run():
 
     api=MetaApi(METAAPI_TOKEN)
-
     account=await api.metatrader_account_api.get_account(ACCOUNT_ID)
 
     await account.wait_connected()
 
     conn=account.get_rpc_connection()
-
     await conn.connect()
     await conn.wait_synchronized()
-    tg("METAAPI CONNECTED")
 
-    tg(f"""
-BOT STARTED
-
-Assets: {len(SYMBOLS)}
-
-Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
-""")
+    tg("PRO BOT STARTED")
 
     while True:
 
         try:
 
-            if not session_filter():
-                await asyncio.sleep(60)
-                continue
-
             info=await conn.get_account_information()
-
             balance=info["balance"]
             equity=info["equity"]
-
-            if not check_daily(balance):
-                await asyncio.sleep(60)
-                continue
 
             positions=await conn.get_positions()
 
             heartbeat(balance,equity,positions)
+
+            if not session_filter():
+                await asyncio.sleep(30)
+                continue
+
+            if not news_filter():
+                await asyncio.sleep(60)
+                continue
+
+            if not check_daily(balance):
+                await asyncio.sleep(60)
+                continue
 
             await trailing(conn)
 
@@ -327,74 +300,59 @@ Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC
                 if correlation_block(symbol,positions):
                     continue
 
-                candles=await account.get_historical_candles(symbol,"5m",200)
+                if max_trades_filter(symbol,positions):
+                    continue
 
+                candles=await account.get_historical_candles(symbol,"5m",200)
                 df=pd.DataFrame(candles)
 
                 df=indicators(df)
 
-                s=signal(df)
+                htf=await multi_tf(account,symbol)
+
+                s,setup=signal(df,htf)
 
                 if not s:
                     continue
 
                 price=await conn.get_symbol_price(symbol)
 
-                spread=price["ask"]-price["bid"]
-
-                if not spread_ok(symbol,spread):
-                    continue
-
                 if s=="buy":
-
                     entry=price["ask"]
                     sl=df.low.tail(10).min()
-
                     risk=entry-sl
-
                     tp1=entry+risk
                     tp2=entry+risk*2
 
                 else:
-
                     entry=price["bid"]
                     sl=df.high.tail(10).max()
-
                     risk=sl-entry
-
                     tp1=entry-risk
                     tp2=entry-risk*2
 
                 rr=abs((tp2-entry)/risk)
 
-                if rr<MIN_RR:
+                if rr < MIN_RR:
                     continue
 
                 lot=lot_size(balance,abs(risk))
 
-                lot1=round(lot*0.5,2)
-                lot2=round(lot*0.5,2)
-
                 if s=="buy":
-
-                    await conn.create_market_buy_order(symbol,lot1,sl,tp1)
-                    await conn.create_market_buy_order(symbol,lot2,sl,tp2)
-
+                    await conn.create_market_buy_order(symbol,lot,sl,tp2)
                 else:
-
-                    await conn.create_market_sell_order(symbol,lot1,sl,tp1)
-                    await conn.create_market_sell_order(symbol,lot2,sl,tp2)
+                    await conn.create_market_sell_order(symbol,lot,sl,tp2)
 
                 tg(f"""
 TRADE OPEN
 
 Symbol: {symbol}
 Type: {s}
+Setup: {setup}
 
 Entry: {entry}
 SL: {sl}
-TP1: {tp1}
-TP2: {tp2}
+TP: {tp2}
 
 RR: {round(rr,2)}
 Balance: {round(balance,2)}
@@ -403,30 +361,12 @@ Balance: {round(balance,2)}
             await asyncio.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-
-            tg(f"""
-BOT ERROR
-
-{str(e)}
-
-Time: {datetime.utcnow().strftime('%H:%M:%S')}
-""")
-
+            tg(f"BOT ERROR: {str(e)}")
             await asyncio.sleep(5)
 
 while True:
-
     try:
         asyncio.run(run())
-
     except Exception as e:
-
-        tg(f"""
-BOT CRASHED
-
-{str(e)}
-
-Restarting bot...
-""")
-
+        tg(f"CRASH: {str(e)}")
         time.sleep(5)
