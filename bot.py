@@ -20,7 +20,7 @@ WEEKLY_RESET_DAY = 2  # Wednesday (0=Monday, 2=Wednesday)
 WEEKLY_RESET_HOUR = 22  # 22:00 UTC
 
 # ===== TEST MODE =====
-TEST_MODE = False  # 🔥 ZET OP FALSE VOOR NORMALE WERKING!
+TEST_MODE = False  # 🔥 UIT - ALLEEN ECHTE SIGNALEN
 
 # Sessie tijden (UTC)
 SESSIONS = {
@@ -57,6 +57,7 @@ logging.basicConfig(level=logging.INFO)
 # ==================== TELEGRAM ====================
 
 def tg(msg):
+    """Stuur notificatie via Telegram"""
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         data = json.dumps({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}).encode()
@@ -68,6 +69,7 @@ def tg(msg):
 # ==================== HEARTBEAT ====================
 
 async def send_heartbeat(conn, balance, equity, positions):
+    """Stuur elke 10 minuten statusupdate (alleen via Telegram)"""
     global last_status
     
     current_time = time.time()
@@ -540,162 +542,145 @@ async def run_diagnostics(conn, account):
 # ==================== HOOFDLOOP ====================
 
 async def run():
-    while True:
-        try:
-            print("🔄 Verbinden met MetaAPI...")
-            api = MetaApi(METAAPI_TOKEN)
-            account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-            
-            print("🔄 Wachten op account connectie...")
-            await account.wait_connected()
-            
-            conn = account.get_rpc_connection()
-            print("🔄 Verbinden met RPC...")
-            await conn.connect()
-            
-            print("🔄 Wachten op synchronisatie met MetaTrader...")
-            await conn.wait_synchronized(timeout_in_seconds=120)
-            print("✅ Account is gesynchroniseerd met MetaTrader!")
-            
-            await asyncio.sleep(2)
-            
-            tg("✅ BOT VERBONDEN MET METATRADER")
-            
-            global last_status
-            last_status = time.time()
-            
-            await run_diagnostics(conn, account)
-            
-            # ===== TEST TRADE - ALLEEN ALS TEST_MODE AAN STAAT =====
-            if TEST_MODE:
-                try:
-                    print("\n🎯 Test trade plaatsen...")
-                    symbol = "EURUSD"
+    try:
+        print("🔄 Verbinden met MetaAPI...")
+        api = MetaApi(METAAPI_TOKEN)
+        account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
+        
+        print("🔄 Wachten op account connectie...")
+        await account.wait_connected()
+        
+        conn = account.get_rpc_connection()
+        print("🔄 Verbinden met RPC...")
+        await conn.connect()
+        
+        print("🔄 Wachten op synchronisatie met MetaTrader...")
+        await conn.wait_synchronized(timeout_in_seconds=120)
+        print("✅ Account is gesynchroniseerd met MetaTrader!")
+        
+        await asyncio.sleep(2)
+        
+        # 🔥 GEEN TELEGRAM SPAM MEER - alleen console
+        print("✅ BOT VERBONDEN MET METATRADER - Klaar voor actie")
+        
+        global last_status
+        last_status = time.time()
+        
+        await run_diagnostics(conn, account)
+        
+        print("✅ Test modus UIT - alleen echte signalen")
+        
+        # Hoofdloop
+        while True:
+            try:
+                if not conn.connected:
+                    print("⚠️ Verbinding verbroken, opnieuw verbinden...")
+                    break
+                
+                info = await conn.get_account_information()
+                balance = info["balance"]
+                equity = info["equity"]
+                
+                positions = await conn.get_positions()
+                
+                update_weekly_loss(balance)
+                
+                await send_heartbeat(conn, balance, equity, positions)
+                
+                if not check_weekly(balance):
+                    await asyncio.sleep(60)
+                    continue
+                    
+                if not check_daily(balance):
+                    await asyncio.sleep(60)
+                    continue
+                    
+                if not await news_filter():
+                    await asyncio.sleep(60)
+                    continue
+                
+                await manage_positions(conn, positions)
+                
+                for symbol in SYMBOLS:
+                    
+                    current_session = session_filter(symbol)
+                    if not current_session:
+                        continue
+                    
+                    if not get_best_correlated_setup(symbol, positions):
+                        continue
+                    
+                    symbol_positions = [p for p in positions if p["symbol"] == symbol]
+                    if len(symbol_positions) >= MAX_TRADES_PER_ASSET:
+                        continue
+                    
+                    try:
+                        candles_5m = await account.get_historical_candles(symbol, "5m", 100)
+                        candles_15m = await account.get_historical_candles(symbol, "15m", 100)
+                    except:
+                        continue
+                    
+                    if not candles_5m or not candles_15m:
+                        continue
+                    
+                    df_5m = pd.DataFrame(candles_5m)
+                    df_15m = pd.DataFrame(candles_15m)
+                    
+                    if len(df_5m) < 50 or len(df_15m) < 30:
+                        continue
+                    
+                    df_5m = calculate_indicators(df_5m)
+                    df_15m = calculate_indicators(df_15m)
+                    
+                    signal = None
+                    setup_name = None
+                    
+                    signal, setup_name = await smc_strong_setup(account, symbol, df_5m, df_15m)
+                    
+                    if not signal:
+                        signal, setup_name = await smc_normal_setup(account, symbol, df_5m, df_15m)
+                    
+                    if not signal and current_session == "london":
+                        signal, setup_name = await london_breakout(account, symbol, df_5m)
+                    
+                    if not signal and current_session == "ny":
+                        signal, setup_name = await ny_breakout(account, symbol, df_5m)
+                    
+                    if not signal:
+                        continue
+                    
+                    signal_key = f"{symbol}_{signal}_{int(time.time()/1800)}"
+                    if signal_key in open_signals:
+                        continue
+                    
                     price = await conn.get_symbol_price(symbol)
-                    lot = 0.01
-                    sl = price['bid'] - 0.0010
-                    tp = price['bid'] + 0.0020
                     
-                    order = await conn.create_market_buy_order(symbol, lot, sl, tp)
-                    print(f"✅ Test trade gelukt!")
-                    tg(f"✅ TEST TRADE GELUKT")
-                except Exception as e:
-                    print(f"⚠️ Test trade mislukt: {e}")
-            else:
-                print("✅ Test modus uit - alleen echte signalen")
-            # ======================================================
-            
-            # Hoofdloop
-            while True:
-                try:
-                    if not conn.connected:
-                        print("⚠️ Verbinding verbroken, opnieuw verbinden...")
-                        break
+                    if signal == "buy":
+                        entry = price["ask"]
+                        sl, tp1, tp2, distance = calculate_levels("buy", entry, df_5m)
+                    else:
+                        entry = price["bid"]
+                        sl, tp1, tp2, distance = calculate_levels("sell", entry, df_5m)
                     
-                    info = await conn.get_account_information()
-                    balance = info["balance"]
-                    equity = info["equity"]
-                    
-                    positions = await conn.get_positions()
-                    
-                    update_weekly_loss(balance)
-                    
-                    await send_heartbeat(conn, balance, equity, positions)
-                    
-                    if not check_weekly(balance):
-                        await asyncio.sleep(60)
-                        continue
-                        
-                    if not check_daily(balance):
-                        await asyncio.sleep(60)
-                        continue
-                        
-                    if not await news_filter():
-                        await asyncio.sleep(60)
+                    rr = abs((tp2 - entry) / distance) if distance != 0 else 0
+                    if rr < MIN_RR:
                         continue
                     
-                    await manage_positions(conn, positions)
+                    lot = calculate_lot_size(balance, abs(distance))
                     
-                    for symbol in SYMBOLS:
-                        
-                        current_session = session_filter(symbol)
-                        if not current_session:
-                            continue
-                        
-                        if not get_best_correlated_setup(symbol, positions):
-                            continue
-                        
-                        symbol_positions = [p for p in positions if p["symbol"] == symbol]
-                        if len(symbol_positions) >= MAX_TRADES_PER_ASSET:
-                            continue
-                        
-                        try:
-                            candles_5m = await account.get_historical_candles(symbol, "5m", 100)
-                            candles_15m = await account.get_historical_candles(symbol, "15m", 100)
-                        except:
-                            continue
-                        
-                        if not candles_5m or not candles_15m:
-                            continue
-                        
-                        df_5m = pd.DataFrame(candles_5m)
-                        df_15m = pd.DataFrame(candles_15m)
-                        
-                        if len(df_5m) < 50 or len(df_15m) < 30:
-                            continue
-                        
-                        df_5m = calculate_indicators(df_5m)
-                        df_15m = calculate_indicators(df_15m)
-                        
-                        signal = None
-                        setup_name = None
-                        
-                        signal, setup_name = await smc_strong_setup(account, symbol, df_5m, df_15m)
-                        
-                        if not signal:
-                            signal, setup_name = await smc_normal_setup(account, symbol, df_5m, df_15m)
-                        
-                        if not signal and current_session == "london":
-                            signal, setup_name = await london_breakout(account, symbol, df_5m)
-                        
-                        if not signal and current_session == "ny":
-                            signal, setup_name = await ny_breakout(account, symbol, df_5m)
-                        
-                        if not signal:
-                            continue
-                        
-                        signal_key = f"{symbol}_{signal}_{int(time.time()/1800)}"
-                        if signal_key in open_signals:
-                            continue
-                        
-                        price = await conn.get_symbol_price(symbol)
-                        
-                        if signal == "buy":
-                            entry = price["ask"]
-                            sl, tp1, tp2, distance = calculate_levels("buy", entry, df_5m)
-                        else:
-                            entry = price["bid"]
-                            sl, tp1, tp2, distance = calculate_levels("sell", entry, df_5m)
-                        
-                        rr = abs((tp2 - entry) / distance) if distance != 0 else 0
-                        if rr < MIN_RR:
-                            continue
-                        
-                        lot = calculate_lot_size(balance, abs(distance))
-                        
-                        if signal == "buy":
-                            order = await conn.create_market_buy_order(symbol, lot, sl, tp2)
-                        else:
-                            order = await conn.create_market_sell_order(symbol, lot, sl, tp2)
-                        
-                        open_signals[signal_key] = time.time()
-                        
-                        current_time = time.time()
-                        for key in list(open_signals.keys()):
-                            if current_time - open_signals[key] > 1800:
-                                del open_signals[key]
-                        
-                        msg = f"""
+                    if signal == "buy":
+                        order = await conn.create_market_buy_order(symbol, lot, sl, tp2)
+                    else:
+                        order = await conn.create_market_sell_order(symbol, lot, sl, tp2)
+                    
+                    open_signals[signal_key] = time.time()
+                    
+                    current_time = time.time()
+                    for key in list(open_signals.keys()):
+                        if current_time - open_signals[key] > 1800:
+                            del open_signals[key]
+                    
+                    msg = f"""
 <b>✅ TRADE GEOPEND</b>
 
 📌 {symbol} - {setup_name}
@@ -713,29 +698,25 @@ async def run():
 
 ⏰ {datetime.utcnow().strftime('%H:%M:%S')} UTC
 """
-                        tg(msg)
-                        
-                        await asyncio.sleep(2)
+                    tg(msg)
                     
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    
-                except Exception as e:
-                    print(f"Error in main loop: {e}")
-                    if "timed out" in str(e).lower() or "disconnect" in str(e).lower() or "connection" in str(e).lower():
-                        print("⚠️ Verbindingsprobleem, opnieuw verbinden...")
-                        break
+                    await asyncio.sleep(2)
+                
+                await asyncio.sleep(CHECK_INTERVAL)
+                
+            except Exception as e:
+                print(f"Error in main loop: {e}")
+                if "timed out" in str(e).lower():
+                    print("⚠️ Timeout, even wachten...")
+                    await asyncio.sleep(10)
+                else:
+                    print("⚠️ Onverwachte error, maar we blijven draaien")
                     await asyncio.sleep(5)
-            
-            try:
-                await conn.close()
-            except:
-                pass
-            
-        except Exception as e:
-            print(f"❌ Connectie fout: {e}")
-            tg(f"❌ CONNECTIE FOUT: {str(e)[:50]}...")
-            print("⏳ Opnieuw proberen over 30 seconden...")
-            await asyncio.sleep(30)
+        
+    except Exception as e:
+        print(f"❌ Fatale fout: {e}")
+        tg(f"❌ FATALE FOUT: {str(e)[:50]}...")
+        raise e
 
 # ==================== START ====================
 
