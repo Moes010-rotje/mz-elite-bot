@@ -13,19 +13,21 @@ from enum import Enum
 from metaapi_cloud_sdk import MetaApi
 
 # ================================================================
-#   PROFESSIONAL SMC BOT v3.0
+#   PROFESSIONAL SMC BOT v3.1 — AGGRESSIVE MODE
 #
 #   Gebouwd als een discretionaire trader denkt:
 #   1. HTF (1H) bepaalt bias (trend richting)
 #   2. MTF (15M) bevestigt structuur (BOS/CHoCH)
 #   3. LTF (5M) entry bij POI zone + confirmatie candle
 #
-#   Kernprincipes:
-#   - Nooit chasing → zones opslaan en WACHTEN op retest
-#   - Premium/Discount → alleen kopen in discount, verkopen in premium
-#   - Liquidity eerst → sweep VOOR entry, niet als entry zelf
-#   - Confirmatie verplicht → rejection wick of engulfing bij zone
-#   - Kwaliteit > Kwantiteit → minder trades, hoger winpercentage
+#   v3.1 AGGRESSIVE aanpassingen:
+#   - Alle killzones actief (Asia voor JPY/Gold pairs)
+#   - Versoepelde confirmatie (strong close + lagere wick ratio)
+#   - Zones 2x testbaar + grotere buffer
+#   - C-grade trades met halve risico
+#   - Momentum entries zonder zone als HTF + structuur aligned
+#   - Min RR 1.5 | Max 15 trades | Equilibrium toegestaan
+#   - Target: 3-15 trades per dag
 # ================================================================
 
 logging.basicConfig(
@@ -115,20 +117,21 @@ class TradeSetup:
 
 CHECK_INTERVAL = 5
 BASE_RISK = 0.01
-MIN_RR = 2.0              # Professioneel: minimaal 2R
-DAILY_LOSS_LIMIT = 0.025  # 2.5% strenger dan v2
-WEEKLY_LOSS_LIMIT = 0.06  # 6% strenger
-MAX_TRADES_PER_ASSET = 2
-MAX_TOTAL_TRADES = 6      # Minder trades, hogere kwaliteit
-COOLDOWN_AFTER_LOSSES = 2
-COOLDOWN_MINUTES = 90
-ZONE_MAX_AGE_HOURS = 24
-ZONE_MAX_TESTS = 1
-MAX_API_CALLS_PER_MIN = 30
+MIN_RR = 1.5              # Verlaagd voor meer trades (was 2.0)
+DAILY_LOSS_LIMIT = 0.03   # 3% (was 2.5%)
+WEEKLY_LOSS_LIMIT = 0.08  # 8% (was 6%)
+MAX_TRADES_PER_ASSET = 3  # 3 per asset (was 2)
+MAX_TOTAL_TRADES = 15     # 15 max (was 6)
+COOLDOWN_AFTER_LOSSES = 3  # Na 3 losses (was 2)
+COOLDOWN_MINUTES = 45      # 45 min (was 90)
+ZONE_MAX_AGE_HOURS = 48    # Zones leven 48u (was 24)
+ZONE_MAX_TESTS = 2         # 2x testbaar (was 1)
+MAX_API_CALLS_PER_MIN = 40 # Iets hoger voor meer symbolen
 
-SWING_LOOKBACK = 3
-MIN_REJECTION_WICK_RATIO = 0.6
-MIN_ENGULFING_BODY_RATIO = 1.3
+SWING_LOOKBACK = 2         # Snellere swing detectie (was 3)
+MIN_REJECTION_WICK_RATIO = 0.45   # Versoepeld (was 0.6)
+MIN_ENGULFING_BODY_RATIO = 1.1    # Versoepeld (was 1.3)
+MIN_STRONG_CLOSE_BODY_RATIO = 1.5 # Nieuw: strong directional close
 
 KILLZONES = {
     "asia":       {"start": 0,  "end": 7},
@@ -138,21 +141,26 @@ KILLZONES = {
     "ny_pm":      {"start": 16, "end": 19},
 }
 
-ENTRY_KILLZONES = ["london", "london_ext", "new_york"]
-NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30", "US500"]
+ENTRY_KILLZONES = ["asia", "london", "london_ext", "new_york", "ny_pm"]
+ASIA_ENTRY_SYMBOLS = ["USDJPY", "GBPJPY", "EURJPY", "XAUUSD", "BTCUSD"]
+NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30", "US500", "BTCUSD"]
 
 SYMBOL_SPECS = {
-    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 30,  "category": "metals"},
-    "BTCUSD":  {"pip_size": 1.0,    "pip_value_per_lot": 1,   "max_spread_pips": 50,  "category": "crypto"},
-    "EURUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 15,  "category": "forex"},
-    "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
-    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex"},
-    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 15,  "category": "forex"},
-    "AUDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 15,  "category": "forex"},
-    "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 20,  "category": "forex"},
-    "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 20,  "category": "indices"},
-    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 30,  "category": "indices"},
-    "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 15,  "category": "indices"},
+    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals"},
+    "XAGUSD":  {"pip_size": 0.01,   "pip_value_per_lot": 50,  "max_spread_pips": 30,  "category": "metals"},
+    "BTCUSD":  {"pip_size": 1.0,    "pip_value_per_lot": 1,   "max_spread_pips": 60,  "category": "crypto"},
+    "EURUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
+    "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 22,  "category": "forex"},
+    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 30,  "category": "forex"},
+    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 18,  "category": "forex"},
+    "USDCHF":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
+    "AUDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
+    "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex"},
+    "EURGBP":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
+    "NZDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 20,  "category": "forex"},
+    "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices"},
+    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices"},
+    "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 18,  "category": "indices"},
 }
 
 SYMBOLS = list(SYMBOL_SPECS.keys())
@@ -167,6 +175,8 @@ CORRELATION_GROUPS = [
     {"NAS100", "US500"},
     {"USDJPY", "EURJPY"},
     {"GBPUSD", "GBPJPY"},
+    {"AUDUSD", "NZDUSD"},
+    {"XAUUSD", "XAGUSD"},
 ]
 
 GRADE_ORDER = ["D", "C", "B", "B+", "A", "A+"]
@@ -291,7 +301,7 @@ def is_entry_allowed(symbol: str) -> Tuple[bool, Optional[str]]:
     if not kz:
         return False, None
     if kz == "asia":
-        return False, kz
+        return (symbol in ASIA_ENTRY_SYMBOLS), kz
     if kz == "ny_pm":
         return (symbol in NY_PM_SYMBOLS), kz
     if kz in ENTRY_KILLZONES:
@@ -751,6 +761,12 @@ def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Op
         if cr > 0 and body / cr < 0.3 and lw / cr > 0.5 and last["close"] > last["open"]:
             return "pin_bar"
 
+        # Strong bullish close in/near zone (nieuw voor aggressive mode)
+        avg_body = float(df["body"].tail(20).mean())
+        if (last["close"] > last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
+                and zone.contains_price(float(last["open"]), 0.4)):
+            return "strong_close"
+
     elif direction == Direction.BEAR:
         uw = float(last["upper_wick"])
         cr = float(last["candle_range"])
@@ -768,6 +784,12 @@ def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Op
         if cr > 0 and body / cr < 0.3 and uw / cr > 0.5 and last["close"] < last["open"]:
             return "pin_bar"
 
+        # Strong bearish close in/near zone
+        avg_body = float(df["body"].tail(20).mean())
+        if (last["close"] < last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
+                and zone.contains_price(float(last["open"]), 0.4)):
+            return "strong_close"
+
     return None
 
 # ==================== ZONE MANAGEMENT ====================
@@ -781,8 +803,8 @@ def store_zones(symbol: str, new_zones: List[Zone]):
         z.symbol = symbol
         zone_store[symbol].append(z)
     zone_store[symbol] = [z for z in zone_store[symbol] if z.is_valid and (now - z.created_at) < max_age]
-    if len(zone_store[symbol]) > 10:
-        zone_store[symbol] = zone_store[symbol][-10:]
+    if len(zone_store[symbol]) > 20:
+        zone_store[symbol] = zone_store[symbol][-20:]
 
 
 def find_active_zone(symbol: str, price: float, direction: Direction) -> Optional[Zone]:
@@ -791,7 +813,7 @@ def find_active_zone(symbol: str, price: float, direction: Direction) -> Optiona
     for zone in zone_store[symbol]:
         if not zone.is_valid or zone.direction != direction:
             continue
-        if zone.contains_price(price, buffer_pct=0.15):
+        if zone.contains_price(price, buffer_pct=0.25):
             return zone
     return None
 
@@ -901,9 +923,7 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
            (direction == Direction.BEAR and premium_discount == "premium"):
             score += 1.5
             reasons.append("P/D_ALIGNED")
-        elif premium_discount == "equilibrium":
-            score -= 0.5
-            reasons.append("EQ⚠️")
+        # Equilibrium = neutraal in aggressive mode (geen penalty)
 
     if regime == "trending":
         score += 1.0
@@ -922,9 +942,11 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
         return "A", 0.75, score, reasons
     elif score >= 6:
         return "B+", 0.6, score, reasons
-    elif score >= 5:
+    elif score >= 4.5:
         return "B", 0.5, score, reasons
-    return "C", 0, score, reasons
+    elif score >= 3.5:
+        return "C", 0.25, score, reasons    # C trades met halve risico (was skip)
+    return "D", 0, score, reasons
 
 # ==================== LOT SIZE ====================
 
@@ -945,7 +967,7 @@ def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct
 # ==================== SL / TP BEREKENING ====================
 
 def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: pd.DataFrame):
-    """SL achter zone, TP1 op 2R, TP2 op 3R"""
+    """SL achter zone, TP1 op 1.5R, TP2 op 2.5R (aggressive)"""
     atr = float(df["atr"].iloc[-1])
     buffer = atr * 0.15
 
@@ -955,16 +977,16 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
         if sl_dist < atr * 0.5:
             sl = entry - atr * 0.5
             sl_dist = entry - sl
-        tp1 = entry + sl_dist * 2.0
-        tp2 = entry + sl_dist * 3.0
+        tp1 = entry + sl_dist * 1.5
+        tp2 = entry + sl_dist * 2.5
     else:
         sl = zone.high + buffer
         sl_dist = sl - entry
         if sl_dist < atr * 0.5:
             sl = entry + atr * 0.5
             sl_dist = sl - entry
-        tp1 = entry - sl_dist * 2.0
-        tp2 = entry - sl_dist * 3.0
+        tp1 = entry - sl_dist * 1.5
+        tp2 = entry - sl_dist * 2.5
 
     return sl, tp1, tp2, sl_dist
 
@@ -1050,7 +1072,7 @@ async def check_closed_trades(conn):
 
 def is_candle_just_closed(tf_min: int = 5) -> bool:
     now = datetime.now(timezone.utc)
-    return now.minute % tf_min == 0 and now.second < 45
+    return now.minute % tf_min == 0 and now.second < 60  # 60s window (was 45)
 
 # ==================== HOOFDSTRATEGIE ====================
 
@@ -1116,30 +1138,83 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
         pd_zone = get_premium_discount(df_15m, swings_15m)
         current_price = float(df_5m["close"].iloc[-1])
 
-        # Bepaal richting
+        # Bepaal richting — AGGRESSIVE: ook zonder HTF als structuur duidelijk is
         direction = None
+
+        # Prioriteit 1: HTF + structuur aligned
         if htf_bias == Direction.BULL and (not structure_15m or structure_15m.direction == Direction.BULL):
             direction = Direction.BULL
         elif htf_bias == Direction.BEAR and (not structure_15m or structure_15m.direction == Direction.BEAR):
             direction = Direction.BEAR
+
+        # Prioriteit 2: CHoCH overrulet (reversal)
         elif structure_15m and structure_15m.type == StructureType.CHOCH:
             direction = structure_15m.direction
+
+        # Prioriteit 3: alleen HTF bias
         elif htf_bias:
             direction = htf_bias
+
+        # Prioriteit 4 (NIEUW): alleen structuur zonder HTF — aggressive
+        elif structure_15m and structure_15m.type == StructureType.BOS:
+            direction = structure_15m.direction
+
+        # Prioriteit 5 (NIEUW): alleen 5M structuur als er een sweep was
+        elif structure_5m and sweep and sweep["type"] == structure_5m.direction.value:
+            direction = structure_5m.direction
 
         if not direction:
             return None
 
-        # P/D filter
+        # P/D filter — AGGRESSIVE: alleen harde premium/discount block, equilibrium OK
         if direction == Direction.BULL and pd_zone == "premium":
-            return None
+            # Toch toestaan als er een sweep is (liquiditeit gepakt boven)
+            if not (sweep and sweep["type"] == "bull"):
+                return None
         if direction == Direction.BEAR and pd_zone == "discount":
-            return None
+            if not (sweep and sweep["type"] == "bear"):
+                return None
 
         # Zoek zone
         active_zone = find_active_zone(symbol, current_price, direction)
+
+        # AGGRESSIVE: als geen zone gevonden, probeer momentum entry
+        # met een "virtuele zone" rond recent swing level
         if not active_zone:
-            return None
+            # Momentum entry: HTF aligned + structuur + sterke candle
+            rsi = float(df_5m["rsi"].iloc[-1])
+            macd_h = float(df_5m["macd_hist"].iloc[-1])
+            macd_h_prev = float(df_5m["macd_hist"].iloc[-2])
+            ema20 = float(df_5m["ema20"].iloc[-1])
+            atr = float(df_5m["atr"].iloc[-1])
+
+            mom_bull = (htf_bias == Direction.BULL and direction == Direction.BULL
+                       and 50 < rsi < 72 and macd_h > macd_h_prev
+                       and current_price > ema20)
+            mom_bear = (htf_bias == Direction.BEAR and direction == Direction.BEAR
+                       and 28 < rsi < 50 and macd_h < macd_h_prev
+                       and current_price < ema20)
+
+            if mom_bull or mom_bear:
+                # Creeer virtuele zone rond recent swing
+                if direction == Direction.BULL:
+                    recent_low = float(df_5m["low"].tail(10).min())
+                    active_zone = Zone(
+                        type=ZoneType.ORDER_BLOCK, direction=Direction.BULL,
+                        high=recent_low + atr * 0.5, low=recent_low,
+                        midpoint=recent_low + atr * 0.25, created_at=time.time(),
+                        symbol=symbol, timeframe="5m_momentum",
+                    )
+                else:
+                    recent_high = float(df_5m["high"].tail(10).max())
+                    active_zone = Zone(
+                        type=ZoneType.ORDER_BLOCK, direction=Direction.BEAR,
+                        high=recent_high, low=recent_high - atr * 0.5,
+                        midpoint=recent_high - atr * 0.25, created_at=time.time(),
+                        symbol=symbol, timeframe="5m_momentum",
+                    )
+            else:
+                return None
 
         # Check confirmatie
         confirmation = check_confirmation(df_5m, direction, active_zone)
@@ -1160,7 +1235,8 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
             premium_discount=pd_zone, regime=regime, direction=direction,
         )
 
-        if grade in ("C", "D"):
+        # AGGRESSIVE: alleen D skippen, C trades toegestaan
+        if grade == "D":
             return None
 
         # Levels
@@ -1301,17 +1377,19 @@ async def run():
 
         await run_diagnostics(conn, account)
 
-        tg(f"""🚀 <b>SMC BOT v3.0 GESTART</b>
+        tg(f"""🚀 <b>SMC BOT v3.1 AGGRESSIVE GESTART</b>
 
 📊 {len(SYMBOLS)} symbols | Entry KZs: {', '.join(ENTRY_KILLZONES)}
 🎯 Min RR: {MIN_RR} | Max trades: {MAX_TOTAL_TRADES}
+🔥 Target: 3-15 trades/dag
 
 ⚡ <b>Strategie:</b>
 • Top-down: 1H bias → 15M structuur → 5M entry
 • Zone-based: OB/FVG opslaan → wachten op retest
-• Confirmatie verplicht: rejection wick / engulfing / pin bar
-• Premium/Discount filter
-• BOS/CHoCH structuur analyse""")
+• Confirmatie: rejection wick / engulfing / pin bar / strong close
+• Momentum entries: HTF + structuur aligned zonder zone
+• Alle killzones actief incl. Asia (JPY/Gold)
+• C-grade trades met halve risico""")
 
         while True:
             try:
@@ -1330,12 +1408,12 @@ async def run():
 
                 kz = get_current_killzone()
 
+                # Asia: range mapping + trading voor select pairs
                 if kz == "asia":
                     await update_asia_range(account)
-                    await asyncio.sleep(60)
-                    continue
+                    # Ga door met normal flow — Asia is nu entry killzone
 
-                if kz not in ENTRY_KILLZONES and kz != "ny_pm":
+                if kz not in ENTRY_KILLZONES:
                     info = await rate_limited_call(conn.get_account_information())
                     positions = await rate_limited_call(conn.get_positions())
                     if positions:
@@ -1387,7 +1465,7 @@ async def run():
                     if not check_correlation(symbol, positions):
                         continue
 
-                    sig_key = f"{symbol}_{int(time.time()/900)}"
+                    sig_key = f"{symbol}_{int(time.time()/300)}"  # 5 min dedup (was 15 min)
                     if sig_key in recent_signals:
                         continue
 
@@ -1421,8 +1499,8 @@ async def run():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("PROFESSIONAL SMC BOT v3.0")
-    log.info("Zone-based | Confirmation Required | Top-Down")
+    log.info("PROFESSIONAL SMC BOT v3.1 — AGGRESSIVE")
+    log.info("Zone-based | Momentum Entries | 3-15 trades/day")
     log.info("=" * 50)
 
     while True:
