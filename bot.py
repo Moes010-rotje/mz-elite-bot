@@ -290,6 +290,7 @@ async def run():
     await conn.connect()
     await conn.wait_synchronized()
     tg("METAAPI CONNECTED")
+
     tg(f"""
 BOT STARTED
 
@@ -403,7 +404,7 @@ Balance: {round(balance,2)}
 
         except Exception as e:
 
-    tg(f"""
+            tg(f"""
 BOT ERROR
 
 {str(e)}
@@ -411,7 +412,7 @@ BOT ERROR
 Time: {datetime.utcnow().strftime('%H:%M:%S')}
 """)
 
-    await asyncio.sleep(5)
+            await asyncio.sleep(5)
 
 while True:
 
