@@ -19,6 +19,9 @@ MAX_TRADES_PER_ASSET = 4  # max 4 trades per asset
 WEEKLY_RESET_DAY = 2  # Wednesday (0=Monday, 2=Wednesday)
 WEEKLY_RESET_HOUR = 22  # 22:00 UTC
 
+# ===== TEST MODE =====
+TEST_MODE = False  # 🔥 ZET OP FALSE VOOR NORMALE WERKING!
+
 # Sessie tijden (UTC)
 SESSIONS = {
     "asia": {"start": 0, "end": 7, "symbols": ["USDJPY", "GBPJPY", "BTCUSD"]},
@@ -62,18 +65,17 @@ def tg(msg):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# ==================== HEARTBEAT (GEFIXT) ====================
+# ==================== HEARTBEAT ====================
 
 async def send_heartbeat(conn, balance, equity, positions):
     global last_status
     
     current_time = time.time()
     
-    if current_time - last_status >= 600:  # 10 minuten
+    if current_time - last_status >= 600:
         last_status = current_time
         
         try:
-            # Verse data ophalen voor heartbeat
             info = await conn.get_account_information()
             balance = info["balance"]
             equity = info["equity"]
@@ -535,7 +537,7 @@ async def run_diagnostics(conn, account):
     print("DIAGNOSE VOLTOOID")
     print("="*60 + "\n")
 
-# ==================== HOOFDLOOP MET ALLE FIXES ====================
+# ==================== HOOFDLOOP ====================
 
 async def run():
     while True:
@@ -564,25 +566,28 @@ async def run():
             
             await run_diagnostics(conn, account)
             
-            # Optionele test trade (uitcommenten als je niet wilt testen)
-            try:
-                print("\n🎯 Test trade plaatsen...")
-                symbol = "EURUSD"
-                price = await conn.get_symbol_price(symbol)
-                lot = 0.01
-                sl = price['bid'] - 0.0010
-                tp = price['bid'] + 0.0020
-                
-                order = await conn.create_market_buy_order(symbol, lot, sl, tp)
-                print(f"✅ Test trade gelukt!")
-                tg(f"✅ TEST TRADE GELUKT")
-            except Exception as e:
-                print(f"⚠️ Test trade niet nodig of mislukt: {e}")
+            # ===== TEST TRADE - ALLEEN ALS TEST_MODE AAN STAAT =====
+            if TEST_MODE:
+                try:
+                    print("\n🎯 Test trade plaatsen...")
+                    symbol = "EURUSD"
+                    price = await conn.get_symbol_price(symbol)
+                    lot = 0.01
+                    sl = price['bid'] - 0.0010
+                    tp = price['bid'] + 0.0020
+                    
+                    order = await conn.create_market_buy_order(symbol, lot, sl, tp)
+                    print(f"✅ Test trade gelukt!")
+                    tg(f"✅ TEST TRADE GELUKT")
+                except Exception as e:
+                    print(f"⚠️ Test trade mislukt: {e}")
+            else:
+                print("✅ Test modus uit - alleen echte signalen")
+            # ======================================================
             
             # Hoofdloop
             while True:
                 try:
-                    # GEFIXT: .connected ipv .is_connected()
                     if not conn.connected:
                         print("⚠️ Verbinding verbroken, opnieuw verbinden...")
                         break
@@ -721,7 +726,6 @@ async def run():
                         break
                     await asyncio.sleep(5)
             
-            # Verbreek connectie voor herstart
             try:
                 await conn.close()
             except:
