@@ -62,23 +62,24 @@ def tg(msg):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# ==================== HEARTBEAT ====================
+# ==================== HEARTBEAT (GEFIXT) ====================
 
 async def send_heartbeat(conn, balance, equity, positions):
     global last_status
     
     current_time = time.time()
     
-    if current_time - last_status >= 600:
+    if current_time - last_status >= 600:  # 10 minuten
         last_status = current_time
         
         try:
+            # Verse data ophalen voor heartbeat
             info = await conn.get_account_information()
             balance = info["balance"]
             equity = info["equity"]
             positions = await conn.get_positions()
-        except:
-            pass
+        except Exception as e:
+            print(f"Heartbeat data error: {e}")
         
         pl = equity - balance
         pl_pct = (pl / balance) * 100 if balance > 0 else 0
@@ -104,6 +105,7 @@ async def send_heartbeat(conn, balance, equity, positions):
 🎯 Open trades: {len(positions)}
 🕐 Sessie: {session.upper()}
 📅 Daily loss: {round(daily_loss, 2)}%
+📆 Weekly loss: {round(weekly['loss']*100, 2)}%
 
 ⏰ {datetime.utcnow().strftime('%H:%M:%S')} UTC
 """
@@ -533,7 +535,7 @@ async def run_diagnostics(conn, account):
     print("DIAGNOSE VOLTOOID")
     print("="*60 + "\n")
 
-# ==================== HOOFDLOOP MET FIX ====================
+# ==================== HOOFDLOOP MET ALLE FIXES ====================
 
 async def run():
     while True:
@@ -550,23 +552,19 @@ async def run():
             await conn.connect()
             
             print("🔄 Wachten op synchronisatie met MetaTrader...")
-            # FIX: Dit is de belangrijke regel!
             await conn.wait_synchronized(timeout_in_seconds=120)
             print("✅ Account is gesynchroniseerd met MetaTrader!")
             
-            # Extra wachttijd voor de zekerheid
             await asyncio.sleep(2)
             
             tg("✅ BOT VERBONDEN MET METATRADER")
             
-            # Reset heartbeat timer
             global last_status
             last_status = time.time()
             
-            # Voer diagnose uit
             await run_diagnostics(conn, account)
             
-            # Test trade (alleen eerste keer)
+            # Optionele test trade (uitcommenten als je niet wilt testen)
             try:
                 print("\n🎯 Test trade plaatsen...")
                 symbol = "EURUSD"
@@ -584,8 +582,8 @@ async def run():
             # Hoofdloop
             while True:
                 try:
-                    # Check of verbinding nog werkt
-                    if not conn.is_connected():
+                    # GEFIXT: .connected ipv .is_connected()
+                    if not conn.connected:
                         print("⚠️ Verbinding verbroken, opnieuw verbinden...")
                         break
                     
@@ -718,7 +716,7 @@ async def run():
                     
                 except Exception as e:
                     print(f"Error in main loop: {e}")
-                    if "timed out" in str(e).lower() or "disconnect" in str(e).lower():
+                    if "timed out" in str(e).lower() or "disconnect" in str(e).lower() or "connection" in str(e).lower():
                         print("⚠️ Verbindingsprobleem, opnieuw verbinden...")
                         break
                     await asyncio.sleep(5)
