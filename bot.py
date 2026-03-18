@@ -63,13 +63,36 @@ def tg(msg):
         data = json.dumps({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
+        print(f"✅ Telegram verstuurd: {msg[:50]}...")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"❌ Telegram error: {e}")
+
+# ==================== TELEGRAM TEST ====================
+
+def test_telegram():
+    """Test of Telegram werkt bij opstarten"""
+    print("\n" + "="*50)
+    print("🔍 TELEGRAM TEST")
+    print("="*50)
+    print(f"TG_TOKEN: {TG_TOKEN[:5]}...{TG_TOKEN[-5:] if TG_TOKEN else 'NIET GEVONDEN'}")
+    print(f"TG_CHAT: {TG_CHAT}")
+    
+    try:
+        test_msg = "🧪 TEST BERICHT - Als je dit ziet, werkt Telegram! Bot is gestart."
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        data = json.dumps({"chat_id": TG_CHAT, "text": test_msg}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+        print("✅ Telegram TEST GELUKT! Check je Telegram.")
+        return True
+    except Exception as e:
+        print(f"❌ Telegram TEST MISLUKT: {e}")
+        return False
 
 # ==================== HEARTBEAT ====================
 
 async def send_heartbeat(conn, balance, equity, positions):
-    """Stuur elke 10 minuten statusupdate (alleen via Telegram)"""
+    """Stuur elke 10 minuten statusupdate"""
     global last_status
     
     current_time = time.time()
@@ -560,7 +583,9 @@ async def run():
         
         await asyncio.sleep(2)
         
-        # 🔥 GEEN TELEGRAM SPAM MEER - alleen console
+        # Telegram test bij opstarten
+        test_telegram()
+        
         print("✅ BOT VERBONDEN MET METATRADER - Klaar voor actie")
         
         global last_status
@@ -569,6 +594,9 @@ async def run():
         await run_diagnostics(conn, account)
         
         print("✅ Test modus UIT - alleen echte signalen")
+        
+        # Stuur een test heartbeat om te checken
+        await send_heartbeat(conn, 0, 0, [])
         
         # Hoofdloop
         while True:
