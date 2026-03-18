@@ -951,19 +951,15 @@ async def run():
 
         await run_diagnostics(conn, account)
 
-        tg("""🚀 <b>SMC BOT v2.1 AGGRESSIVE GESTART</b>
+        tg(f"""🚀 <b>SMC BOT v2.1 AGGRESSIVE GESTART</b>
 
 📊 {len(SYMBOLS)} symbols | {len(TRADING_KILLZONES)} killzones
 🎯 Min RR: {MIN_RR} | Max trades: {MAX_TOTAL_TRADES}
-⚡ Features: Displacement OB/FVG | Liquidity Sweep | Momentum | Dynamic Risk | Grading | Partial TP | Trailing | Cooldown | Regime Filter""".replace("{len(SYMBOLS)}", str(len(SYMBOLS))).replace("{len(TRADING_KILLZONES)}", str(len(TRADING_KILLZONES))).replace("{MIN_RR}", str(MIN_RR)).replace("{MAX_TOTAL_TRADES}", str(MAX_TOTAL_TRADES)))
+⚡ Displacement OB/FVG | Liquidity Sweep | Momentum | Dynamic Risk | Grading | Partial TP | Trailing | Cooldown | Regime Filter""")
 
         # === MAIN LOOP ===
         while True:
             try:
-                if not conn.connected:
-                    print("⚠️ Disconnected")
-                    break
-
                 info = await conn.get_account_information()
                 balance = info["balance"]
                 equity = info["equity"]
