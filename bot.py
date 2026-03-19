@@ -194,19 +194,78 @@ asia_range_cache: Dict[str, dict] = {}
 recent_signals: Dict[str, float] = {}
 connection_healthy = True
 last_connection_check = 0
+watchdog_last_loop = time.time()  # Watchdog: laatste succesvolle loop iteratie
+watchdog_max_silence = 300        # 5 min zonder loop = hang detected
+consecutive_errors = 0            # Tel opeenvolgende loop errors
+MAX_CONSECUTIVE_ERRORS = 20       # Na 20 errors: force restart
+
+# ===== PERFORMANCE TRACKER (voor dynamische lotsize) =====
+performance = {
+    "wins": 0,
+    "losses": 0,
+    "consecutive_wins": 0,
+    "consecutive_losses": 0,
+    "recent_results": [],       # Laatste 20 trades: True=win, False=loss
+    "peak_balance": 0,          # Hoogste balance (drawdown calc)
+    "session_start_balance": 0, # Balance bij bot start
+    "total_profit": 0,
+    "grade_stats": {},          # {"A+": {"w": 0, "l": 0}, ...}
+    "kz_stats": {},             # {"london": {"w": 0, "l": 0}, ...}
+}
+
+# Killzone risk multipliers — meer risico in betere sessies
+KILLZONE_RISK_MULT = {
+    "london":     1.2,   # Beste liquidity, hogere risk
+    "new_york":   1.2,
+    "london_ext": 1.0,
+    "ny_pm":      0.8,   # Minder volume
+    "asia":       0.7,   # Laagste volume
+}
+
+# Lotsize limieten per categorie
+LOT_LIMITS = {
+    "forex":   {"min": 0.01, "max": 5.0},
+    "metals":  {"min": 0.01, "max": 3.0},
+    "indices": {"min": 0.01, "max": 3.0},
+    "crypto":  {"min": 0.01, "max": 2.0},
+}
 
 # ==================== TELEGRAM ====================
 
+tg_fail_count = 0
+tg_last_success = time.time()
+
 def tg(msg: str):
+    """Telegram met 3x retry en exponential backoff"""
+    global tg_fail_count, tg_last_success
     if not TG_TOKEN or not TG_CHAT:
         return
+    for attempt in range(3):
+        try:
+            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+            payload = json.dumps({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}).encode()
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=8 + attempt * 4)  # 8s, 12s, 16s
+            tg_fail_count = 0
+            tg_last_success = time.time()
+            return
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 ** attempt)  # 1s, 2s
+            else:
+                tg_fail_count += 1
+                log.warning(f"Telegram FAILED 3x (total fails: {tg_fail_count}): {e}")
+
+
+def tg_health_check() -> bool:
+    """Check of Telegram nog bereikbaar is"""
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        payload = json.dumps({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}).encode()
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/getMe"
+        req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        log.warning(f"Telegram error: {e}")
+        return True
+    except Exception:
+        return False
 
 # ==================== RATE LIMITER ====================
 
@@ -260,6 +319,8 @@ async def send_heartbeat(conn):
         positions = await rate_limited_call(conn.get_positions())
     except Exception as e:
         log.error(f"Heartbeat error: {e}")
+        # Probeer toch een minimale heartbeat te sturen
+        tg(f"💓 <b>HEARTBEAT</b> (limited)\n⚠️ Data ophalen mislukt: {str(e)[:60]}\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
         return
 
     pl = equity - balance
@@ -267,8 +328,10 @@ async def send_heartbeat(conn):
     kz = get_current_killzone()
     daily_loss = ((daily_state["start_balance"] - balance) / daily_state["start_balance"] * 100) if daily_state["start_balance"] > 0 else 0
     total_zones = sum(len([z for z in zones if z.is_valid]) for zones in zone_store.values())
+    uptime_min = int((now - watchdog_last_loop) / 60) if watchdog_last_loop else 0
+    tg_status = "✅" if tg_fail_count == 0 else f"⚠️ {tg_fail_count} fails"
 
-    msg = f"""<b>💓 SMC v3.0 HEARTBEAT</b>
+    msg = f"""<b>💓 SMC v3.1 HEARTBEAT</b>
 
 💰 Balance: ${balance:,.2f}
 📊 Equity: ${equity:,.2f}
@@ -280,8 +343,17 @@ async def send_heartbeat(conn):
 
 📅 Daily loss: {daily_loss:.2f}%
 📆 Weekly loss: {weekly_state['loss']*100:.2f}%
-🔥 Losses in row: {daily_state['losses_in_row']}
 📊 Trades today: {daily_state['trades_today']}
+
+📈 Performance:
+  W/L: {performance['wins']}/{performance['losses']}
+  Streak: {performance['consecutive_wins']}W / {performance['consecutive_losses']}L
+  WR: {(performance['wins']/(performance['wins']+performance['losses'])*100) if (performance['wins']+performance['losses']) > 0 else 0:.0f}%
+  Peak: ${performance['peak_balance']:,.2f}
+
+🔗 Connection: {'✅' if connection_healthy else '❌'}
+📡 Telegram: {tg_status}
+⚙️ Loop errors: {consecutive_errors}
 
 ⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"""
     tg(msg)
@@ -402,16 +474,139 @@ def register_trade_result(is_win: bool, profit: float = 0):
             daily_state["cooldown_until"] = time.time() + COOLDOWN_MINUTES * 60
             tg(f"🧊 <b>COOLDOWN {COOLDOWN_MINUTES}min</b> na {daily_state['losses_in_row']} losses")
 
+    # Update performance tracker
+    update_performance(is_win, profit)
 
-def get_dynamic_risk(balance: float) -> float:
-    risk = BASE_RISK
-    if daily_state["losses_in_row"] >= 1:
-        risk *= 0.5
+
+def get_dynamic_risk(balance: float, grade: str = "B", kz: str = None) -> float:
+    """
+    DYNAMISCHE RISICO BEREKENING
+    
+    Factoren die risico beïnvloeden:
+    1. Base risk (1%)
+    2. Win/loss streak → scale up bij winst, down bij verlies
+    3. Equity curve → meer risico als je in profit bent, minder bij drawdown
+    4. Killzone → hogere risk in London/NY, lager in Asia
+    5. Grade → A+ krijgt meer, C krijgt minder
+    6. Recent winrate → boven 55% = bonus, onder 40% = penalty
+    7. Dagverlies protectie → hard afschalen bij drawdown
+    """
+    risk = BASE_RISK  # 1%
+
+    # === 1. LOSS STREAK PROTECTIE ===
+    if daily_state["losses_in_row"] >= 3:
+        risk *= 0.25    # 3+ losses: kwart risico
+    elif daily_state["losses_in_row"] >= 2:
+        risk *= 0.4     # 2 losses: 40%
+    elif daily_state["losses_in_row"] >= 1:
+        risk *= 0.6     # 1 loss: 60%
+
+    # === 2. WIN STREAK BONUS ===
+    if performance["consecutive_wins"] >= 4:
+        risk *= 1.4     # 4+ wins: +40%
+    elif performance["consecutive_wins"] >= 3:
+        risk *= 1.25    # 3 wins: +25%
+    elif performance["consecutive_wins"] >= 2:
+        risk *= 1.1     # 2 wins: +10%
+
+    # === 3. EQUITY CURVE SCALING ===
+    if performance["peak_balance"] > 0 and balance > 0:
+        drawdown = (performance["peak_balance"] - balance) / performance["peak_balance"]
+        if drawdown >= 0.04:
+            risk *= 0.25     # 4%+ drawdown: noodrem
+        elif drawdown >= 0.02:
+            risk *= 0.5      # 2%+ drawdown: halveer
+        elif drawdown >= 0.01:
+            risk *= 0.75     # 1%+ drawdown: 75%
+        elif drawdown <= 0:
+            # In profit → licht opschalen (compound growth)
+            growth = (balance - performance["session_start_balance"]) / performance["session_start_balance"] if performance["session_start_balance"] > 0 else 0
+            if growth > 0.05:
+                risk *= 1.2   # 5%+ groei: +20%
+            elif growth > 0.02:
+                risk *= 1.1   # 2%+ groei: +10%
+
+    # === 4. KILLZONE MULTIPLIER ===
+    if kz:
+        kz_mult = KILLZONE_RISK_MULT.get(kz, 1.0)
+        risk *= kz_mult
+
+    # === 5. GRADE MULTIPLIER ===
+    grade_risk_mult = {
+        "A+": 1.5,
+        "A":  1.2,
+        "B+": 1.0,
+        "B":  0.75,
+        "C":  0.4,
+    }
+    risk *= grade_risk_mult.get(grade, 0.75)
+
+    # === 6. RECENT WINRATE ===
+    recent = performance["recent_results"]
+    if len(recent) >= 8:
+        winrate = sum(recent[-10:]) / len(recent[-10:])
+        if winrate >= 0.65:
+            risk *= 1.2    # 65%+ winrate: +20%
+        elif winrate >= 0.55:
+            risk *= 1.1    # 55%+ winrate: +10%
+        elif winrate <= 0.35:
+            risk *= 0.5    # 35%- winrate: halveer
+        elif winrate <= 0.40:
+            risk *= 0.7    # 40%- winrate: -30%
+
+    # === 7. DAGVERLIES PROTECTIE ===
     if daily_state["start_balance"] > 0:
-        cur_loss = (daily_state["start_balance"] - balance) / daily_state["start_balance"]
-        if cur_loss >= 0.015:
-            risk *= 0.5
-    return max(risk, 0.002)
+        day_loss = (daily_state["start_balance"] - balance) / daily_state["start_balance"]
+        if day_loss >= 0.02:
+            risk *= 0.3    # 2%+ dagverlies: hard afschalen
+        elif day_loss >= 0.015:
+            risk *= 0.5    # 1.5%+: halveer
+
+    # === FLOOR & CEILING ===
+    return max(risk, 0.002)  # Min 0.2%, geen max hier (max via lot limits)
+
+
+def update_performance(is_win: bool, profit: float = 0, grade: str = "", kz: str = ""):
+    """Update performance tracker na trade resultaat"""
+    if is_win:
+        performance["wins"] += 1
+        performance["consecutive_wins"] += 1
+        performance["consecutive_losses"] = 0
+    else:
+        performance["losses"] += 1
+        performance["consecutive_losses"] += 1
+        performance["consecutive_wins"] = 0
+
+    performance["total_profit"] += profit
+    performance["recent_results"].append(is_win)
+    if len(performance["recent_results"]) > 20:
+        performance["recent_results"] = performance["recent_results"][-20:]
+
+    # Grade stats
+    if grade:
+        if grade not in performance["grade_stats"]:
+            performance["grade_stats"][grade] = {"w": 0, "l": 0}
+        if is_win:
+            performance["grade_stats"][grade]["w"] += 1
+        else:
+            performance["grade_stats"][grade]["l"] += 1
+
+    # Killzone stats
+    if kz:
+        if kz not in performance["kz_stats"]:
+            performance["kz_stats"][kz] = {"w": 0, "l": 0}
+        if is_win:
+            performance["kz_stats"][kz]["w"] += 1
+        else:
+            performance["kz_stats"][kz]["l"] += 1
+
+
+def update_peak_balance(balance: float):
+    """Track peak balance voor drawdown berekening"""
+    if balance > performance["peak_balance"]:
+        performance["peak_balance"] = balance
+    if performance["session_start_balance"] == 0:
+        performance["session_start_balance"] = balance
 
 
 def check_correlation(symbol: str, positions: list) -> bool:
@@ -950,19 +1145,41 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
 
 # ==================== LOT SIZE ====================
 
-def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct: float) -> float:
+def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct: float) -> Tuple[float, dict]:
+    """
+    Dynamische lot-sizing met:
+    - Correcte pip value per instrument
+    - Category-specifieke min/max lots
+    - Risk amount logging voor transparantie
+    """
     if sl_distance <= 0:
-        return 0
+        return 0, {"error": "sl_distance <= 0"}
     spec = SYMBOL_SPECS.get(symbol)
     if not spec:
-        return 0
+        return 0, {"error": "unknown symbol"}
+
     sl_pips = sl_distance / spec["pip_size"]
     risk_amount = balance * risk_pct
     denom = sl_pips * spec["pip_value_per_lot"]
     if denom <= 0:
-        return 0
-    lot = risk_amount / denom
-    return round(max(0.01, min(lot, 3.0)), 2)
+        return 0, {"error": "denom <= 0"}
+
+    raw_lot = risk_amount / denom
+
+    # Category limits
+    limits = LOT_LIMITS.get(spec["category"], {"min": 0.01, "max": 3.0})
+    lot = round(max(limits["min"], min(raw_lot, limits["max"])), 2)
+
+    details = {
+        "risk_amount": round(risk_amount, 2),
+        "sl_pips": round(sl_pips, 1),
+        "raw_lot": round(raw_lot, 4),
+        "final_lot": lot,
+        "capped": raw_lot > limits["max"],
+        "floored": raw_lot < limits["min"],
+        "category": spec["category"],
+    }
+    return lot, details
 
 # ==================== SL / TP BEREKENING ====================
 
@@ -1266,12 +1483,16 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
 # ==================== TRADE EXECUTIE ====================
 
 async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
-    risk_pct = get_dynamic_risk(balance) * setup.risk_mult
+    kz = get_current_killzone()
+    risk_pct = get_dynamic_risk(balance, grade=setup.grade, kz=kz) * setup.risk_mult
     sl_dist = abs(setup.entry - setup.stop_loss)
-    lot = calculate_lot_size(balance, sl_dist, setup.symbol, risk_pct)
+    lot, lot_details = calculate_lot_size(balance, sl_dist, setup.symbol, risk_pct)
 
     if lot < 0.01:
         return False
+
+    # Update peak balance voor equity curve tracking
+    update_peak_balance(balance)
 
     try:
         if setup.direction == Direction.BULL:
@@ -1293,11 +1514,13 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
         "lot": lot, "rr": setup.rr, "risk_pct": risk_pct,
         "reasons": setup.reasons, "regime": setup.regime,
         "confirmation": setup.confirmation, "zone_type": setup.zone.type.value,
+        "lot_details": lot_details,
     })
 
-    kz = get_current_killzone()
     r = " | ".join(setup.reasons)
     de = "🟢" if setup.direction == Direction.BULL else "🔴"
+    cap_warn = " ⚠️CAP" if lot_details.get("capped") else ""
+    wr = sum(performance["recent_results"][-10:]) / max(len(performance["recent_results"][-10:]), 1) * 100
 
     tg(f"""<b>{de} TRADE OPENED — Grade {setup.grade}</b>
 
@@ -1310,11 +1533,14 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
 🎯 TP1: {setup.tp1:.5f} (50% partial)
 🎯 TP2: {setup.tp2:.5f} (runner)
 
-📊 RR: 1:{setup.rr:.1f} | Lots: {lot}
-💵 Risk: {risk_pct*100:.2f}%
+📊 RR: 1:{setup.rr:.1f} | Lots: {lot}{cap_warn}
+💵 Risk: {risk_pct*100:.2f}% (${lot_details['risk_amount']})
+📏 SL: {lot_details['sl_pips']:.1f} pips
 ✅ Confirm: {setup.confirmation}
 🗺️ Zone: {setup.zone.type.value} ({setup.zone.timeframe})
 
+📈 Streak: {performance['consecutive_wins']}W / {performance['consecutive_losses']}L
+🎯 Recent WR: {wr:.0f}%
 📋 Score: {setup.score:.1f} | {r}
 💰 Balance: ${balance:,.2f}""")
 
@@ -1361,19 +1587,108 @@ async def run():
         log.info("Connecting to MetaAPI...")
         api = MetaApi(METAAPI_TOKEN)
         account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-        await account.wait_connected()
 
-        conn = account.get_rpc_connection()
-        await conn.connect()
+        # === ROBUUSTE CONNECTION SETUP ===
+        # Probleem: MetaAPI SDK kan vastlopen in connect-disconnect loop
+        # Oplossing: meerdere pogingen met account redeploy als fallback
 
-        log.info("Synchronizing...")
-        await conn.wait_synchronized(timeout_in_seconds=120)
-        log.info("Synchronized!")
+        conn = None
+        for attempt in range(5):
+            try:
+                log.info(f"Connection poging {attempt + 1}/5...")
+
+                # Stap 1: Check account state en deploy indien nodig
+                account_info = account.state
+                log.info(f"Account state: {account_info}")
+
+                if account_info != "DEPLOYED":
+                    log.info("Account niet deployed, deploying...")
+                    try:
+                        await account.deploy()
+                    except Exception as e:
+                        log.warning(f"Deploy fout (kan normaal zijn): {e}")
+                    await asyncio.sleep(5)
+
+                # Stap 2: Wacht op account connected met timeout
+                try:
+                    await asyncio.wait_for(account.wait_connected(), timeout=60)
+                    log.info("Account connected!")
+                except asyncio.TimeoutError:
+                    log.warning(f"Account connect timeout poging {attempt + 1}")
+                    # Undeploy + redeploy forceren
+                    if attempt >= 2:
+                        log.info("Forcing undeploy + redeploy...")
+                        try:
+                            await account.undeploy()
+                            await asyncio.sleep(10)
+                            await account.deploy()
+                            await asyncio.sleep(10)
+                        except Exception as e:
+                            log.warning(f"Redeploy fout: {e}")
+                    await asyncio.sleep(10)
+                    continue
+
+                # Stap 3: Maak RPC connection
+                conn = account.get_rpc_connection()
+                await conn.connect()
+
+                # Stap 4: Synchroniseer met korte timeout, retry bij falen
+                log.info("Synchroniseren...")
+                try:
+                    await asyncio.wait_for(
+                        conn.wait_synchronized(),
+                        timeout=90
+                    )
+                    log.info("Gesynchroniseerd!")
+                    break  # SUCCESS — uit de loop
+                except asyncio.TimeoutError:
+                    log.warning(f"Sync timeout poging {attempt + 1}")
+                    # Sluit connection en probeer opnieuw
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                    await asyncio.sleep(15)
+                    continue
+
+            except Exception as e:
+                log.error(f"Connection poging {attempt + 1} mislukt: {e}")
+                if conn:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                await asyncio.sleep(15)
+
+        if not conn:
+            tg("❌ <b>FATAL: Kon niet verbinden na 5 pogingen</b>\nCheck MetaAPI dashboard!")
+            raise Exception("Connection failed after 5 attempts")
+
+        # === EXTRA VALIDATIE: test of connection echt werkt ===
+        try:
+            test_info = await asyncio.wait_for(conn.get_account_information(), timeout=15)
+            log.info(f"Connection verified: ${test_info['balance']} balance")
+        except Exception as e:
+            tg(f"⚠️ Connection gemaakt maar verificatie mislukt: {e}")
+            raise Exception(f"Connection verification failed: {e}")
 
         await asyncio.sleep(2)
 
-        global last_heartbeat
+        global last_heartbeat, watchdog_last_loop, consecutive_errors
         last_heartbeat = 0
+        watchdog_last_loop = time.time()
+        consecutive_errors = 0
+
+        # Initialiseer performance tracker met startbalance
+        try:
+            init_info = await conn.get_account_information()
+            performance["session_start_balance"] = init_info["balance"]
+            performance["peak_balance"] = init_info["balance"]
+            log.info(f"Performance tracker init: ${init_info['balance']}")
+        except Exception:
+            pass
 
         await run_diagnostics(conn, account)
 
@@ -1393,18 +1708,47 @@ async def run():
 
         while True:
             try:
+                # === WATCHDOG: markeer succesvolle loop ===
+                watchdog_last_loop = time.time()
+                consecutive_errors = 0  # Reset na succesvolle iteratie
+
                 await send_heartbeat(conn)
 
                 if not await check_connection_health(conn):
                     log.warning("Connection unhealthy, reconnecting...")
-                    try:
-                        await conn.connect()
-                        await conn.wait_synchronized(timeout_in_seconds=60)
-                        log.info("Reconnected!")
-                    except Exception as e:
-                        log.error(f"Reconnect failed: {e}")
-                        await asyncio.sleep(30)
-                        continue
+                    tg("⚠️ <b>CONNECTION LOST</b> — reconnecting...")
+                    reconnected = False
+                    for attempt in range(3):
+                        try:
+                            log.info(f"Reconnect poging {attempt + 1}/3...")
+                            # Sluit oude connection
+                            try:
+                                await conn.close()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(5)
+
+                            # Nieuwe connection opzetten
+                            conn = account.get_rpc_connection()
+                            await conn.connect()
+                            await asyncio.wait_for(
+                                conn.wait_synchronized(),
+                                timeout=60
+                            )
+                            log.info(f"Reconnected on attempt {attempt + 1}!")
+                            tg(f"✅ <b>RECONNECTED</b> (poging {attempt + 1})")
+
+                            # Verifieer
+                            await asyncio.wait_for(conn.get_account_information(), timeout=10)
+                            reconnected = True
+                            break
+                        except Exception as e:
+                            log.error(f"Reconnect attempt {attempt + 1} failed: {e}")
+                            await asyncio.sleep(15 * (attempt + 1))
+
+                    if not reconnected:
+                        tg("❌ <b>RECONNECT FAILED 3x</b> — force restart...")
+                        raise Exception("Reconnect failed after 3 attempts")
 
                 kz = get_current_killzone()
 
@@ -1425,6 +1769,9 @@ async def run():
                 balance = info["balance"]
                 equity = info["equity"]
                 positions = await rate_limited_call(conn.get_positions())
+
+                # Track peak balance voor dynamische lotsize
+                update_peak_balance(equity)
 
                 update_weekly_loss(balance)
                 await check_closed_trades(conn)
@@ -1487,7 +1834,18 @@ async def run():
                 await asyncio.sleep(CHECK_INTERVAL)
 
             except Exception as e:
-                log.error(f"Loop error: {e}")
+                consecutive_errors += 1
+                log.error(f"Loop error #{consecutive_errors}: {e}")
+
+                # Na te veel errors: force restart
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    tg(f"🚨 <b>{MAX_CONSECUTIVE_ERRORS} CONSECUTIVE ERRORS</b> — force restart\nLaatste: {str(e)[:60]}")
+                    raise Exception(f"Too many consecutive errors: {consecutive_errors}")
+
+                # Elke 5 errors: stuur warning
+                if consecutive_errors % 5 == 0:
+                    tg(f"⚠️ <b>{consecutive_errors} LOOP ERRORS</b>\n{str(e)[:80]}")
+
                 await asyncio.sleep(10 if "timed out" in str(e).lower() else 5)
 
     except Exception as e:
@@ -1497,20 +1855,54 @@ async def run():
 
 # ==================== START ====================
 
+def watchdog_thread():
+    """
+    Aparte thread die de main loop monitort.
+    Als de loop langer dan 5 min niet reageert: force exit zodat
+    de outer while-loop een restart triggert.
+    """
+    global watchdog_last_loop
+    while True:
+        time.sleep(60)  # Check elke minuut
+        silence = time.time() - watchdog_last_loop
+        if silence > watchdog_max_silence:
+            log.critical(f"WATCHDOG: Loop silent for {silence:.0f}s — force restart!")
+            tg(f"🐕 <b>WATCHDOG TRIGGERED</b>\nLoop niet actief voor {silence:.0f}s\nForce restart...")
+            # Force exit — de outer while True herstart alles
+            os._exit(1)
+
+
 if __name__ == "__main__":
+    import threading
+
     log.info("=" * 50)
     log.info("PROFESSIONAL SMC BOT v3.1 — AGGRESSIVE")
     log.info("Zone-based | Momentum Entries | 3-15 trades/day")
+    log.info("Watchdog enabled | Telegram retry 3x")
     log.info("=" * 50)
+
+    # Start watchdog als daemon thread
+    wd = threading.Thread(target=watchdog_thread, daemon=True)
+    wd.start()
+    log.info("🐕 Watchdog thread gestart")
+
+    restart_count = 0
 
     while True:
         try:
+            restart_count += 1
+            if restart_count > 1:
+                tg(f"🔄 <b>AUTO RESTART #{restart_count}</b>")
             asyncio.run(run())
         except KeyboardInterrupt:
             tg("🛑 <b>BOT GESTOPT</b>")
             log.info("Stopped by user")
             break
         except Exception as e:
-            tg(f"💥 <b>CRASH</b>: {str(e)[:80]}")
-            log.error(f"Crash: {e} — Restart in 10s...")
-            time.sleep(10)
+            tg(f"💥 <b>CRASH #{restart_count}</b>: {str(e)[:80]}\n🔄 Restart in 15s...")
+            log.error(f"Crash #{restart_count}: {e}")
+
+            # Exponential backoff bij herhaalde crashes (max 60s)
+            wait = min(15 * restart_count, 60)
+            log.info(f"Restart in {wait}s...")
+            time.sleep(wait)
