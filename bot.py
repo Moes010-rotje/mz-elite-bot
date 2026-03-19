@@ -707,6 +707,120 @@ def update_peak_balance(balance: float):
         performance["session_start_balance"] = balance
 
 
+# ==================== ADAPTIVE TRADE DATA ====================
+
+TRADE_DATA_FILE = "/tmp/smc_trade_history.json"
+
+def save_trade_data(trade: dict):
+    """Sla individuele trade op naar disk met alle details"""
+    try:
+        history = load_trade_history()
+        history.append(trade)
+        # Max 500 trades bewaren
+        if len(history) > 500:
+            history = history[-500:]
+        with open(TRADE_DATA_FILE, "w") as f:
+            json.dump(history, f)
+    except Exception as e:
+        log.debug(f"Trade data save error: {e}")
+
+
+def load_trade_history() -> list:
+    """Laad trade history van disk"""
+    try:
+        if os.path.exists(TRADE_DATA_FILE):
+            with open(TRADE_DATA_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def get_adaptive_boosts() -> dict:
+    """
+    Analyseer trade history en genereer boosts per symbool, confirmatie, killzone, zone type.
+    Winnende combinaties krijgen een hogere score, verliezende een lagere.
+
+    Returns: {
+        "symbol": {"XAUUSD": 1.5, "GBPJPY": 0.8, ...},
+        "confirmation": {"strong_close": 1.3, "pin_bar": 0.9, ...},
+        "killzone": {"new_york": 1.4, "london": 1.0, ...},
+        "zone_type": {"ob": 1.2, "fvg": 0.8, ...},
+        "best_setups": [...],  # Top 3 winnende combinaties
+    }
+    """
+    history = load_trade_history()
+    if len(history) < 3:
+        return {}  # Te weinig data
+
+    boosts = {"symbol": {}, "confirmation": {}, "killzone": {}, "zone_type": {}}
+
+    for category in boosts:
+        stats = {}
+        for t in history:
+            key = t.get(category, "unknown")
+            if not key:
+                continue
+            if key not in stats:
+                stats[key] = {"wins": 0, "losses": 0, "profit": 0}
+            if t.get("profit", 0) > 0:
+                stats[key]["wins"] += 1
+            else:
+                stats[key]["losses"] += 1
+            stats[key]["profit"] += t.get("profit", 0)
+
+        for key, s in stats.items():
+            total = s["wins"] + s["losses"]
+            if total < 2:
+                boosts[category][key] = 1.0  # Te weinig data
+                continue
+            wr = s["wins"] / total
+            # Boost = 0.6 bij 0% WR → 1.8 bij 100% WR, lineair
+            boosts[category][key] = round(0.6 + wr * 1.2, 2)
+
+    # Vind top 3 winnende combinaties
+    combos = {}
+    for t in history:
+        combo_key = f"{t.get('symbol','?')}|{t.get('killzone','?')}|{t.get('confirmation','?')}"
+        if combo_key not in combos:
+            combos[combo_key] = {"wins": 0, "losses": 0, "profit": 0}
+        if t.get("profit", 0) > 0:
+            combos[combo_key]["wins"] += 1
+        else:
+            combos[combo_key]["losses"] += 1
+        combos[combo_key]["profit"] += t.get("profit", 0)
+
+    sorted_combos = sorted(combos.items(), key=lambda x: x[1]["profit"], reverse=True)
+    boosts["best_setups"] = sorted_combos[:5]
+
+    return boosts
+
+
+def get_symbol_boost(symbol: str) -> float:
+    """Haal adaptive boost op voor een specifiek symbool"""
+    boosts = get_adaptive_boosts()
+    if not boosts:
+        return 1.0
+    return boosts.get("symbol", {}).get(symbol, 1.0)
+
+
+def get_setup_boost(symbol: str, confirmation: str, killzone: str, zone_type: str) -> float:
+    """Combineer alle boosts voor een specifieke setup"""
+    boosts = get_adaptive_boosts()
+    if not boosts:
+        return 1.0
+
+    sym_boost = boosts.get("symbol", {}).get(symbol, 1.0)
+    conf_boost = boosts.get("confirmation", {}).get(confirmation, 1.0)
+    kz_boost = boosts.get("killzone", {}).get(killzone, 1.0)
+    zt_boost = boosts.get("zone_type", {}).get(zone_type, 1.0)
+
+    # Gewogen gemiddelde: symbool telt zwaarst (40%), rest elk 20%
+    combined = sym_boost * 0.4 + conf_boost * 0.2 + kz_boost * 0.2 + zt_boost * 0.2
+    # Normaliseer rond 1.0 en begrens 0.5 - 2.0
+    return max(0.5, min(2.0, combined))
+
+
 def check_correlation(symbol: str, positions: list) -> bool:
     for group in CORRELATION_GROUPS:
         if symbol in group:
@@ -1252,7 +1366,7 @@ async def get_htf_bias(account, symbol: str) -> Optional[Direction]:
 
 # ==================== TRADE GRADING ====================
 
-def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount, regime, direction):
+def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount, regime, direction, symbol=""):
     """
     Verplicht: Zone + Confirmatie (zonder = D)
     A+ >= 10 | A >= 8 | B+ >= 6 | B >= 5 | C < 5 = skip
@@ -1303,6 +1417,13 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
     if zone.type == ZoneType.ORDER_BLOCK and zone.structure_break:
         score += 0.5
         reasons.append("OB+STRUCT")
+
+    # === ADAPTIVE BOOST: winnende patronen krijgen hogere score ===
+    adaptive = get_symbol_boost(symbol)
+    if adaptive > 1.1:
+        bonus = min((adaptive - 1.0) * 3.0, 2.0)  # Max +2.0 score bonus
+        score += bonus
+        reasons.append(f"ADAPTIVE({adaptive:.1f}x)")
 
     if score >= 10:
         return "A+", 1.0, score, reasons
@@ -1452,9 +1573,41 @@ async def check_closed_trades(conn):
                 continue
             if profit != 0:
                 recent_signals[dk] = time.time()
+                symbol = deal.get("symbol", "UNKNOWN")
+                
+                # Match terug naar journal entry voor rijke data
+                journal_match = None
+                for j in reversed(trade_journal):
+                    if j.get("symbol") == symbol:
+                        journal_match = j
+                        break
+
+                kz = get_current_killzone() or "unknown"
+                grade = journal_match.get("grade", "") if journal_match else ""
+                confirmation = journal_match.get("confirmation", "") if journal_match else ""
+                zone_type = journal_match.get("zone_type", "") if journal_match else ""
+                direction = journal_match.get("direction", "") if journal_match else ""
+
                 register_trade_result(profit > 0, profit)
+
+                # Sla rijke trade data op naar disk
+                trade_data = {
+                    "time": now.isoformat(),
+                    "symbol": symbol,
+                    "direction": direction,
+                    "profit": profit,
+                    "grade": grade,
+                    "confirmation": confirmation,
+                    "zone_type": zone_type,
+                    "killzone": kz,
+                    "won": profit > 0,
+                }
+                save_trade_data(trade_data)
+
                 emoji = "💰" if profit > 0 else "💔"
-                tg(f"{emoji} <b>TRADE {'WON' if profit>0 else 'LOST'}</b>: {'+'if profit>0 else ''}{profit:.2f}")
+                boost = get_symbol_boost(symbol)
+                boost_str = f" | Boost: {boost:.1f}x" if boost != 1.0 else ""
+                tg(f"{emoji} <b>TRADE {'WON' if profit>0 else 'LOST'}</b>: {symbol} {'+'if profit>0 else ''}{profit:.2f}{boost_str}")
     except Exception as e:
         log.debug(f"Closed trades error: {e}")
 
@@ -1623,6 +1776,7 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
             zone=active_zone, confirmation=confirmation,
             sweep=sweep if sweep and sweep["type"] == direction.value else None,
             premium_discount=pd_zone, regime=regime, direction=direction,
+            symbol=symbol,
         )
 
         # AGGRESSIVE: alleen D skippen, C trades toegestaan
@@ -1658,8 +1812,19 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
 async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
     kz = get_current_killzone()
     risk_pct = get_dynamic_risk(balance, grade=setup.grade, kz=kz) * setup.risk_mult
+
+    # === ADAPTIVE RISK BOOST: winnende symbolen/setups krijgen meer risico ===
+    adaptive_boost = get_setup_boost(
+        setup.symbol,
+        setup.confirmation or "",
+        kz or "",
+        setup.zone.type.value if setup.zone else "",
+    )
+    risk_pct *= adaptive_boost
+
     sl_dist = abs(setup.entry - setup.stop_loss)
     lot, lot_details = calculate_lot_size(balance, sl_dist, setup.symbol, risk_pct)
+    lot_details["adaptive_boost"] = adaptive_boost
 
     if lot < 0.01:
         return False
@@ -1706,11 +1871,33 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
 
     try:
         if setup.direction == Direction.BULL:
-            await rate_limited_call(conn.create_market_buy_order(setup.symbol, lot, setup.stop_loss, setup.tp2))
+            result = await asyncio.wait_for(
+                conn.create_market_buy_order(setup.symbol, lot, setup.stop_loss, setup.tp2),
+                timeout=15
+            )
         else:
-            await rate_limited_call(conn.create_market_sell_order(setup.symbol, lot, setup.stop_loss, setup.tp2))
+            result = await asyncio.wait_for(
+                conn.create_market_sell_order(setup.symbol, lot, setup.stop_loss, setup.tp2),
+                timeout=15
+            )
+
+        # Verifieer dat order echt geplaatst is
+        if not result or result.get("stringCode") == "ERR_NO_ERROR" or "orderId" not in str(result):
+            # Sommige brokers retourneren success zonder orderId — check posities
+            await asyncio.sleep(1)
+            positions = await rate_limited_call(conn.get_positions())
+            if positions:
+                found = any(p.get("symbol") == setup.symbol for p in positions)
+                if not found:
+                    tg(f"❌ <b>ORDER NOT CONFIRMED</b>: {setup.symbol} — geen positie gevonden na order")
+                    return False
+            mark_api_success()
+        else:
+            mark_api_success()
+
     except Exception as e:
         tg(f"❌ <b>ORDER FAIL</b>: {setup.symbol} — {e}")
+        mark_api_failure()
         return False
 
     daily_state["trades_today"] += 1
