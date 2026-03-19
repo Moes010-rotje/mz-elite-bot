@@ -126,7 +126,7 @@ COOLDOWN_AFTER_LOSSES = 3  # Na 3 losses (was 2)
 COOLDOWN_MINUTES = 45      # 45 min (was 90)
 ZONE_MAX_AGE_HOURS = 48    # Zones leven 48u (was 24)
 ZONE_MAX_TESTS = 2         # 2x testbaar (was 1)
-MAX_API_CALLS_PER_MIN = 60 # Verhoogd voor 15 symbolen × 3 timeframes
+MAX_API_CALLS_PER_MIN = 120 # 15 symbolen × ~5 calls = 75 per cyclus + overhead
 
 SWING_LOOKBACK = 2         # Snellere swing detectie (was 3)
 MIN_REJECTION_WICK_RATIO = 0.45   # Versoepeld (was 0.6)
@@ -195,7 +195,7 @@ recent_signals: Dict[str, float] = {}
 connection_healthy = True
 last_connection_check = 0
 watchdog_last_loop = time.time()  # Watchdog: laatste succesvolle loop iteratie
-watchdog_max_silence = 300        # 5 min zonder loop = hang detected
+watchdog_max_silence = 600        # 10 min zonder loop = hang detected (was 300)
 consecutive_errors = 0            # Tel opeenvolgende loop errors
 MAX_CONSECUTIVE_ERRORS = 20       # Na 20 errors: force restart
 
@@ -1857,6 +1857,9 @@ async def run():
                     continue
 
                 for symbol in SYMBOLS:
+                    # Watchdog: reset timer zodat lange analyse cyclus geen trigger geeft
+                    watchdog_last_loop = time.time()
+
                     allowed, _ = is_entry_allowed(symbol)
                     if not allowed:
                         continue
