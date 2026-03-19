@@ -6,6 +6,8 @@ import time
 import json
 import urllib.request
 import logging
+import pickle
+from pathlib import Path
 from datetime import datetime, date, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
@@ -267,9 +269,56 @@ def tg_health_check() -> bool:
     except Exception:
         return False
 
-# ==================== RATE LIMITER ====================
+# ==================== SAFE API CALL (BULLETPROOF) ====================
+
+async def safe_call(coro_func, *args, retries=3, timeout=30, default=None, label="API"):
+    """
+    Universele wrapper voor ELKE API call.
+    - Rate limiting
+    - Timeout protectie
+    - Auto-retry met backoff
+    - Retourneert default bij falen (nooit een crash)
+    """
+    global api_call_count, api_call_reset_time
+
+    for attempt in range(retries):
+        try:
+            # Rate limit
+            now = time.time()
+            if now - api_call_reset_time > 60:
+                api_call_count = 0
+                api_call_reset_time = now
+            if api_call_count >= MAX_API_CALLS_PER_MIN:
+                wait = 60 - (now - api_call_reset_time)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                api_call_count = 0
+                api_call_reset_time = time.time()
+            api_call_count += 1
+
+            # Execute met timeout
+            result = await asyncio.wait_for(coro_func(*args), timeout=timeout)
+            return result
+
+        except asyncio.TimeoutError:
+            log.warning(f"{label} timeout (poging {attempt+1}/{retries})")
+            await asyncio.sleep(2 * (attempt + 1))
+        except Exception as e:
+            err = str(e).lower()
+            if "not connected" in err or "not synchronized" in err or "socket" in err:
+                log.warning(f"{label} connection error (poging {attempt+1}): {e}")
+                await asyncio.sleep(5 * (attempt + 1))
+            elif attempt < retries - 1:
+                log.debug(f"{label} error (poging {attempt+1}): {e}")
+                await asyncio.sleep(2)
+            else:
+                log.warning(f"{label} failed after {retries} attempts: {e}")
+
+    return default
+
 
 async def rate_limited_call(coro):
+    """Legacy wrapper — redirects naar safe_call voor bestaande code"""
     global api_call_count, api_call_reset_time
     now = time.time()
     if now - api_call_reset_time > 60:
@@ -278,45 +327,85 @@ async def rate_limited_call(coro):
     if api_call_count >= MAX_API_CALLS_PER_MIN:
         wait = 60 - (now - api_call_reset_time)
         if wait > 0:
-            log.info(f"Rate limit: wacht {wait:.0f}s")
             await asyncio.sleep(wait)
         api_call_count = 0
         api_call_reset_time = time.time()
     api_call_count += 1
-    return await coro
+    try:
+        return await asyncio.wait_for(coro, timeout=30)
+    except asyncio.TimeoutError:
+        log.warning("rate_limited_call timeout")
+        return None
+    except Exception as e:
+        log.warning(f"rate_limited_call error: {e}")
+        return None
 
 # ==================== CANDLE HELPER ====================
 
 TF_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
 
 async def get_candles(account, symbol: str, timeframe: str, count: int):
-    """
-    Wrapper voor get_historical_candles die correct start_time berekent.
-    MetaAPI verwacht een datetime als startTime, niet een int.
-    """
+    """Haal candles op met retry en timeout protectie"""
     tf_min = TF_MINUTES.get(timeframe, 15)
-    start = datetime.now(timezone.utc) - timedelta(minutes=tf_min * count * 1.5)  # 1.5x buffer
-    return await rate_limited_call(
-        account.get_historical_candles(symbol, timeframe, start)
-    )
+    start = datetime.now(timezone.utc) - timedelta(minutes=tf_min * count * 1.5)
+    try:
+        result = await safe_call(
+            account.get_historical_candles, symbol, timeframe, start,
+            retries=2, timeout=20, default=None, label=f"candles_{symbol}_{timeframe}"
+        )
+        return result
+    except Exception as e:
+        log.debug(f"get_candles {symbol} {timeframe}: {e}")
+        return None
 
-# ==================== CONNECTION HEALTH ====================
+# ==================== CONNECTION HEALTH (DUAL CHECK) ====================
+
+last_price_time = time.time()  # Track wanneer laatste price data binnenkwam
+
+def update_last_price_time():
+    """Call dit vanuit de main loop om te tracken dat data binnenkomt"""
+    global last_price_time
+    last_price_time = time.time()
+
 
 async def check_connection_health(conn) -> bool:
+    """
+    DUAL health check:
+    1. API check: kan ik account info ophalen?
+    2. Data freshness: komt er nog price data binnen?
+
+    Beide moeten slagen. Een stale connection die "connected" zegt
+    maar geen data stuurt wordt nu ook gedetecteerd.
+    """
     global connection_healthy, last_connection_check
     now = time.time()
-    if now - last_connection_check < 120:
+    if now - last_connection_check < 180:
         return connection_healthy
     last_connection_check = now
-    try:
-        info = await asyncio.wait_for(conn.get_account_information(), timeout=10)
-        if info and "balance" in info:
-            connection_healthy = True
-            return True
-    except Exception as e:
-        log.error(f"Connection health check failed: {e}")
+
+    # === CHECK 1: Data freshness ===
+    # Als we >120s geen price data hebben ontvangen, is de connection stale
+    data_age = now - last_price_time
+    if data_age > 120:
+        log.warning(f"Data stale: {data_age:.0f}s sinds laatste price update")
         connection_healthy = False
-    return connection_healthy
+        return False
+
+    # === CHECK 2: API responsiveness (2 pogingen) ===
+    for attempt in range(2):
+        try:
+            info = await asyncio.wait_for(conn.get_account_information(), timeout=10)
+            if info and "balance" in info:
+                connection_healthy = True
+                return True
+        except Exception as e:
+            if attempt == 0:
+                await asyncio.sleep(2)
+            else:
+                log.warning(f"Health check API failed 2x: {e}")
+
+    connection_healthy = False
+    return False
 
 # ==================== HEARTBEAT ====================
 
@@ -329,9 +418,14 @@ async def send_heartbeat(conn):
 
     try:
         info = await rate_limited_call(conn.get_account_information())
+        if not info or "balance" not in info:
+            tg(f"💓 <b>HEARTBEAT</b> (limited)\n⚠️ Account info niet beschikbaar\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
+            return
         balance = info["balance"]
         equity = info["equity"]
         positions = await rate_limited_call(conn.get_positions())
+        if positions is None:
+            positions = []
     except Exception as e:
         log.error(f"Heartbeat error: {e}")
         # Probeer toch een minimale heartbeat te sturen
@@ -653,7 +747,7 @@ async def news_filter() -> bool:
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        res = urllib.request.urlopen(req, timeout=10)
+        res = urllib.request.urlopen(req, timeout=5)  # 5s timeout (was 10)
         events = json.loads(res.read().decode())
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         for event in events:
@@ -669,7 +763,7 @@ async def news_filter() -> bool:
                 continue
         return True
     except Exception:
-        return True
+        return True  # Bij error: gewoon door, nooit blokkeren
 
 # ==================== INDICATOREN ====================
 
@@ -1004,6 +1098,78 @@ def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Op
 
 # ==================== ZONE MANAGEMENT ====================
 
+ZONE_SAVE_FILE = "/tmp/smc_zones.pkl"
+ZONE_SAVE_INTERVAL = 60  # Sla zones op elke 60 seconden
+_last_zone_save = 0
+
+def save_zones_to_disk():
+    """Sla zone store op naar disk zodat het een herstart overleeft"""
+    global _last_zone_save
+    now = time.time()
+    if now - _last_zone_save < ZONE_SAVE_INTERVAL:
+        return
+    _last_zone_save = now
+    try:
+        data = {}
+        for symbol, zones in zone_store.items():
+            data[symbol] = []
+            for z in zones:
+                if z.is_valid:
+                    data[symbol].append({
+                        "type": z.type.value,
+                        "direction": z.direction.value,
+                        "high": z.high, "low": z.low, "midpoint": z.midpoint,
+                        "created_at": z.created_at,
+                        "status": z.status.value,
+                        "test_count": z.test_count,
+                        "symbol": z.symbol,
+                        "timeframe": z.timeframe,
+                    })
+        with open(ZONE_SAVE_FILE, "w") as f:
+            json.dump(data, f)
+        log.debug(f"Zones opgeslagen: {sum(len(v) for v in data.values())} zones")
+    except Exception as e:
+        log.warning(f"Zone save error: {e}")
+
+
+def load_zones_from_disk():
+    """Laad zones van disk na herstart"""
+    try:
+        if not os.path.exists(ZONE_SAVE_FILE):
+            return 0
+        with open(ZONE_SAVE_FILE, "r") as f:
+            data = json.load(f)
+
+        count = 0
+        now = time.time()
+        max_age = ZONE_MAX_AGE_HOURS * 3600
+
+        for symbol, zones_data in data.items():
+            if symbol not in zone_store:
+                zone_store[symbol] = []
+            for zd in zones_data:
+                if now - zd["created_at"] > max_age:
+                    continue  # Verlopen zone
+                zone = Zone(
+                    type=ZoneType(zd["type"]),
+                    direction=Direction(zd["direction"]),
+                    high=zd["high"], low=zd["low"], midpoint=zd["midpoint"],
+                    created_at=zd["created_at"],
+                    status=ZoneStatus(zd["status"]),
+                    test_count=zd["test_count"],
+                    symbol=zd.get("symbol", symbol),
+                    timeframe=zd.get("timeframe", "loaded"),
+                )
+                zone_store[symbol].append(zone)
+                count += 1
+
+        log.info(f"Zones geladen van disk: {count} zones")
+        return count
+    except Exception as e:
+        log.warning(f"Zone load error: {e}")
+        return 0
+
+
 def store_zones(symbol: str, new_zones: List[Zone]):
     if symbol not in zone_store:
         zone_store[symbol] = []
@@ -1015,6 +1181,9 @@ def store_zones(symbol: str, new_zones: List[Zone]):
     zone_store[symbol] = [z for z in zone_store[symbol] if z.is_valid and (now - z.created_at) < max_age]
     if len(zone_store[symbol]) > 20:
         zone_store[symbol] = zone_store[symbol][-20:]
+
+    # Auto-save na elke zone update
+    save_zones_to_disk()
 
 
 def find_active_zone(symbol: str, price: float, direction: Direction) -> Optional[Zone]:
@@ -1743,6 +1912,10 @@ async def run():
         except Exception:
             pass
 
+        # === LAAD ZONES VAN DISK (overleeft herstart) ===
+        zones_loaded = load_zones_from_disk()
+        update_last_price_time()  # Reset data freshness bij startup
+
         await run_diagnostics(conn, account)
 
         tg(f"""🚀 <b>SMC BOT v3.1 AGGRESSIVE GESTART</b>
@@ -1750,14 +1923,14 @@ async def run():
 📊 {len(SYMBOLS)} symbols | Entry KZs: {', '.join(ENTRY_KILLZONES)}
 🎯 Min RR: {MIN_RR} | Max trades: {MAX_TOTAL_TRADES}
 🔥 Target: 3-15 trades/dag
+🗺️ Zones geladen: {zones_loaded}
 
 ⚡ <b>Strategie:</b>
 • Top-down: 1H bias → 15M structuur → 5M entry
 • Zone-based: OB/FVG opslaan → wachten op retest
-• Confirmatie: rejection wick / engulfing / pin bar / strong close
-• Momentum entries: HTF + structuur aligned zonder zone
-• Alle killzones actief incl. Asia (JPY/Gold)
-• C-grade trades met halve risico""")
+• Zone persistence: overleeft herstart
+• Fast reconnect: 5 pogingen + redeploy fallback
+• Dual health check: API + data freshness""")
 
         while True:
             try:
@@ -1768,40 +1941,67 @@ async def run():
                 await send_heartbeat(conn)
 
                 if not await check_connection_health(conn):
-                    log.warning("Connection unhealthy, reconnecting...")
-                    tg("⚠️ <b>CONNECTION LOST</b> — reconnecting...")
+                    log.warning("Connection unhealthy, fast reconnecting...")
+                    tg("⚠️ <b>CONNECTION LOST</b> — fast reconnect...")
                     reconnected = False
-                    for attempt in range(3):
+
+                    # SNELLE RECONNECT: korte sleeps, agressiever
+                    for attempt in range(5):  # 5 pogingen (was 3)
                         try:
-                            log.info(f"Reconnect poging {attempt + 1}/3...")
-                            # Sluit oude connection
+                            log.info(f"Fast reconnect {attempt + 1}/5...")
                             try:
                                 await conn.close()
                             except Exception:
                                 pass
-                            await asyncio.sleep(5)
+                            await asyncio.sleep(2)  # 2s (was 5s)
 
-                            # Nieuwe connection opzetten
                             conn = account.get_rpc_connection()
                             await conn.connect()
                             await asyncio.wait_for(
                                 conn.wait_synchronized(),
-                                timeout=60
+                                timeout=30  # 30s (was 60s)
                             )
-                            log.info(f"Reconnected on attempt {attempt + 1}!")
-                            tg(f"✅ <b>RECONNECTED</b> (poging {attempt + 1})")
 
-                            # Verifieer
-                            await asyncio.wait_for(conn.get_account_information(), timeout=10)
-                            reconnected = True
-                            break
+                            # Verifieer + update data freshness
+                            test = await asyncio.wait_for(conn.get_account_information(), timeout=8)
+                            if test and "balance" in test:
+                                update_last_price_time()  # Reset data freshness
+                                connection_healthy = True
+                                reconnected = True
+                                log.info(f"Reconnected in poging {attempt + 1}!")
+                                tg(f"✅ <b>RECONNECTED</b> ({(attempt+1)*2}s)")
+                                break
+
                         except Exception as e:
-                            log.error(f"Reconnect attempt {attempt + 1} failed: {e}")
-                            await asyncio.sleep(15 * (attempt + 1))
+                            log.warning(f"Reconnect {attempt + 1}/5 failed: {e}")
+                            await asyncio.sleep(3 * (attempt + 1))  # 3s, 6s, 9s, 12s, 15s
 
                     if not reconnected:
-                        tg("❌ <b>RECONNECT FAILED 3x</b> — force restart...")
-                        raise Exception("Reconnect failed after 3 attempts")
+                        # Probeer volledige account redeploy als laatste redmiddel
+                        log.warning("Attempting account redeploy...")
+                        try:
+                            await account.undeploy()
+                            await asyncio.sleep(5)
+                            await account.deploy()
+                            await asyncio.sleep(10)
+                            conn = account.get_rpc_connection()
+                            await conn.connect()
+                            await asyncio.wait_for(conn.wait_synchronized(), timeout=60)
+                            test = await asyncio.wait_for(conn.get_account_information(), timeout=10)
+                            if test:
+                                update_last_price_time()
+                                connection_healthy = True
+                                reconnected = True
+                                tg("✅ <b>RECONNECTED via REDEPLOY</b>")
+                        except Exception as e:
+                            log.error(f"Redeploy failed: {e}")
+
+                    if not reconnected:
+                        tg("❌ <b>RECONNECT FAILED</b> — force restart...")
+                        raise Exception("All reconnect methods failed")
+
+                # === DATA FRESHNESS: update bij elke succesvolle loop ===
+                update_last_price_time()
 
                 kz = get_current_killzone()
 
@@ -1811,17 +2011,29 @@ async def run():
                     # Ga door met normal flow — Asia is nu entry killzone
 
                 if kz not in ENTRY_KILLZONES:
-                    info = await rate_limited_call(conn.get_account_information())
-                    positions = await rate_limited_call(conn.get_positions())
-                    if positions:
-                        await manage_positions(conn, positions)
+                    try:
+                        info = await rate_limited_call(conn.get_account_information())
+                        positions = await rate_limited_call(conn.get_positions())
+                        if info and positions:
+                            await manage_positions(conn, positions)
+                    except Exception:
+                        pass
                     await asyncio.sleep(30)
                     continue
 
+                # === HAAL ACCOUNT DATA OP (met None protectie) ===
                 info = await rate_limited_call(conn.get_account_information())
+                if not info or "balance" not in info:
+                    log.warning("Kon account info niet ophalen, skip cyclus")
+                    await asyncio.sleep(10)
+                    continue
+
                 balance = info["balance"]
                 equity = info["equity"]
+
                 positions = await rate_limited_call(conn.get_positions())
+                if positions is None:
+                    positions = []  # Behandel als geen open posities
 
                 # Track peak balance voor dynamische lotsize
                 update_peak_balance(equity)
@@ -1860,27 +2072,31 @@ async def run():
                     # Watchdog: reset timer zodat lange analyse cyclus geen trigger geeft
                     watchdog_last_loop = time.time()
 
-                    allowed, _ = is_entry_allowed(symbol)
-                    if not allowed:
-                        continue
-                    if sum(1 for p in positions if p["symbol"] == symbol) >= MAX_TRADES_PER_ASSET:
-                        continue
-                    if not check_correlation(symbol, positions):
-                        continue
+                    try:
+                        allowed, _ = is_entry_allowed(symbol)
+                        if not allowed:
+                            continue
+                        if sum(1 for p in positions if p["symbol"] == symbol) >= MAX_TRADES_PER_ASSET:
+                            continue
+                        if not check_correlation(symbol, positions):
+                            continue
 
-                    sig_key = f"{symbol}_{int(time.time()/300)}"  # 5 min dedup (was 15 min)
-                    if sig_key in recent_signals:
-                        continue
+                        sig_key = f"{symbol}_{int(time.time()/300)}"  # 5 min dedup
+                        if sig_key in recent_signals:
+                            continue
 
-                    setup = await analyze_and_find_setup(account, conn, symbol, positions, balance)
-                    if not setup:
-                        continue
+                        setup = await analyze_and_find_setup(account, conn, symbol, positions, balance)
+                        if not setup:
+                            continue
 
-                    success = await execute_trade(conn, setup, balance)
-                    if success:
-                        recent_signals[sig_key] = time.time()
+                        success = await execute_trade(conn, setup, balance)
+                        if success:
+                            recent_signals[sig_key] = time.time()
 
-                    await asyncio.sleep(1)
+                    except Exception as e:
+                        log.debug(f"Symbol {symbol} error (skipping): {e}")
+
+                    await asyncio.sleep(0.5)  # Korte pauze, minder dan 1s
 
                 now = time.time()
                 for k in list(recent_signals.keys()):
