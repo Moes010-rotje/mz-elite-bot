@@ -126,7 +126,7 @@ COOLDOWN_AFTER_LOSSES = 3  # Na 3 losses (was 2)
 COOLDOWN_MINUTES = 45      # 45 min (was 90)
 ZONE_MAX_AGE_HOURS = 48    # Zones leven 48u (was 24)
 ZONE_MAX_TESTS = 2         # 2x testbaar (was 1)
-MAX_API_CALLS_PER_MIN = 40 # Iets hoger voor meer symbolen
+MAX_API_CALLS_PER_MIN = 60 # Verhoogd voor 15 symbolen × 3 timeframes
 
 SWING_LOOKBACK = 2         # Snellere swing detectie (was 3)
 MIN_REJECTION_WICK_RATIO = 0.45   # Versoepeld (was 0.6)
@@ -285,6 +285,21 @@ async def rate_limited_call(coro):
     api_call_count += 1
     return await coro
 
+# ==================== CANDLE HELPER ====================
+
+TF_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+
+async def get_candles(account, symbol: str, timeframe: str, count: int):
+    """
+    Wrapper voor get_historical_candles die correct start_time berekent.
+    MetaAPI verwacht een datetime als startTime, niet een int.
+    """
+    tf_min = TF_MINUTES.get(timeframe, 15)
+    start = datetime.now(timezone.utc) - timedelta(minutes=tf_min * count * 1.5)  # 1.5x buffer
+    return await rate_limited_call(
+        account.get_historical_candles(symbol, timeframe, start)
+    )
+
 # ==================== CONNECTION HEALTH ====================
 
 async def check_connection_health(conn) -> bool:
@@ -388,7 +403,7 @@ async def update_asia_range(account):
         if symbol in asia_range_cache and asia_range_cache[symbol]["date"] == today:
             continue
         try:
-            candles = await rate_limited_call(account.get_historical_candles(symbol, "15m", 60))
+            candles = await get_candles(account, symbol, "15m", 60)
             if not candles or len(candles) < 10:
                 continue
             df = pd.DataFrame(candles)
@@ -1055,7 +1070,7 @@ def detect_regime(df: pd.DataFrame) -> str:
 
 async def get_htf_bias(account, symbol: str) -> Optional[Direction]:
     try:
-        candles = await rate_limited_call(account.get_historical_candles(symbol, "1h", 120))
+        candles = await get_candles(account, symbol, "1h", 120)
         if not candles or len(candles) < 60:
             return None
         df = pd.DataFrame(candles)
@@ -1307,7 +1322,7 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
         htf_bias = await get_htf_bias(account, symbol)
 
         # Stap 2: MTF (15M)
-        candles_15m = await rate_limited_call(account.get_historical_candles(symbol, "15m", 100))
+        candles_15m = await get_candles(account, symbol, "15m", 100)
         if not candles_15m or len(candles_15m) < 40:
             return None
 
@@ -1329,7 +1344,7 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
         store_zones(symbol, new_fvgs)
 
         # Stap 3: LTF (5M)
-        candles_5m = await rate_limited_call(account.get_historical_candles(symbol, "5m", 100))
+        candles_5m = await get_candles(account, symbol, "5m", 100)
         if not candles_5m or len(candles_5m) < 50:
             return None
 
@@ -1567,7 +1582,7 @@ async def run_diagnostics(conn, account):
 
     for s in SYMBOLS:
         try:
-            candles = await rate_limited_call(account.get_historical_candles(s, "5m", 20))
+            candles = await get_candles(account, s, "5m", 20)
             status = f"OK {len(candles)}c" if candles and len(candles) >= 10 else "FAIL"
             p = await rate_limited_call(conn.get_symbol_price(s))
             spread = p["ask"] - p["bid"]
