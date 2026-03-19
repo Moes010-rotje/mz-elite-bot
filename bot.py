@@ -124,6 +124,13 @@ DAILY_LOSS_LIMIT = 0.03   # 3% (was 2.5%)
 WEEKLY_LOSS_LIMIT = 0.08  # 8% (was 6%)
 MAX_TRADES_PER_ASSET = 3  # 3 per asset (was 2)
 MAX_TOTAL_TRADES = 15     # 15 max (was 6)
+
+# === GOLD PRIORITY: XAUUSD wordt zwaarder gewogen ===
+PRIORITY_SYMBOLS = ["XAUUSD"]  # Symbolen met voorrang
+PRIORITY_MAX_TRADES = 5        # 5 trades tegelijk (normaal 3)
+PRIORITY_SCORE_BONUS = 2.0     # +2.0 score bonus → sneller A/A+
+PRIORITY_RISK_MULT = 1.3       # 30% meer risico op priority symbolen
+PRIORITY_ALL_KILLZONES = True  # Mag in ALLE killzones traden
 COOLDOWN_AFTER_LOSSES = 3  # Na 3 losses (was 2)
 COOLDOWN_MINUTES = 45      # 45 min (was 90)
 ZONE_MAX_AGE_HOURS = 48    # Zones leven 48u (was 24)
@@ -165,7 +172,8 @@ SYMBOL_SPECS = {
     "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 18,  "category": "indices",  "leverage": 20, "contract": 1},
 }
 
-SYMBOLS = list(SYMBOL_SPECS.keys())
+# XAUUSD eerst in de lijst → wordt als eerste geanalyseerd
+SYMBOLS = ["XAUUSD"] + [s for s in SYMBOL_SPECS.keys() if s != "XAUUSD"]
 
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("ACCOUNT_ID")
@@ -1425,6 +1433,11 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
         score += bonus
         reasons.append(f"ADAPTIVE({adaptive:.1f}x)")
 
+    # === PRIORITY SYMBOL BOOST ===
+    if symbol in PRIORITY_SYMBOLS:
+        score += PRIORITY_SCORE_BONUS
+        reasons.append(f"PRIORITY(+{PRIORITY_SCORE_BONUS})")
+
     if score >= 10:
         return "A+", 1.0, score, reasons
     elif score >= 8:
@@ -1821,6 +1834,10 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
         setup.zone.type.value if setup.zone else "",
     )
     risk_pct *= adaptive_boost
+
+    # === PRIORITY SYMBOL RISK BOOST ===
+    if setup.symbol in PRIORITY_SYMBOLS:
+        risk_pct *= PRIORITY_RISK_MULT
 
     sl_dist = abs(setup.entry - setup.stop_loss)
     lot, lot_details = calculate_lot_size(balance, sl_dist, setup.symbol, risk_pct)
@@ -2242,8 +2259,11 @@ async def run():
                     try:
                         allowed, _ = is_entry_allowed(symbol)
                         if not allowed:
-                            continue
-                        if sum(1 for p in positions if p["symbol"] == symbol) >= MAX_TRADES_PER_ASSET:
+                            # Priority symbolen mogen in ALLE killzones
+                            if not (PRIORITY_ALL_KILLZONES and symbol in PRIORITY_SYMBOLS):
+                                continue
+                        max_trades = PRIORITY_MAX_TRADES if symbol in PRIORITY_SYMBOLS else MAX_TRADES_PER_ASSET
+                        if sum(1 for p in positions if p["symbol"] == symbol) >= max_trades:
                             continue
                         if not check_correlation(symbol, positions):
                             continue
