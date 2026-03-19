@@ -146,21 +146,21 @@ ASIA_ENTRY_SYMBOLS = ["USDJPY", "GBPJPY", "EURJPY", "XAUUSD", "BTCUSD"]
 NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30", "US500", "BTCUSD"]
 
 SYMBOL_SPECS = {
-    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals"},
-    "XAGUSD":  {"pip_size": 0.01,   "pip_value_per_lot": 50,  "max_spread_pips": 30,  "category": "metals"},
-    "BTCUSD":  {"pip_size": 1.0,    "pip_value_per_lot": 1,   "max_spread_pips": 60,  "category": "crypto"},
-    "EURUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
-    "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 22,  "category": "forex"},
-    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 30,  "category": "forex"},
-    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 18,  "category": "forex"},
-    "USDCHF":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
-    "AUDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
-    "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex"},
-    "EURGBP":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex"},
-    "NZDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 20,  "category": "forex"},
-    "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices"},
-    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices"},
-    "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 18,  "category": "indices"},
+    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals",  "leverage": 20, "contract": 100},
+    "XAGUSD":  {"pip_size": 0.01,   "pip_value_per_lot": 50,  "max_spread_pips": 30,  "category": "metals",  "leverage": 10, "contract": 5000},
+    "BTCUSD":  {"pip_size": 1.0,    "pip_value_per_lot": 1,   "max_spread_pips": 60,  "category": "crypto",  "leverage": 2,  "contract": 1},
+    "EURUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
+    "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 22,  "category": "forex",   "leverage": 30, "contract": 100000},
+    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 30,  "category": "forex",   "leverage": 20, "contract": 100000},
+    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
+    "USDCHF":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
+    "AUDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 20, "contract": 100000},
+    "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex",   "leverage": 20, "contract": 100000},
+    "EURGBP":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 20, "contract": 100000},
+    "NZDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 20,  "category": "forex",   "leverage": 20, "contract": 100000},
+    "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices",  "leverage": 20, "contract": 1},
+    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices",  "leverage": 20, "contract": 1},
+    "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 18,  "category": "indices",  "leverage": 20, "contract": 1},
 }
 
 SYMBOLS = list(SYMBOL_SPECS.keys())
@@ -1506,6 +1506,43 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
     if lot < 0.01:
         return False
 
+    # === MARGIN CHECK: bereken benodigde margin en pas lot aan ===
+    try:
+        info = await rate_limited_call(conn.get_account_information())
+        free_margin = info.get("freeMargin", balance)
+        spec = SYMBOL_SPECS.get(setup.symbol, {})
+        leverage = spec.get("leverage", 20)
+
+        # Margin berekening: (lots × contract × prijs) / leverage
+        margin_needed = (lot * spec.get("contract", 100000) * setup.entry) / leverage
+
+        # Margin moet in account currency (EUR) — voor USD pairs delen door exchange rate
+        # Simpele benadering: als margin > 80% free margin, verklein lot
+        max_margin_use = free_margin * 0.80  # Max 80% van vrije margin gebruiken
+
+        if margin_needed > max_margin_use and margin_needed > 0:
+            reduction = max_margin_use / margin_needed
+            old_lot = lot
+            lot = round(max(0.01, lot * reduction), 2)
+            lot_details["margin_reduced"] = True
+            lot_details["original_lot"] = old_lot
+            log.info(f"Margin check: {setup.symbol} lot {old_lot} → {lot} (margin {margin_needed:.0f} > free {free_margin:.0f})")
+
+        # Dubbel check: als margin nog steeds te hoog, skip trade
+        final_margin = (lot * spec.get("contract", 100000) * setup.entry) / leverage
+        if final_margin > free_margin * 0.90:
+            log.warning(f"Margin te hoog voor {setup.symbol}: {final_margin:.0f} > {free_margin:.0f}")
+            tg(f"⚠️ <b>MARGIN SKIP</b>: {setup.symbol}\nMargin: €{final_margin:.0f} | Free: €{free_margin:.0f}")
+            return False
+
+    except Exception as e:
+        log.warning(f"Margin check error: {e}")
+        # Bij fout: gebruik kleinere lot als safety
+        lot = min(lot, 0.05)
+
+    if lot < 0.01:
+        return False
+
     # Update peak balance voor equity curve tracking
     update_peak_balance(balance)
 
@@ -1535,6 +1572,7 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
     r = " | ".join(setup.reasons)
     de = "🟢" if setup.direction == Direction.BULL else "🔴"
     cap_warn = " ⚠️CAP" if lot_details.get("capped") else ""
+    margin_warn = " ⚠️MARGIN" if lot_details.get("margin_reduced") else ""
     wr = sum(performance["recent_results"][-10:]) / max(len(performance["recent_results"][-10:]), 1) * 100
 
     tg(f"""<b>{de} TRADE OPENED — Grade {setup.grade}</b>
@@ -1548,7 +1586,7 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
 🎯 TP1: {setup.tp1:.5f} (50% partial)
 🎯 TP2: {setup.tp2:.5f} (runner)
 
-📊 RR: 1:{setup.rr:.1f} | Lots: {lot}{cap_warn}
+📊 RR: 1:{setup.rr:.1f} | Lots: {lot}{cap_warn}{margin_warn}
 💵 Risk: {risk_pct*100:.2f}% (${lot_details['risk_amount']})
 📏 SL: {lot_details['sl_pips']:.1f} pips
 ✅ Confirm: {setup.confirmation}
