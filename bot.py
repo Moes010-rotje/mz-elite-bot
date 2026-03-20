@@ -126,7 +126,7 @@ MAX_TRADES_PER_ASSET = 3  # 3 per asset (was 2)
 MAX_TOTAL_TRADES = 15     # 15 max (was 6)
 
 # === GOLD PRIORITY: XAUUSD wordt zwaarder gewogen ===
-PRIORITY_SYMBOLS = ["XAUUSD"]  # Symbolen met voorrang
+PRIORITY_SYMBOLS = ["XAUUSD", "NAS100", "GBPJPY"]  # Top 3 SMC assets
 PRIORITY_MAX_TRADES = 5        # 5 trades tegelijk (normaal 3)
 PRIORITY_SCORE_BONUS = 2.0     # +2.0 score bonus → sneller A/A+
 PRIORITY_RISK_MULT = 1.3       # 30% meer risico op priority symbolen
@@ -135,7 +135,7 @@ COOLDOWN_AFTER_LOSSES = 3  # Na 3 losses (was 2)
 COOLDOWN_MINUTES = 45      # 45 min (was 90)
 ZONE_MAX_AGE_HOURS = 48    # Zones leven 48u (was 24)
 ZONE_MAX_TESTS = 2         # 2x testbaar (was 1)
-MAX_API_CALLS_PER_MIN = 80  # 10 symbolen × ~5 calls = 50 per cyclus + overhead
+MAX_API_CALLS_PER_MIN = 60  # 7 symbolen × ~5 calls = 35 per cyclus + overhead
 
 SWING_LOOKBACK = 2         # Snellere swing detectie (was 3)
 MIN_REJECTION_WICK_RATIO = 0.45   # Versoepeld (was 0.6)
@@ -152,23 +152,20 @@ KILLZONES = {
 
 ENTRY_KILLZONES = ["asia", "london", "london_ext", "new_york", "ny_pm"]
 ASIA_ENTRY_SYMBOLS = ["USDJPY", "GBPJPY", "EURJPY", "XAUUSD"]
-NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30", "US500"]
+NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30"]
 
 SYMBOL_SPECS = {
     "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals",  "leverage": 20, "contract": 100},
-    "EURUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
     "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 22,  "category": "forex",   "leverage": 30, "contract": 100000},
     "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 30,  "category": "forex",   "leverage": 20, "contract": 100000},
     "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
-    "AUDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 20, "contract": 100000},
     "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex",   "leverage": 20, "contract": 100000},
     "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices",  "leverage": 20, "contract": 1},
     "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices",  "leverage": 20, "contract": 1},
-    "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 18,  "category": "indices",  "leverage": 20, "contract": 1},
 }
 
-# XAUUSD eerst in de lijst → wordt als eerste geanalyseerd
-SYMBOLS = ["XAUUSD"] + [s for s in SYMBOL_SPECS.keys() if s != "XAUUSD"]
+# Priority symbolen eerst → worden als eerste geanalyseerd
+SYMBOLS = ["XAUUSD", "NAS100", "GBPJPY"] + [s for s in SYMBOL_SPECS.keys() if s not in ["XAUUSD", "NAS100", "GBPJPY"]]
 
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("ACCOUNT_ID")
@@ -176,8 +173,7 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT = os.getenv("TG_CHAT")
 
 CORRELATION_GROUPS = [
-    {"EURUSD", "GBPUSD"},
-    {"NAS100", "US500"},
+    {"NAS100", "US30"},
     {"USDJPY", "EURJPY"},
     {"GBPUSD", "GBPJPY"},
 ]
