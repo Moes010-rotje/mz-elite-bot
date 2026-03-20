@@ -135,7 +135,7 @@ COOLDOWN_AFTER_LOSSES = 3  # Na 3 losses (was 2)
 COOLDOWN_MINUTES = 45      # 45 min (was 90)
 ZONE_MAX_AGE_HOURS = 48    # Zones leven 48u (was 24)
 ZONE_MAX_TESTS = 2         # 2x testbaar (was 1)
-MAX_API_CALLS_PER_MIN = 120 # 15 symbolen × ~5 calls = 75 per cyclus + overhead
+MAX_API_CALLS_PER_MIN = 80  # 10 symbolen × ~5 calls = 50 per cyclus + overhead
 
 SWING_LOOKBACK = 2         # Snellere swing detectie (was 3)
 MIN_REJECTION_WICK_RATIO = 0.45   # Versoepeld (was 0.6)
@@ -151,22 +151,17 @@ KILLZONES = {
 }
 
 ENTRY_KILLZONES = ["asia", "london", "london_ext", "new_york", "ny_pm"]
-ASIA_ENTRY_SYMBOLS = ["USDJPY", "GBPJPY", "EURJPY", "XAUUSD", "BTCUSD"]
-NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30", "US500", "BTCUSD"]
+ASIA_ENTRY_SYMBOLS = ["USDJPY", "GBPJPY", "EURJPY", "XAUUSD"]
+NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30", "US500"]
 
 SYMBOL_SPECS = {
     "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals",  "leverage": 20, "contract": 100},
-    "XAGUSD":  {"pip_size": 0.01,   "pip_value_per_lot": 50,  "max_spread_pips": 30,  "category": "metals",  "leverage": 10, "contract": 5000},
-    "BTCUSD":  {"pip_size": 1.0,    "pip_value_per_lot": 1,   "max_spread_pips": 60,  "category": "crypto",  "leverage": 2,  "contract": 1},
     "EURUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
     "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 22,  "category": "forex",   "leverage": 30, "contract": 100000},
     "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 30,  "category": "forex",   "leverage": 20, "contract": 100000},
     "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
-    "USDCHF":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
     "AUDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 20, "contract": 100000},
     "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex",   "leverage": 20, "contract": 100000},
-    "EURGBP":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 18,  "category": "forex",   "leverage": 20, "contract": 100000},
-    "NZDUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 20,  "category": "forex",   "leverage": 20, "contract": 100000},
     "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices",  "leverage": 20, "contract": 1},
     "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices",  "leverage": 20, "contract": 1},
     "US500":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 18,  "category": "indices",  "leverage": 20, "contract": 1},
@@ -185,8 +180,6 @@ CORRELATION_GROUPS = [
     {"NAS100", "US500"},
     {"USDJPY", "EURJPY"},
     {"GBPUSD", "GBPJPY"},
-    {"AUDUSD", "NZDUSD"},
-    {"XAUUSD", "XAGUSD"},
 ]
 
 GRADE_ORDER = ["D", "C", "B", "B+", "A", "A+"]
