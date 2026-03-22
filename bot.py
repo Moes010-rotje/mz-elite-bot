@@ -4,6 +4,7 @@ import numpy as np
 import os
 import time
 import json
+import math
 import urllib.request
 import logging
 import pickle
@@ -126,7 +127,7 @@ MAX_TRADES_PER_ASSET = 3  # 3 per asset (was 2)
 MAX_TOTAL_TRADES = 15     # 15 max (was 6)
 
 # === GOLD PRIORITY: XAUUSD wordt zwaarder gewogen ===
-PRIORITY_SYMBOLS = ["XAUUSD", "NAS100", "GBPJPY"]  # Top 3 SMC assets
+PRIORITY_SYMBOLS = ["XAUUSD", "USTEC", "GBPJPY"]  # Top 3 SMC assets
 PRIORITY_MAX_TRADES = 5        # 5 trades tegelijk (normaal 3)
 PRIORITY_SCORE_BONUS = 2.0     # +2.0 score bonus → sneller A/A+
 PRIORITY_RISK_MULT = 1.3       # 30% meer risico op priority symbolen
@@ -152,20 +153,20 @@ KILLZONES = {
 
 ENTRY_KILLZONES = ["asia", "london", "london_ext", "new_york", "ny_pm"]
 ASIA_ENTRY_SYMBOLS = ["USDJPY", "GBPJPY", "EURJPY", "XAUUSD"]
-NY_PM_SYMBOLS = ["XAUUSD", "NAS100", "US30"]
+NY_PM_SYMBOLS = ["XAUUSD", "USTEC", "US30"]
 
 SYMBOL_SPECS = {
-    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals",  "leverage": 20, "contract": 100},
-    "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 22,  "category": "forex",   "leverage": 30, "contract": 100000},
-    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 30,  "category": "forex",   "leverage": 20, "contract": 100000},
-    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000},
-    "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex",   "leverage": 20, "contract": 100000},
-    "NAS100":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices",  "leverage": 20, "contract": 1},
-    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices",  "leverage": 20, "contract": 1},
+    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals",  "leverage": 20, "contract": 100, "min_lot": 0.01, "lot_step": 0.01},
+    "GBPUSD":  {"pip_size": 0.0001, "pip_value_per_lot": 10,  "max_spread_pips": 22,  "category": "forex",   "leverage": 30, "contract": 100000, "min_lot": 0.01, "lot_step": 0.01},
+    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 30,  "category": "forex",   "leverage": 20, "contract": 100000, "min_lot": 0.01, "lot_step": 0.01},
+    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000, "min_lot": 0.01, "lot_step": 0.01},
+    "EURJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 25,  "category": "forex",   "leverage": 20, "contract": 100000, "min_lot": 0.01, "lot_step": 0.01},
+    "USTEC":  {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices",  "leverage": 20, "contract": 1, "min_lot": 0.1, "lot_step": 0.1},
+    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices",  "leverage": 20, "contract": 1, "min_lot": 0.1, "lot_step": 0.1},
 }
 
 # Priority symbolen eerst → worden als eerste geanalyseerd
-SYMBOLS = ["XAUUSD", "NAS100", "GBPJPY"] + [s for s in SYMBOL_SPECS.keys() if s not in ["XAUUSD", "NAS100", "GBPJPY"]]
+SYMBOLS = ["XAUUSD", "USTEC", "GBPJPY"] + [s for s in SYMBOL_SPECS.keys() if s not in ["XAUUSD", "USTEC", "GBPJPY"]]
 
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("ACCOUNT_ID")
@@ -173,7 +174,7 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT = os.getenv("TG_CHAT")
 
 CORRELATION_GROUPS = [
-    {"NAS100", "US30"},
+    {"USTEC", "US30"},
     {"USDJPY", "EURJPY"},
     {"GBPUSD", "GBPJPY"},
 ]
@@ -1446,7 +1447,7 @@ def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct
     Dynamische lot-sizing met:
     - Correcte pip value per instrument
     - Category-specifieke min/max lots
-    - Risk amount logging voor transparantie
+    - Broker min_lot en lot_step respect
     """
     if sl_distance <= 0:
         return 0, {"error": "sl_distance <= 0"}
@@ -1464,7 +1465,21 @@ def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct
 
     # Category limits
     limits = LOT_LIMITS.get(spec["category"], {"min": 0.01, "max": 3.0})
-    lot = round(max(limits["min"], min(raw_lot, limits["max"])), 2)
+
+    # Broker min_lot en lot_step
+    min_lot = spec.get("min_lot", 0.01)
+    lot_step = spec.get("lot_step", 0.01)
+
+    # Round naar lot_step (bijv. 0.1 voor indices)
+    lot = math.floor(raw_lot / lot_step) * lot_step
+    lot = round(lot, 2)  # Fix floating point
+
+    # Clamp naar limits
+    lot = max(min_lot, min(lot, limits["max"]))
+
+    # Als raw_lot te klein is voor zelfs de minimum lot, skip
+    if raw_lot < min_lot * 0.5:
+        return 0, {"error": f"lot te klein: {raw_lot:.4f} < min {min_lot}"}
 
     details = {
         "risk_amount": round(risk_amount, 2),
@@ -1472,7 +1487,7 @@ def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct
         "raw_lot": round(raw_lot, 4),
         "final_lot": lot,
         "capped": raw_lot > limits["max"],
-        "floored": raw_lot < limits["min"],
+        "floored": raw_lot < min_lot,
         "category": spec["category"],
     }
     return lot, details
@@ -1480,24 +1495,39 @@ def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct
 # ==================== SL / TP BEREKENING ====================
 
 def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: pd.DataFrame):
-    """SL achter zone, TP1 op 1.5R, TP2 op 2.5R (aggressive)"""
+    """SL achter zone, TP1 op 1.5R, TP2 op 2.5R. MAX SL = 2.5x ATR."""
     atr = float(df["atr"].iloc[-1])
     buffer = atr * 0.15
+    max_sl_distance = atr * 2.5  # HARD CAP: SL nooit verder dan 2.5x ATR
 
     if direction == Direction.BULL:
         sl = zone.low - buffer
         sl_dist = entry - sl
+
+        # Min SL: 0.5 ATR
         if sl_dist < atr * 0.5:
             sl = entry - atr * 0.5
             sl_dist = entry - sl
+
+        # Max SL: 2.5 ATR — voorkomt 1488 pip stops
+        if sl_dist > max_sl_distance:
+            sl = entry - max_sl_distance
+            sl_dist = max_sl_distance
+
         tp1 = entry + sl_dist * 1.5
         tp2 = entry + sl_dist * 2.5
     else:
         sl = zone.high + buffer
         sl_dist = sl - entry
+
         if sl_dist < atr * 0.5:
             sl = entry + atr * 0.5
             sl_dist = sl - entry
+
+        if sl_dist > max_sl_distance:
+            sl = entry + max_sl_distance
+            sl_dist = max_sl_distance
+
         tp1 = entry - sl_dist * 1.5
         tp2 = entry - sl_dist * 2.5
 
@@ -1506,7 +1536,33 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
 # ==================== POSITION MANAGEMENT ====================
 
 async def manage_positions(conn, positions: list):
-    """Partial bij 1.5R + BE, trailing bij 2.5R"""
+    """
+    Position management:
+    1. Partial close 50% bij TP1 (1.5R)
+    2. SL naar breakeven na partial
+    3. Trailing SL bij 2.0R+
+    4. Vrijdag auto-close 30 min voor market close
+    """
+    now = datetime.now(timezone.utc)
+
+    # === VRIJDAG AUTO-CLOSE: sluit alles 30 min voor market close ===
+    if now.weekday() == 4 and now.hour >= 21 and now.minute >= 30:
+        for pos in positions:
+            try:
+                symbol = pos["symbol"]
+                pid = pos["id"]
+                profit = pos.get("profit", 0) + pos.get("swap", 0) + pos.get("commission", 0)
+                await asyncio.wait_for(
+                    conn.close_position(pid),
+                    timeout=10
+                )
+                emoji = "💰" if profit >= 0 else "💔"
+                tg(f"🕐 <b>FRIDAY CLOSE</b>: {symbol} {emoji} {'+'if profit>=0 else ''}{profit:.2f}\nWeekend gap bescherming")
+            except Exception as e:
+                log.warning(f"Friday close error {pos.get('symbol','?')}: {e}")
+        return
+
+    # === TRADE MANAGEMENT PER POSITIE ===
     for pos in positions:
         try:
             symbol = pos["symbol"]
@@ -1517,8 +1573,9 @@ async def manage_positions(conn, positions: list):
             pid = pos["id"]
             sl = pos.get("stopLoss", 0)
             tp = pos.get("takeProfit", 0)
+            spec = SYMBOL_SPECS.get(symbol)
 
-            if cur_p <= 0 or vol <= 0 or symbol not in SYMBOL_SPECS:
+            if cur_p <= 0 or vol <= 0 or not spec:
                 continue
 
             is_buy = "BUY" in ptype
@@ -1527,34 +1584,77 @@ async def manage_positions(conn, positions: list):
             if sl_dist <= 0:
                 continue
 
-            if profit_dist >= sl_dist * 1.5 and vol > 0.02:
-                partial = round(vol * 0.5, 2)
-                if partial >= 0.01:
-                    try:
-                        await rate_limited_call(conn.close_position_partially(pid, partial))
-                        be_buf = sl_dist * 0.15
-                        new_sl = (open_p + be_buf) if is_buy else (open_p - be_buf)
-                        await rate_limited_call(conn.modify_position(pid, stop_loss=new_sl, take_profit=tp))
-                        tg(f"✅ <b>PARTIAL TP</b>: {symbol} 50% @ 1.5R, SL→BE+")
-                    except Exception as e:
-                        log.warning(f"Partial error {symbol}: {e}")
+            min_lot = spec.get("min_lot", 0.01)
+            lot_step = spec.get("lot_step", 0.01)
 
-            elif profit_dist >= sl_dist * 2.5:
-                trail_dist = sl_dist * 1.0
+            # === 1. PARTIAL CLOSE BIJ TP1 (1.5R) ===
+            if profit_dist >= sl_dist * 1.5:
+                # Bereken partial: 50% van volume, afgerond naar lot_step
+                partial = math.floor((vol * 0.5) / lot_step) * lot_step
+                partial = round(partial, 2)
+                remaining = round(vol - partial, 2)
+
+                # Alleen partial als beide delen >= min_lot
+                if partial >= min_lot and remaining >= min_lot:
+                    # Check of we al partial hebben gedaan (SL is al op BE = al gehandeld)
+                    be_zone = abs(sl - open_p) < sl_dist * 0.3 if sl else False
+                    if not be_zone:
+                        try:
+                            await asyncio.wait_for(
+                                conn.close_position_partially(pid, partial),
+                                timeout=10
+                            )
+                            # === 2. SL NAAR BREAKEVEN ===
+                            be_buf = sl_dist * 0.1  # Klein buffer boven entry
+                            new_sl = (open_p + be_buf) if is_buy else (open_p - be_buf)
+                            await asyncio.wait_for(
+                                conn.modify_position(pid, stop_loss=new_sl, take_profit=tp),
+                                timeout=10
+                            )
+                            profit_amount = partial * profit_dist * spec["pip_value_per_lot"] / (1 / spec["pip_size"])
+                            tg(f"✅ <b>TP1 HIT</b>: {symbol}\n💰 50% gesloten ({partial} lots)\n🛡️ SL → breakeven\n📊 Runner: {remaining} lots naar TP2")
+                        except Exception as e:
+                            log.warning(f"Partial/BE error {symbol}: {e}")
+
+                # Als volume te klein voor partial: verplaats alleen SL naar BE
+                elif vol < min_lot * 2:
+                    be_zone = abs(sl - open_p) < sl_dist * 0.3 if sl else False
+                    if not be_zone:
+                        try:
+                            be_buf = sl_dist * 0.1
+                            new_sl = (open_p + be_buf) if is_buy else (open_p - be_buf)
+                            await asyncio.wait_for(
+                                conn.modify_position(pid, stop_loss=new_sl, take_profit=tp),
+                                timeout=10
+                            )
+                            tg(f"🛡️ <b>SL → BE</b>: {symbol} (lot te klein voor partial)")
+                        except Exception:
+                            pass
+
+            # === 3. TRAILING SL BIJ 2.0R+ ===
+            if profit_dist >= sl_dist * 2.0:
+                trail_dist = sl_dist * 0.8  # Trail op 0.8R achter prijs
                 if is_buy:
                     new_sl = cur_p - trail_dist
-                    if sl and new_sl > sl:
+                    if sl and new_sl > sl + spec["pip_size"]:
                         try:
-                            await rate_limited_call(conn.modify_position(pid, stop_loss=new_sl, take_profit=tp))
+                            await asyncio.wait_for(
+                                conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp),
+                                timeout=10
+                            )
                         except Exception:
                             pass
                 else:
                     new_sl = cur_p + trail_dist
-                    if sl and new_sl < sl:
+                    if sl and new_sl < sl - spec["pip_size"]:
                         try:
-                            await rate_limited_call(conn.modify_position(pid, stop_loss=new_sl, take_profit=tp))
+                            await asyncio.wait_for(
+                                conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp),
+                                timeout=10
+                            )
                         except Exception:
                             pass
+
         except Exception as e:
             log.warning(f"Position management error: {e}")
 
@@ -1741,21 +1841,25 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
                        and current_price < ema20)
 
             if mom_bull or mom_bear:
-                # Creeer virtuele zone rond recent swing
+                # Creeer TIGHT virtuele zone: max 1x ATR breed, dicht bij price
                 if direction == Direction.BULL:
-                    recent_low = float(df_5m["low"].tail(10).min())
+                    # Zone net onder prijs, max 1 ATR diep
+                    zone_low = current_price - atr * 1.0
+                    zone_high = current_price - atr * 0.3
                     active_zone = Zone(
                         type=ZoneType.ORDER_BLOCK, direction=Direction.BULL,
-                        high=recent_low + atr * 0.5, low=recent_low,
-                        midpoint=recent_low + atr * 0.25, created_at=time.time(),
+                        high=zone_high, low=zone_low,
+                        midpoint=(zone_high + zone_low) / 2, created_at=time.time(),
                         symbol=symbol, timeframe="5m_momentum",
                     )
                 else:
-                    recent_high = float(df_5m["high"].tail(10).max())
+                    # Zone net boven prijs, max 1 ATR breed
+                    zone_low = current_price + atr * 0.3
+                    zone_high = current_price + atr * 1.0
                     active_zone = Zone(
                         type=ZoneType.ORDER_BLOCK, direction=Direction.BEAR,
-                        high=recent_high, low=recent_high - atr * 0.5,
-                        midpoint=recent_high - atr * 0.25, created_at=time.time(),
+                        high=zone_high, low=zone_low,
+                        midpoint=(zone_high + zone_low) / 2, created_at=time.time(),
                         symbol=symbol, timeframe="5m_momentum",
                     )
             else:
@@ -1852,7 +1956,10 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
         if margin_needed > max_margin_use and margin_needed > 0:
             reduction = max_margin_use / margin_needed
             old_lot = lot
-            lot = round(max(0.01, lot * reduction), 2)
+            min_lot = spec.get("min_lot", 0.01)
+            lot_step = spec.get("lot_step", 0.01)
+            lot = math.floor((lot * reduction) / lot_step) * lot_step
+            lot = round(max(min_lot, lot), 2)
             lot_details["margin_reduced"] = True
             lot_details["original_lot"] = old_lot
             log.info(f"Margin check: {setup.symbol} lot {old_lot} → {lot} (margin {margin_needed:.0f} > free {free_margin:.0f})")
@@ -1866,10 +1973,9 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
 
     except Exception as e:
         log.warning(f"Margin check error: {e}")
-        # Bij fout: gebruik kleinere lot als safety
-        lot = min(lot, 0.05)
+        lot = min(lot, spec.get("min_lot", 0.01))
 
-    if lot < 0.01:
+    if lot < spec.get("min_lot", 0.01):
         return False
 
     # Update peak balance voor equity curve tracking
