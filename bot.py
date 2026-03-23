@@ -105,17 +105,25 @@ class TradeSetup:
 # ==================== CONFIGURATIE ====================
 CHECK_INTERVAL = 5
 BASE_RISK = 0.01
-MIN_RR = 1.5              # Verlaagd voor meer trades (was 2.0)
+MIN_RR = 2.0              # Terug naar 2.0 — grotere targets, commissie-proof
 DAILY_LOSS_LIMIT = 0.03   # 3% (was 2.5%)
 WEEKLY_LOSS_LIMIT = 0.08  # 8% (was 6%)
-MAX_TRADES_PER_ASSET = 3  # 3 per asset (was 2)
-MAX_TOTAL_TRADES = 15     # 15 max (was 6)
-# === GOLD PRIORITY: XAUUSD wordt zwaarder gewogen ===
-PRIORITY_SYMBOLS = ["XAUUSD", "USTEC", "GBPJPY"]  # Top 3 SMC assets
-PRIORITY_MAX_TRADES = 5        # 5 trades tegelijk (normaal 3)
-PRIORITY_SCORE_BONUS = 2.0     # +2.0 score bonus → sneller A/A+
-PRIORITY_RISK_MULT = 1.3       # 30% meer risico op priority symbolen
-PRIORITY_ALL_KILLZONES = True  # Mag in ALLE killzones traden
+MAX_TRADES_PER_ASSET = 2  # 2 per asset — voorkom overtrading
+MAX_TOTAL_TRADES = 6      # Max 6 tegelijk — kwaliteit boven kwantiteit
+
+# === PRIORITY SYMBOLS ===
+PRIORITY_SYMBOLS = ["XAUUSD", "USTEC", "GBPJPY"]
+PRIORITY_MAX_TRADES = 3        # 3 trades tegelijk (was 5)
+PRIORITY_SCORE_BONUS = 2.0     # +2.0 score bonus
+PRIORITY_RISK_MULT = 1.3       # 30% meer risico
+PRIORITY_ALL_KILLZONES = True
+
+# === MINIMUM SL AFSTAND PER CATEGORIE (voorkom te krappe stops) ===
+MIN_SL_PIPS = {
+    "metals": 30,    # Goud: min 30 pips (3 punten) SL
+    "forex": 15,     # Forex: min 15 pips SL
+    "indices": 200,  # Indices: min 200 pips (20 punten) SL — voorkomt commissie-probleem
+}
 COOLDOWN_AFTER_LOSSES = 3  # Na 3 losses (was 2)
 COOLDOWN_MINUTES = 45      # 45 min (was 90)
 ZONE_MAX_AGE_HOURS = 48    # Zones leven 48u (was 24)
@@ -1253,35 +1261,50 @@ def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct
     }
     return lot, details
 # ==================== SL / TP BEREKENING ====================
-def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: pd.DataFrame):
-    """SL achter zone, TP1 op 1.5R, TP2 op 2.5R. MAX SL = 2.5x ATR."""
+def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: pd.DataFrame, symbol: str = ""):
+    """SL achter zone, TP1 op 2.0R, TP2 op 3.0R. MIN/MAX SL per categorie."""
     atr = float(df["atr"].iloc[-1])
     buffer = atr * 0.15
     max_sl_distance = atr * 2.5  # HARD CAP: SL nooit verder dan 2.5x ATR
+
+    # Minimum SL afstand per categorie
+    spec = SYMBOL_SPECS.get(symbol, {})
+    category = spec.get("category", "forex")
+    pip_size = spec.get("pip_size", 0.0001)
+    min_sl_pips = MIN_SL_PIPS.get(category, 15)
+    min_sl_dist = min_sl_pips * pip_size
+
     if direction == Direction.BULL:
         sl = zone.low - buffer
         sl_dist = entry - sl
-        # Min SL: 0.5 ATR
-        if sl_dist < atr * 0.5:
-            sl = entry - atr * 0.5
-            sl_dist = entry - sl
-        # Max SL: 2.5 ATR — voorkomt 1488 pip stops
+
+        # Min SL: categorie minimum of 0.5 ATR (whichever is larger)
+        if sl_dist < max(atr * 0.5, min_sl_dist):
+            sl_dist = max(atr * 0.5, min_sl_dist)
+            sl = entry - sl_dist
+
+        # Max SL: 2.5 ATR
         if sl_dist > max_sl_distance:
             sl = entry - max_sl_distance
             sl_dist = max_sl_distance
-        tp1 = entry + sl_dist * 1.5
-        tp2 = entry + sl_dist * 2.5
+
+        tp1 = entry + sl_dist * 2.0   # TP1 op 2R (was 1.5R)
+        tp2 = entry + sl_dist * 3.0   # TP2 op 3R (was 2.5R)
     else:
         sl = zone.high + buffer
         sl_dist = sl - entry
-        if sl_dist < atr * 0.5:
-            sl = entry + atr * 0.5
-            sl_dist = sl - entry
+
+        if sl_dist < max(atr * 0.5, min_sl_dist):
+            sl_dist = max(atr * 0.5, min_sl_dist)
+            sl = entry + sl_dist
+
         if sl_dist > max_sl_distance:
             sl = entry + max_sl_distance
             sl_dist = max_sl_distance
-        tp1 = entry - sl_dist * 1.5
-        tp2 = entry - sl_dist * 2.5
+
+        tp1 = entry - sl_dist * 2.0   # TP1 op 2R (was 1.5R)
+        tp2 = entry - sl_dist * 3.0   # TP2 op 3R (was 2.5R)
+
     return sl, tp1, tp2, sl_dist
 # ==================== POSITION MANAGEMENT ====================
 async def manage_positions(conn, positions: list):
@@ -1330,8 +1353,8 @@ async def manage_positions(conn, positions: list):
                 continue
             min_lot = spec.get("min_lot", 0.01)
             lot_step = spec.get("lot_step", 0.01)
-            # === 1. PARTIAL CLOSE BIJ TP1 (1.5R) ===
-            if profit_dist >= sl_dist * 1.5:
+            # === 1. PARTIAL CLOSE BIJ TP1 (2.0R) ===
+            if profit_dist >= sl_dist * 2.0:
                 # Bereken partial: 50% van volume, afgerond naar lot_step
                 partial = math.floor((vol * 0.5) / lot_step) * lot_step
                 partial = round(partial, 2)
@@ -1371,8 +1394,8 @@ async def manage_positions(conn, positions: list):
                             tg(f"🛡️ <b>SL → BE</b>: {symbol} (lot te klein voor partial)")
                         except Exception:
                             pass
-            # === 3. TRAILING SL BIJ 2.0R+ ===
-            if profit_dist >= sl_dist * 2.0:
+            # === 3. TRAILING SL BIJ 2.5R+ ===
+            if profit_dist >= sl_dist * 2.5:
                 trail_dist = sl_dist * 0.8  # Trail op 0.8R achter prijs
                 if is_buy:
                     new_sl = cur_p - trail_dist
@@ -1594,7 +1617,7 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
         # Levels
         price_data = await rate_limited_call(conn.get_symbol_price(symbol))
         entry = price_data["ask"] if direction == Direction.BULL else price_data["bid"]
-        sl, tp1, tp2, sl_dist = calculate_trade_levels(direction, entry, active_zone, df_5m)
+        sl, tp1, tp2, sl_dist = calculate_trade_levels(direction, entry, active_zone, df_5m, symbol)
         rr = abs((tp2 - entry) / sl_dist) if sl_dist > 0 else 0
         if rr < MIN_RR:
             return None
@@ -1982,7 +2005,7 @@ async def run():
                             continue
                         if not check_correlation(symbol, positions):
                             continue
-                        sig_key = f"{symbol}_{int(time.time()/300)}"  # 5 min dedup
+                        sig_key = f"{symbol}_{int(time.time()/900)}"  # 15 min dedup — voorkom overtrading
                         if sig_key in recent_signals:
                             continue
                         setup = await analyze_and_find_setup(account, conn, symbol, positions, balance)
