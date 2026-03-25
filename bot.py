@@ -104,7 +104,7 @@ class TradeSetup:
     confirmation: str = ""
 # ==================== CONFIGURATIE ====================
 CHECK_INTERVAL = 5
-BASE_RISK = 0.01
+BASE_RISK = 0.015  # 1.5% base risico — grotere lot sizes
 MIN_RR = 2.0              # Terug naar 2.0 — grotere targets, commissie-proof
 DAILY_LOSS_LIMIT = 0.03   # 3% (was 2.5%)
 WEEKLY_LOSS_LIMIT = 0.08  # 8% (was 6%)
@@ -1380,23 +1380,10 @@ async def manage_positions(conn, positions: list):
                             tg(f"✅ <b>TP1 HIT</b>: {symbol}\n💰 50% gesloten ({partial} lots)\n🛡️ SL → breakeven\n📊 Runner: {remaining} lots naar TP2")
                         except Exception as e:
                             log.warning(f"Partial/BE error {symbol}: {e}")
-                # Als volume te klein voor partial: verplaats alleen SL naar BE
-                elif vol < min_lot * 2:
-                    be_zone = abs(sl - open_p) < sl_dist * 0.3 if sl else False
-                    if not be_zone:
-                        try:
-                            be_buf = sl_dist * 0.1
-                            new_sl = (open_p + be_buf) if is_buy else (open_p - be_buf)
-                            await asyncio.wait_for(
-                                conn.modify_position(pid, stop_loss=new_sl, take_profit=tp),
-                                timeout=10
-                            )
-                            tg(f"🛡️ <b>SL → BE</b>: {symbol} (lot te klein voor partial)")
-                        except Exception:
-                            pass
-            # === 3. TRAILING SL BIJ 2.5R+ ===
-            if profit_dist >= sl_dist * 2.5:
-                trail_dist = sl_dist * 0.8  # Trail op 0.8R achter prijs
+                # Als volume te klein voor partial: NIET naar BE, laat trade lopen naar broker TP2
+            # === 3. TRAILING SL BIJ 3.0R+ ===
+            if profit_dist >= sl_dist * 3.0:
+                trail_dist = sl_dist * 1.2  # Trail op 1.2R achter prijs — minder agressief
                 if is_buy:
                     new_sl = cur_p - trail_dist
                     if sl and new_sl > sl + spec["pip_size"]:
