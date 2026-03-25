@@ -118,6 +118,19 @@ PRIORITY_SCORE_BONUS = 2.0     # +2.0 score bonus
 PRIORITY_RISK_MULT = 1.3       # 30% meer risico
 PRIORITY_ALL_KILLZONES = True
 
+# === GOLD SCALPING MODE ===
+GOLD_SCALP = {
+    "enabled": True,
+    "symbol": "XAUUSD",
+    "max_trades": 5,           # 5 goud trades tegelijk
+    "min_rr": 1.5,             # Lagere RR voor snellere trades
+    "risk_mult": 1.5,          # 50% meer risico op goud
+    "dedup_seconds": 300,      # 5 min dedup (rest is 15 min)
+    "min_grade": "B",          # B trades toegestaan (rest moet A)
+    "tp1_mult": 1.5,           # TP1 op 1.5R (snellere partial)
+    "tp2_mult": 2.5,           # TP2 op 2.5R
+}
+
 # === MINIMUM SL AFSTAND PER CATEGORIE (voorkom te krappe stops) ===
 MIN_SL_PIPS = {
     "metals": 30,    # Goud: min 30 pips (3 punten) SL
@@ -1274,6 +1287,11 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
     min_sl_pips = MIN_SL_PIPS.get(category, 15)
     min_sl_dist = min_sl_pips * pip_size
 
+    # Gold scalping: snellere TP levels
+    is_gold = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+    tp1_mult = GOLD_SCALP["tp1_mult"] if is_gold else 2.0
+    tp2_mult = GOLD_SCALP["tp2_mult"] if is_gold else 3.0
+
     if direction == Direction.BULL:
         sl = zone.low - buffer
         sl_dist = entry - sl
@@ -1288,8 +1306,8 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
             sl = entry - max_sl_distance
             sl_dist = max_sl_distance
 
-        tp1 = entry + sl_dist * 2.0   # TP1 op 2R (was 1.5R)
-        tp2 = entry + sl_dist * 3.0   # TP2 op 3R (was 2.5R)
+        tp1 = entry + sl_dist * tp1_mult
+        tp2 = entry + sl_dist * tp2_mult
     else:
         sl = zone.high + buffer
         sl_dist = sl - entry
@@ -1302,8 +1320,8 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
             sl = entry + max_sl_distance
             sl_dist = max_sl_distance
 
-        tp1 = entry - sl_dist * 2.0   # TP1 op 2R (was 1.5R)
-        tp2 = entry - sl_dist * 3.0   # TP2 op 3R (was 2.5R)
+        tp1 = entry - sl_dist * tp1_mult
+        tp2 = entry - sl_dist * tp2_mult
 
     return sl, tp1, tp2, sl_dist
 # ==================== POSITION MANAGEMENT ====================
@@ -1353,8 +1371,13 @@ async def manage_positions(conn, positions: list):
                 continue
             min_lot = spec.get("min_lot", 0.01)
             lot_step = spec.get("lot_step", 0.01)
-            # === 1. PARTIAL CLOSE BIJ TP1 (2.0R) ===
-            if profit_dist >= sl_dist * 2.0:
+
+            # Gold scalp: partial bij 1.5R, anderen bij 2.0R
+            is_gold = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+            partial_trigger = 1.5 if is_gold else 2.0
+
+            # === 1. PARTIAL CLOSE BIJ TP1 ===
+            if profit_dist >= sl_dist * partial_trigger:
                 # Bereken partial: 50% van volume, afgerond naar lot_step
                 partial = math.floor((vol * 0.5) / lot_step) * lot_step
                 partial = round(partial, 2)
@@ -1598,15 +1621,29 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
             premium_discount=pd_zone, regime=regime, direction=direction,
             symbol=symbol,
         )
-        # AGGRESSIVE: alleen D skippen, C trades toegestaan
-        if grade == "D":
-            return None
+        # Gold scalping: B trades toegestaan, lagere RR
+        is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+        
+        if is_gold_scalp:
+            # Gold scalp: alleen D skippen, B en C toegestaan
+            if grade == "D":
+                return None
+        else:
+            # Andere assets: C en D skippen, alleen B+ en hoger
+            if grade in ("D", "C"):
+                return None
+
         # Levels
         price_data = await rate_limited_call(conn.get_symbol_price(symbol))
+        if not price_data:
+            return None
         entry = price_data["ask"] if direction == Direction.BULL else price_data["bid"]
         sl, tp1, tp2, sl_dist = calculate_trade_levels(direction, entry, active_zone, df_5m, symbol)
         rr = abs((tp2 - entry) / sl_dist) if sl_dist > 0 else 0
-        if rr < MIN_RR:
+        
+        # Gold scalp: lagere RR toegestaan
+        min_rr = GOLD_SCALP["min_rr"] if is_gold_scalp else MIN_RR
+        if rr < min_rr:
             return None
         mark_zone_tested(active_zone)
         return TradeSetup(
@@ -1633,7 +1670,9 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
     )
     risk_pct *= adaptive_boost
     # === PRIORITY SYMBOL RISK BOOST ===
-    if setup.symbol in PRIORITY_SYMBOLS:
+    if GOLD_SCALP["enabled"] and setup.symbol == GOLD_SCALP["symbol"]:
+        risk_pct *= GOLD_SCALP["risk_mult"]  # Gold: 1.5x risico
+    elif setup.symbol in PRIORITY_SYMBOLS:
         risk_pct *= PRIORITY_RISK_MULT
     sl_dist = abs(setup.entry - setup.stop_loss)
     lot, lot_details = calculate_lot_size(balance, sl_dist, setup.symbol, risk_pct)
@@ -1987,12 +2026,22 @@ async def run():
                             # Priority symbolen mogen in ALLE killzones
                             if not (PRIORITY_ALL_KILLZONES and symbol in PRIORITY_SYMBOLS):
                                 continue
-                        max_trades = PRIORITY_MAX_TRADES if symbol in PRIORITY_SYMBOLS else MAX_TRADES_PER_ASSET
+                        # Gold scalp krijgt eigen max trades
+                        if GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]:
+                            max_trades = GOLD_SCALP["max_trades"]
+                        elif symbol in PRIORITY_SYMBOLS:
+                            max_trades = PRIORITY_MAX_TRADES
+                        else:
+                            max_trades = MAX_TRADES_PER_ASSET
                         if sum(1 for p in positions if p["symbol"] == symbol) >= max_trades:
                             continue
                         if not check_correlation(symbol, positions):
                             continue
-                        sig_key = f"{symbol}_{int(time.time()/900)}"  # 15 min dedup — voorkom overtrading
+
+                        # Gold scalp: kortere dedup, hogere max trades
+                        is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+                        dedup_secs = GOLD_SCALP["dedup_seconds"] if is_gold_scalp else 900
+                        sig_key = f"{symbol}_{int(time.time()/dedup_secs)}"
                         if sig_key in recent_signals:
                             continue
                         setup = await analyze_and_find_setup(account, conn, symbol, positions, balance)
