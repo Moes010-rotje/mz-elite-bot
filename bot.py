@@ -465,8 +465,10 @@ def check_weekly(balance: float) -> bool:
     now = datetime.now(timezone.utc)
     cw = now.isocalendar()[1]
     if weekly_state["week"] != cw:
+        was_set = weekly_state["week"] is not None  # False bij eerste startup
         weekly_state.update({"week": cw, "loss": 0, "limit_hit": False, "start_balance": balance})
-        tg("📊 <b>WEEKLY RESET</b>")
+        if was_set:  # Alleen melden bij echte nieuwe week, niet bij herstart
+            tg("📊 <b>WEEKLY RESET</b>")
     return not weekly_state["limit_hit"]
 def update_weekly_loss(balance: float):
     if weekly_state["start_balance"] > 0:
