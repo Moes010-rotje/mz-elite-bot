@@ -310,6 +310,10 @@ async def rate_limited_call(coro):
         mark_api_failure()
         log.debug("rate_limited_call timeout")
         return None
+    except (asyncio.CancelledError, asyncio.exceptions.CancelledError):
+        mark_api_failure()
+        log.warning("rate_limited_call CancelledError (WebSocket disconnect)")
+        return None
     except Exception as e:
         mark_api_failure()
         log.debug(f"rate_limited_call error: {e}")
@@ -2060,6 +2064,14 @@ async def run():
                     if now - recent_signals[k] > 7200:
                         del recent_signals[k]
                 await asyncio.sleep(CHECK_INTERVAL)
+            except (asyncio.CancelledError, asyncio.exceptions.CancelledError) as e:
+                # WebSocket disconnect → reconnect, niet crashen
+                consecutive_errors += 1
+                log.warning(f"CancelledError (WebSocket disconnect?) #{consecutive_errors}: {e}")
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    tg(f"🚨 <b>TOO MANY DISCONNECTS</b> — force restart")
+                    raise Exception("Too many CancelledErrors")
+                await asyncio.sleep(15)  # Wacht tot MetaAPI reconnect
             except Exception as e:
                 consecutive_errors += 1
                 log.error(f"Loop error #{consecutive_errors}: {e}")
@@ -2071,6 +2083,10 @@ async def run():
                 if consecutive_errors % 5 == 0:
                     tg(f"⚠️ <b>{consecutive_errors} LOOP ERRORS</b>\n{str(e)[:80]}")
                 await asyncio.sleep(10 if "timed out" in str(e).lower() else 5)
+    except (asyncio.CancelledError, asyncio.exceptions.CancelledError) as e:
+        log.critical(f"FATAL CancelledError: {e}")
+        tg(f"❌ <b>FATAL DISCONNECT</b> — herstarting...")
+        raise Exception(f"CancelledError: {e}")
     except Exception as e:
         log.critical(f"FATAL: {e}")
         tg(f"❌ <b>FATAL</b>: {str(e)[:100]}")
