@@ -113,8 +113,8 @@ MAX_TOTAL_TRADES = 6      # Max 6 tegelijk — kwaliteit boven kwantiteit
 
 # === PRIORITY SYMBOLS ===
 PRIORITY_SYMBOLS = ["XAUUSD", "USTEC", "GBPJPY"]
-PRIORITY_MAX_TRADES = 3        # 3 trades tegelijk (was 5)
-PRIORITY_SCORE_BONUS = 2.0     # +2.0 score bonus
+PRIORITY_MAX_TRADES = 3
+PRIORITY_SCORE_BONUS = 0.5     # Was 2.0 → nu 0.5. Grades moeten ECHT verdiend worden
 PRIORITY_RISK_MULT = 1.3       # 30% meer risico
 PRIORITY_ALL_KILLZONES = True
 
@@ -1227,7 +1227,14 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
         score += PRIORITY_SCORE_BONUS
         reasons.append(f"PRIORITY(+{PRIORITY_SCORE_BONUS})")
     if score >= 10:
-        return "A+", 1.0, score, reasons
+        # A+ moet ECHT top kwaliteit zijn — sweep of P/D alignment vereist
+        has_sweep = any("SWEEP" in r for r in reasons)
+        has_pd = any("P/D_ALIGNED" in r for r in reasons)
+        has_choch = any("CHoCH" in r for r in reasons)
+        if has_sweep or has_pd or has_choch:
+            return "A+", 1.0, score, reasons
+        else:
+            return "A", 1.0, score, reasons  # Downgrade naar A als er geen extra confirmatie is
     elif score >= 8:
         return "A", 0.75, score, reasons
     elif score >= 6:
@@ -1302,9 +1309,10 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
         sl = zone.low - buffer
         sl_dist = entry - sl
 
-        # Min SL: categorie minimum of 0.5 ATR (whichever is larger)
-        if sl_dist < max(atr * 0.5, min_sl_dist):
-            sl_dist = max(atr * 0.5, min_sl_dist)
+        # Min SL: categorie minimum of 1.0 ATR (whichever is larger)
+        # Was 0.5 ATR — te krap, trades werden te snel gestopt
+        if sl_dist < max(atr * 1.0, min_sl_dist):
+            sl_dist = max(atr * 1.0, min_sl_dist)
             sl = entry - sl_dist
 
         # Max SL: 2.5 ATR
@@ -1318,8 +1326,8 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
         sl = zone.high + buffer
         sl_dist = sl - entry
 
-        if sl_dist < max(atr * 0.5, min_sl_dist):
-            sl_dist = max(atr * 0.5, min_sl_dist)
+        if sl_dist < max(atr * 1.0, min_sl_dist):
+            sl_dist = max(atr * 1.0, min_sl_dist)
             sl = entry + sl_dist
 
         if sl_dist > max_sl_distance:
@@ -1571,10 +1579,11 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
                 return None
         # Zoek zone
         active_zone = find_active_zone(symbol, current_price, direction)
-        # AGGRESSIVE: als geen zone gevonden, probeer momentum entry
-        # met een "virtuele zone" rond recent swing level
+        # MOMENTUM ENTRY: alleen als er een SWEEP was + HTF aligned
+        # Zonder sweep is momentum entry te riskant
         if not active_zone:
-            # Momentum entry: HTF aligned + structuur + sterke candle
+            if not sweep:
+                return None  # Geen zone + geen sweep = geen trade
             rsi = float(df_5m["rsi"].iloc[-1])
             macd_h = float(df_5m["macd_hist"].iloc[-1])
             macd_h_prev = float(df_5m["macd_hist"].iloc[-2])
@@ -1582,10 +1591,12 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
             atr = float(df_5m["atr"].iloc[-1])
             mom_bull = (htf_bias == Direction.BULL and direction == Direction.BULL
                        and 50 < rsi < 72 and macd_h > macd_h_prev
-                       and current_price > ema20)
+                       and current_price > ema20
+                       and sweep["type"] == "bull")
             mom_bear = (htf_bias == Direction.BEAR and direction == Direction.BEAR
                        and 28 < rsi < 50 and macd_h < macd_h_prev
-                       and current_price < ema20)
+                       and current_price < ema20
+                       and sweep["type"] == "bear")
             if mom_bull or mom_bear:
                 # Creeer TIGHT virtuele zone: max 1x ATR breed, dicht bij price
                 if direction == Direction.BULL:
@@ -1631,12 +1642,12 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
         is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
         
         if is_gold_scalp:
-            # Gold scalp: alleen D skippen, B en C toegestaan
-            if grade == "D":
+            # Gold scalp: C en D skippen, B en hoger toegestaan
+            if grade in ("D", "C"):
                 return None
         else:
-            # Andere assets: C en D skippen, alleen B+ en hoger
-            if grade in ("D", "C"):
+            # Andere assets: C, D en B skippen, alleen B+ en hoger
+            if grade in ("D", "C", "B"):
                 return None
 
         # Levels
