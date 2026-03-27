@@ -337,7 +337,7 @@ async def get_candles(account, symbol: str, timeframe: str, count: int):
 # Niet meer proactief checken. Alleen reconnecten als een ECHTE operatie faalt.
 # Dit voorkomt onnodige disconnects.
 consecutive_api_fails = 0
-MAX_API_FAILS_BEFORE_RECONNECT = 5  # Pas na 5 opeenvolgende echte fails reconnecten
+MAX_API_FAILS_BEFORE_RECONNECT = 7  # Pas na 7 opeenvolgende echte fails reconnecten
 async def check_connection_health(conn) -> bool:
     """
     REACTIVE health check: retourneer altijd True.
@@ -360,6 +360,10 @@ def mark_api_failure():
 def needs_reconnect() -> bool:
     """Check of we moeten reconnecten"""
     return consecutive_api_fails >= MAX_API_FAILS_BEFORE_RECONNECT
+def reset_api_fails():
+    """Reset fail counter — voorkomt directe re-entry in reconnect loop"""
+    global consecutive_api_fails
+    consecutive_api_fails = 0
 # ==================== HEARTBEAT ====================
 async def send_heartbeat(conn):
     global last_heartbeat
@@ -1937,52 +1941,91 @@ async def run():
                 watchdog_last_loop = time.time()
                 consecutive_errors = 0  # Reset na succesvolle iteratie
                 await send_heartbeat(conn)
-                # === REACTIVE RECONNECT: alleen als echte operaties herhaaldelijk falen ===
+                # === ROBUST RECONNECT: exponential backoff, geen spam ===
                 if needs_reconnect():
                     log.warning(f"API failed {consecutive_api_fails}x — reconnecting...")
                     tg("⚠️ <b>CONNECTION ISSUE</b> — auto-recovering...")
                     reconnected = False
-                    for attempt in range(5):
+
+                    # Fase 1: Soft reconnect (3 pogingen, snel)
+                    for attempt in range(3):
                         try:
-                            log.info(f"Reconnect {attempt + 1}/5...")
+                            log.info(f"Soft reconnect {attempt + 1}/3...")
                             try:
                                 await conn.close()
                             except Exception:
                                 pass
-                            await asyncio.sleep(3)
+                            await asyncio.sleep(5 * (attempt + 1))  # 5s, 10s, 15s
                             conn = account.get_rpc_connection()
                             await conn.connect()
                             await asyncio.wait_for(conn.wait_synchronized(), timeout=30)
-                            test = await asyncio.wait_for(conn.get_account_information(), timeout=8)
+                            test = await asyncio.wait_for(conn.get_account_information(), timeout=10)
                             if test and "balance" in test:
-                                mark_api_success()  # Reset fail counter
+                                mark_api_success()
                                 connection_healthy = True
                                 reconnected = True
-                                log.info(f"Reconnected in {attempt + 1} pogingen")
+                                log.info(f"Soft reconnect OK in {attempt + 1} pogingen")
+                                tg("✅ <b>RECOVERED</b> — bot draait weer")
                                 break
                         except Exception as e:
-                            log.warning(f"Reconnect {attempt + 1}/5: {e}")
-                            await asyncio.sleep(5 * (attempt + 1))
-                    if reconnected:
-                        tg("✅ <b>RECOVERED</b> — bot draait weer")
-                    else:
+                            log.warning(f"Soft reconnect {attempt + 1}/3: {e}")
+
+                    # Fase 2: Wacht 2 minuten en probeer opnieuw (1x)
+                    if not reconnected:
+                        log.info("Soft reconnect failed — wacht 2 min voor retry...")
+                        # Reset fail counter zodat we niet direct opnieuw reconnecten
+                        reset_api_fails()
+                        await asyncio.sleep(120)  # 2 minuten wachten
+                        try:
+                            conn = account.get_rpc_connection()
+                            await conn.connect()
+                            await asyncio.wait_for(conn.wait_synchronized(), timeout=60)
+                            test = await asyncio.wait_for(conn.get_account_information(), timeout=10)
+                            if test and "balance" in test:
+                                mark_api_success()
+                                connection_healthy = True
+                                reconnected = True
+                                tg("✅ <b>RECOVERED</b> na 2 min wachttijd")
+                        except Exception as e:
+                            log.warning(f"2-min retry failed: {e}")
+
+                    # Fase 3: Undeploy/redeploy als laatste redmiddel (1x)
+                    if not reconnected:
+                        log.info("Trying undeploy/redeploy als laatste optie...")
                         try:
                             await account.undeploy()
-                            await asyncio.sleep(5)
+                            await asyncio.sleep(15)
                             await account.deploy()
-                            await asyncio.sleep(10)
+                            await asyncio.sleep(30)  # Geef server tijd om op te starten
+                            conn = account.get_rpc_connection()
+                            await conn.connect()
+                            await asyncio.wait_for(conn.wait_synchronized(), timeout=90)
+                            test = await asyncio.wait_for(conn.get_account_information(), timeout=10)
+                            if test and "balance" in test:
+                                mark_api_success()
+                                connection_healthy = True
+                                reconnected = True
+                                tg("✅ <b>RECOVERED via REDEPLOY</b>")
+                        except Exception as e:
+                            log.error(f"Redeploy failed: {e}")
+
+                    # Fase 4: Als alles faalt, wacht 5 minuten en laat de loop gewoon doorgaan
+                    # NIET crashen — de volgende cyclus probeert het opnieuw
+                    if not reconnected:
+                        reset_api_fails()  # Voorkom directe re-entry in reconnect
+                        tg("⚠️ <b>CONNECTION DOWN</b> — wacht 5 min en probeer opnieuw...")
+                        log.warning("Alle reconnect pogingen gefaald. Wacht 5 min...")
+                        await asyncio.sleep(300)  # 5 minuten wachten
+                        # Probeer een verse connectie
+                        try:
                             conn = account.get_rpc_connection()
                             await conn.connect()
                             await asyncio.wait_for(conn.wait_synchronized(), timeout=60)
                             mark_api_success()
-                            connection_healthy = True
-                            reconnected = True
-                            tg("✅ <b>RECOVERED via REDEPLOY</b>")
-                        except Exception as e:
-                            log.error(f"Redeploy failed: {e}")
-                    if not reconnected:
-                        tg("❌ <b>RECONNECT FAILED</b> — force restart...")
-                        raise Exception("All reconnect methods failed")
+                            tg("✅ <b>RECOVERED</b> na 5 min wachttijd")
+                        except Exception:
+                            log.warning("Nog steeds geen connectie — volgende cyclus probeert opnieuw")
+                        continue  # Skip deze cyclus, probeer volgende
                 kz = get_current_killzone()
                 # Asia: range mapping + trading voor select pairs
                 if kz == "asia":
