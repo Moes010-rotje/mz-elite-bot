@@ -118,24 +118,25 @@ PRIORITY_SCORE_BONUS = 0.5     # Was 2.0 → nu 0.5. Grades moeten ECHT verdiend
 PRIORITY_RISK_MULT = 1.3       # 30% meer risico
 PRIORITY_ALL_KILLZONES = True
 
-# === GOLD SCALPING MODE ===
+# === GOLD TRADING MODE ===
 GOLD_SCALP = {
     "enabled": True,
     "symbol": "XAUUSD",
-    "max_trades": 5,           # 5 goud trades tegelijk
-    "min_rr": 1.5,             # Lagere RR voor snellere trades
-    "risk_mult": 1.5,          # 50% meer risico op goud
-    "dedup_seconds": 300,      # 5 min dedup (rest is 15 min)
-    "min_grade": "B",          # B trades toegestaan (rest moet A)
-    "tp1_mult": 1.5,           # TP1 op 1.5R (snellere partial)
-    "tp2_mult": 2.5,           # TP2 op 2.5R
+    "max_trades": 3,           # Max 3 tegelijk — kwaliteit boven kwantiteit
+    "min_rr": 1.5,             # Lagere RR toegestaan
+    "risk_mult": 2.0,          # 2x risico op goud (was 1.5x)
+    "dedup_seconds": 300,      # 5 min dedup
+    "min_grade": "B",          # B trades toegestaan
+    "tp1_mult": 2.0,           # TP1 op 2.0R (was 1.5R — grotere eerste target)
+    "tp2_mult": 3.5,           # TP2 op 3.5R (was 2.5R — grotere runner)
+    "htf_zone_risk_boost": 1.3, # Extra 30% risico als zone van 15M is
 }
 
 # === MINIMUM SL AFSTAND PER CATEGORIE (voorkom te krappe stops) ===
 MIN_SL_PIPS = {
-    "metals": 30,    # Goud: min 30 pips (3 punten) SL
+    "metals": 50,    # Goud: min 50 pips (5 punten) SL — grotere targets
     "forex": 15,     # Forex: min 15 pips SL
-    "indices": 200,  # Indices: min 200 pips (20 punten) SL — voorkomt commissie-probleem
+    "indices": 200,  # Indices: min 200 pips (20 punten) SL
 }
 COOLDOWN_AFTER_LOSSES = 3  # Na 3 losses (was 2)
 COOLDOWN_MINUTES = 45      # 45 min (was 90)
@@ -1116,12 +1117,25 @@ def store_zones(symbol: str, new_zones: List[Zone]):
 def find_active_zone(symbol: str, price: float, direction: Direction) -> Optional[Zone]:
     if symbol not in zone_store:
         return None
+
+    # Prioriteit: 15M zones > 5M zones > momentum zones
+    # Hogere TF zones = sterkere levels = grotere moves
+    tf_priority = {"15m": 0, "5m": 1, "5m_momentum": 2}
+    candidates = []
+
     for zone in zone_store[symbol]:
         if not zone.is_valid or zone.direction != direction:
             continue
         if zone.contains_price(price, buffer_pct=0.25):
-            return zone
-    return None
+            priority = tf_priority.get(zone.timeframe, 3)
+            candidates.append((priority, zone))
+
+    if not candidates:
+        return None
+
+    # Sorteer op timeframe prioriteit (laagste = beste)
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 def mark_zone_tested(zone: Zone):
     zone.test_count += 1
     if zone.test_count > ZONE_MAX_TESTS:
@@ -1188,6 +1202,10 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
         return "D", 0, 0, ["NO_ZONE" if not zone else "NO_CONFIRM"]
     reasons.append(f"ZONE({zone.type.value})")
     score += 2.0
+    # 15M zones zijn sterker dan 5M — bonus
+    if hasattr(zone, 'timeframe') and zone.timeframe == "15m":
+        score += 1.0
+        reasons.append("HTF_ZONE")
     reasons.append(f"CONFIRM({confirmation})")
     score += 2.0
     if htf_bias:
@@ -1692,7 +1710,11 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
     risk_pct *= adaptive_boost
     # === PRIORITY SYMBOL RISK BOOST ===
     if GOLD_SCALP["enabled"] and setup.symbol == GOLD_SCALP["symbol"]:
-        risk_pct *= GOLD_SCALP["risk_mult"]  # Gold: 1.5x risico
+        risk_pct *= GOLD_SCALP["risk_mult"]  # Gold: 2x risico
+        # Extra boost als zone van 15M is (sterker institutional level)
+        if setup.zone and hasattr(setup.zone, 'timeframe') and setup.zone.timeframe == "15m":
+            risk_pct *= GOLD_SCALP.get("htf_zone_risk_boost", 1.0)
+            log.info(f"Gold HTF zone boost: risk now {risk_pct*100:.1f}%")
     elif setup.symbol in PRIORITY_SYMBOLS:
         risk_pct *= PRIORITY_RISK_MULT
     sl_dist = abs(setup.entry - setup.stop_loss)
