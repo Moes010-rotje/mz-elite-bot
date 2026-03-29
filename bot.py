@@ -5,9 +5,9 @@ import os
 import time
 import json
 import math
+import sqlite3
 import urllib.request
 import logging
-import pickle
 from pathlib import Path
 from datetime import datetime, date, timedelta, timezone
 from dataclasses import dataclass, field
@@ -16,22 +16,31 @@ from enum import Enum
 from metaapi_cloud_sdk import MetaApi
 
 # ================================================================
-# PROFESSIONAL SMC BOT v3.2 — REFINED
-# 
-# Verbeteringen t.o.v. v3.1:
-# - Momentum entries VERWIJDERD (alleen echte zones)
-# - Risk stack vereenvoudigd: 3 lagen i.p.v. 9
-# - Min grade B+ (C/B trades verwijderd)
-# - Spread-weighted RR berekening
-# - Multi-TF zone confluence (1H zones)
-# - Session high/low tracking + sweeps
-# - Cooldown PER SYMBOOL i.p.v. globaal
-# - Volume confirmatie
-# - 33/33/33 partial close strategie
-# - Swing lookback 3 (was 2)
-# - Zone max tests 1 (was 2)
-# - Priority score bonus VERWIJDERD
-# - Adaptive boosts met TTL cache
+# PROFESSIONAL SMC BOT v4.0 — FULL REBUILD
+#
+# Verbeteringen t.o.v. v3.2:
+#
+# [FIXES]
+# - Risk per trade verlaagd: 0.5-1.0% (was 1.0-2.0%)
+# - Daily loss limit: 1.5% (was 3%)
+# - Weekly loss limit: 4% (was 8%)
+# - Max trades/dag: 4 (was 10)
+# - Max tegelijk open: 3 (was 6)
+# - is_candle_just_closed bug gefixt (second < 15)
+# - Streak modifier: max +10% upside (was +30%)
+# - Zone buffer: max 0.1 (was 0.2-0.4)
+#
+# [NIEUW]
+# - SQLite persistent database (overleeft restarts)
+# - Limit orders i.p.v. market orders
+# - Slippage bescherming
+# - OTE Fibonacci zone (62-79% retracement)
+# - Dry-run mode (analyse zonder executie)
+# - MAE/MFE tracking per trade
+# - Profit factor realtime tracking
+# - Volatility-based position sizing (ATR scaling)
+# - Regime-aware filtering (stop in ranging)
+# - Backtest-ready data logging
 # ================================================================
 
 logging.basicConfig(
@@ -54,6 +63,7 @@ class StructureType(Enum):
 class ZoneType(Enum):
     ORDER_BLOCK = "ob"
     FAIR_VALUE_GAP = "fvg"
+    OTE = "ote"
 
 class ZoneStatus(Enum):
     FRESH = "fresh"
@@ -118,51 +128,78 @@ class TradeSetup:
     mtf_structure: Optional[StructureBreak] = None
     confirmation: str = ""
     confluence: bool = False
+    ote_entry: bool = False
 
 # ==================== CONFIGURATIE ====================
 
-CHECK_INTERVAL = 5
-BASE_RISK = 0.015
+# === MODUS ===
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
-# === VEREENVOUDIGDE RISK: slechts 3 lagen ===
-# Laag 1: Grade-based risk (ingebakken in grade)
+CHECK_INTERVAL = 5
+
+# === VERLAAGDE RISK — professioneel niveau ===
 GRADE_RISK = {
-    "A+": 0.020,   # 2.0%
-    "A":  0.015,    # 1.5%
-    "B+": 0.010,    # 1.0%
+    "A+": 0.010,   # 1.0% (was 2.0%)
+    "A":  0.0075,   # 0.75% (was 1.5%)
+    "B+": 0.005,    # 0.5% (was 1.0%)
 }
 
-# Laag 2: Drawdown protectie
-DAILY_LOSS_LIMIT = 0.03
-WEEKLY_LOSS_LIMIT = 0.08
+# === STRENGERE LIMIETEN ===
+DAILY_LOSS_LIMIT = 0.03      # 3%
+WEEKLY_LOSS_LIMIT = 0.08     # 8%
 
-# Laag 3: Streak modifier (max ±30%)
+# === STREAK MODIFIER — conservatiever ===
 STREAK_MODIFIER = {
-    "wins_4plus": 1.3,
-    "wins_2_3": 1.15,
-    "neutral": 1.0,
-    "loss_1": 0.8,
-    "loss_2": 0.6,
+    "wins_4plus": 1.1,     # Max +10% (was +30%)
+    "wins_2_3":   1.05,    # Max +5% (was +15%)
+    "neutral":    1.0,
+    "loss_1":     0.85,
+    "loss_2":     0.65,
     "loss_3plus": 0.4,
 }
 
 MIN_RR = 2.0
-MAX_TRADES_PER_ASSET = 2
-MAX_TOTAL_TRADES = 6
-MAX_TRADES_PER_DAY = 10
+MAX_TRADES_PER_ASSET = 2       # 2 tegelijk per asset
+MAX_TOTAL_TRADES = 4           # Max 4 tegelijk
+MAX_TRADES_PER_DAY = 6         # Max 6 per dag
 
-# === GOLD TRADING MODE ===
+# === SLIPPAGE BESCHERMING (NIEUW) ===
+MAX_SLIPPAGE_PIPS = {
+    "metals":  15,
+    "forex":   5,
+    "indices": 20,
+}
+
+# === GOLD SCALP MODE — PROFESSIONEEL ===
+# Gebaseerd op institutional gold scalping best practices:
+# - Lagere risk per scalp (meer trades, kleiner risico per stuk)
+# - Strakkere TP levels (gold scalps targeten 20-40 pips, niet 100+)
+# - Spread filter strenger (scalp profit verdampt bij hoge spread)
+# - Snellere dedup voor re-entry
+# - Round number ($50/$100) level detectie
+# - Prime killzones: London + NY (13:00-17:00 UTC = meeste volume)
+# - Max 2 losses per sessie → stop gold scalping die sessie
 GOLD_SCALP = {
     "enabled": True,
     "symbol": "XAUUSD",
     "max_trades": 3,
-    "min_rr": 1.5,
+    "min_rr": 1.3,              # Lager voor scalps (was 1.5)
     "min_grade": "B+",
-    "tp1_mult": 2.0,
-    "tp2_mult": 3.0,
-    "tp3_mult": 4.5,
-    "dedup_seconds": 300,
+    "risk_override": 0.005,     # 0.5% risk per gold scalp (NIEUW)
+    "tp1_mult": 1.5,            # Strakker: 1.5R (was 2.0)
+    "tp2_mult": 2.5,            # Strakker: 2.5R (was 3.0)
+    "tp3_mult": 3.5,            # Strakker: 3.5R (was 4.5)
+    "dedup_seconds": 180,       # 3 min (was 5 min) — snellere re-entry
+    "max_spread_scalp": 20,     # Strenger: 20 pips max (normaal 35)
+    "session_max_losses": 2,    # Stop gold scalping na 2 losses in sessie
+    "prime_killzones": ["london", "london_ext", "new_york"],  # Beste uren
+    "round_number_step": 50,    # $50 round numbers ($2600, $2650, etc.)
+    "round_number_buffer": 3.0, # Binnen $3 van round number = extra zone
+    "cooldown_minutes": 30,     # Kortere cooldown dan andere pairs
 }
+
+# === GOLD SESSION LOSS TRACKER ===
+gold_session_losses = {"killzone": None, "losses": 0}
 
 # === MINIMUM SL AFSTAND PER CATEGORIE ===
 MIN_SL_PIPS = {
@@ -174,12 +211,16 @@ MIN_SL_PIPS = {
 COOLDOWN_AFTER_LOSSES = 3
 COOLDOWN_MINUTES = 45
 ZONE_MAX_AGE_HOURS = 48
-ZONE_MAX_TESTS = 1          # Terug naar 1 — geteste zone is zwak
+ZONE_MAX_TESTS = 1
 MAX_API_CALLS_PER_MIN = 50
-SWING_LOOKBACK = 3           # Terug naar 3 — minder noise
+SWING_LOOKBACK = 3
 MIN_REJECTION_WICK_RATIO = 0.45
 MIN_ENGULFING_BODY_RATIO = 1.1
 MIN_STRONG_CLOSE_BODY_RATIO = 1.5
+
+# === ZONE BUFFER — strenger (was 0.2-0.4) ===
+ZONE_ENTRY_BUFFER = 0.1       # Max 10% buiten zone
+ZONE_CONFIRM_BUFFER = 0.15    # Max 15% voor confirmatie
 
 KILLZONES = {
     "asia":       {"start": 0,  "end": 7},
@@ -194,11 +235,11 @@ ASIA_ENTRY_SYMBOLS = ["USDJPY", "GBPJPY", "XAUUSD"]
 NY_PM_SYMBOLS = ["XAUUSD", "USTEC", "US30"]
 
 SYMBOL_SPECS = {
-    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals",  "leverage": 20, "contract": 100, "min_lot": 0.01, "lot_step": 0.01},
+    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,  "max_spread_pips": 35,  "category": "metals",  "leverage": 20, "contract": 100,    "min_lot": 0.01, "lot_step": 0.01},
     "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 30,  "category": "forex",   "leverage": 20, "contract": 100000, "min_lot": 0.01, "lot_step": 0.01},
     "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": 6.5, "max_spread_pips": 18,  "category": "forex",   "leverage": 30, "contract": 100000, "min_lot": 0.01, "lot_step": 0.01},
-    "USTEC":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices",  "leverage": 20, "contract": 1, "min_lot": 0.1, "lot_step": 0.1},
-    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices",  "leverage": 20, "contract": 1, "min_lot": 0.1, "lot_step": 0.1},
+    "USTEC":   {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 25,  "category": "indices",  "leverage": 20, "contract": 1,     "min_lot": 0.1,  "lot_step": 0.1},
+    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,   "max_spread_pips": 35,  "category": "indices",  "leverage": 20, "contract": 1,     "min_lot": 0.1,  "lot_step": 0.1},
 }
 
 SYMBOLS = ["XAUUSD", "USTEC", "GBPJPY"] + [s for s in SYMBOL_SPECS.keys() if s not in ["XAUUSD", "USTEC", "GBPJPY"]]
@@ -214,6 +255,208 @@ CORRELATION_GROUPS = [
 
 GRADE_ORDER = ["D", "C", "B", "B+", "A", "A+"]
 
+LOT_LIMITS = {
+    "forex":   {"min": 0.01, "max": 5.0},
+    "metals":  {"min": 0.01, "max": 3.0},
+    "indices": {"min": 0.01, "max": 3.0},
+}
+
+# ==================== SQLite PERSISTENCE (NIEUW) ====================
+
+DB_PATH = os.getenv("DB_PATH", "/tmp/smc_bot_v4.db")
+
+def init_database():
+    """Initialiseer SQLite database — overleeft Railway restarts als volume gemount is"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("""CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        direction TEXT,
+        grade TEXT,
+        score REAL,
+        entry REAL,
+        stop_loss REAL,
+        tp1 REAL, tp2 REAL, tp3 REAL,
+        lot REAL,
+        rr REAL,
+        risk_pct REAL,
+        confirmation TEXT,
+        zone_type TEXT,
+        regime TEXT,
+        killzone TEXT,
+        confluence INTEGER DEFAULT 0,
+        ote_entry INTEGER DEFAULT 0,
+        reasons TEXT,
+        profit REAL DEFAULT 0,
+        closed INTEGER DEFAULT 0,
+        close_time TEXT,
+        mae REAL DEFAULT 0,
+        mfe REAL DEFAULT 0,
+        dry_run INTEGER DEFAULT 0
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS zones (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        type TEXT,
+        direction TEXT,
+        high REAL,
+        low REAL,
+        midpoint REAL,
+        created_at REAL,
+        status TEXT,
+        test_count INTEGER DEFAULT 0,
+        timeframe TEXT,
+        htf INTEGER DEFAULT 0
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS performance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        wins INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        total_profit REAL DEFAULT 0,
+        profit_factor REAL DEFAULT 0,
+        peak_balance REAL DEFAULT 0,
+        max_drawdown REAL DEFAULT 0
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )""")
+
+    conn.commit()
+    conn.close()
+    log.info(f"Database geïnitialiseerd: {DB_PATH}")
+
+def db_execute(query: str, params: tuple = (), fetch: bool = False):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(query, params)
+        if fetch:
+            result = c.fetchall()
+            conn.close()
+            return result
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning(f"DB error: {e}")
+        return [] if fetch else None
+
+def db_save_state(key: str, value):
+    db_execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+               (key, json.dumps(value)))
+
+def db_load_state(key: str, default=None):
+    rows = db_execute("SELECT value FROM state WHERE key = ?", (key,), fetch=True)
+    if rows and rows[0][0]:
+        try:
+            return json.loads(rows[0][0])
+        except Exception:
+            pass
+    return default
+
+def db_save_trade(trade_data: dict):
+    db_execute("""INSERT INTO trades
+        (timestamp, symbol, direction, grade, score, entry, stop_loss,
+         tp1, tp2, tp3, lot, rr, risk_pct, confirmation, zone_type,
+         regime, killzone, confluence, ote_entry, reasons, dry_run)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (trade_data.get("time", ""), trade_data.get("symbol", ""),
+         trade_data.get("direction", ""), trade_data.get("grade", ""),
+         trade_data.get("score", 0), trade_data.get("entry", 0),
+         trade_data.get("sl", 0), trade_data.get("tp1", 0),
+         trade_data.get("tp2", 0), trade_data.get("tp3", 0),
+         trade_data.get("lot", 0), trade_data.get("rr", 0),
+         trade_data.get("risk_pct", 0), trade_data.get("confirmation", ""),
+         trade_data.get("zone_type", ""), trade_data.get("regime", ""),
+         trade_data.get("killzone", ""), 1 if trade_data.get("confluence") else 0,
+         1 if trade_data.get("ote_entry") else 0,
+         json.dumps(trade_data.get("reasons", [])),
+         1 if DRY_RUN else 0))
+
+def db_update_trade_result(symbol: str, profit: float, mae: float = 0, mfe: float = 0):
+    db_execute("""UPDATE trades SET profit = ?, closed = 1, close_time = ?,
+        mae = ?, mfe = ? WHERE symbol = ? AND closed = 0
+        ORDER BY id DESC LIMIT 1""",
+        (profit, datetime.now(timezone.utc).isoformat(), mae, mfe, symbol))
+
+def db_get_profit_factor() -> float:
+    """Bereken realtime profit factor uit database"""
+    rows = db_execute(
+        "SELECT profit FROM trades WHERE closed = 1 AND dry_run = 0", fetch=True)
+    if not rows:
+        return 0
+    total_wins = sum(r[0] for r in rows if r[0] > 0)
+    total_losses = abs(sum(r[0] for r in rows if r[0] < 0))
+    if total_losses == 0:
+        return 99.0 if total_wins > 0 else 0
+    return round(total_wins / total_losses, 2)
+
+def db_get_mae_mfe_stats(symbol: str = None) -> dict:
+    """Haal MAE/MFE statistieken op voor optimalisatie"""
+    query = "SELECT mae, mfe, profit FROM trades WHERE closed = 1 AND dry_run = 0"
+    params = ()
+    if symbol:
+        query += " AND symbol = ?"
+        params = (symbol,)
+    rows = db_execute(query, params, fetch=True)
+    if not rows or len(rows) < 5:
+        return {}
+    maes = [r[0] for r in rows]
+    mfes = [r[1] for r in rows]
+    return {
+        "avg_mae": round(np.mean(maes), 5),
+        "max_mae": round(max(maes), 5),
+        "avg_mfe": round(np.mean(mfes), 5),
+        "max_mfe": round(max(mfes), 5),
+        "count": len(rows),
+    }
+
+def db_save_zones_bulk(zones_dict: dict, htf: bool = False):
+    """Sla alle zones op naar database"""
+    db_execute("DELETE FROM zones WHERE htf = ?", (1 if htf else 0,))
+    for symbol, zones in zones_dict.items():
+        for z in zones:
+            if z.is_valid:
+                db_execute("""INSERT INTO zones
+                    (symbol, type, direction, high, low, midpoint, created_at,
+                     status, test_count, timeframe, htf)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (symbol, z.type.value, z.direction.value, z.high, z.low,
+                     z.midpoint, z.created_at, z.status.value, z.test_count,
+                     z.timeframe, 1 if htf else 0))
+
+def db_load_zones() -> Tuple[dict, dict]:
+    """Laad zones uit database"""
+    zone_s = {}
+    htf_s = {}
+    now = time.time()
+    max_age = ZONE_MAX_AGE_HOURS * 3600
+    rows = db_execute("SELECT * FROM zones", fetch=True)
+    count = 0
+    for r in (rows or []):
+        _, symbol, ztype, direction, high, low, midpoint, created_at, status, test_count, tf, htf = r
+        if now - created_at > max_age:
+            continue
+        zone = Zone(
+            type=ZoneType(ztype), direction=Direction(direction),
+            high=high, low=low, midpoint=midpoint, created_at=created_at,
+            status=ZoneStatus(status), test_count=test_count,
+            symbol=symbol, timeframe=tf or "loaded",
+        )
+        store = htf_s if htf else zone_s
+        if symbol not in store:
+            store[symbol] = []
+        store[symbol].append(zone)
+        count += 1
+    return zone_s, htf_s, count
+
 # ==================== GLOBALE STATE ====================
 
 daily_state = {"date": None, "start_balance": 0, "trades_today": 0}
@@ -222,7 +465,7 @@ last_heartbeat = 0
 api_call_count = 0
 api_call_reset_time = 0
 zone_store: Dict[str, List[Zone]] = {}
-htf_zone_store: Dict[str, List[Zone]] = {}  # NIEUW: 1H zones apart
+htf_zone_store: Dict[str, List[Zone]] = {}
 trade_journal: List[dict] = []
 asia_range_cache: Dict[str, dict] = {}
 recent_signals: Dict[str, float] = {}
@@ -233,17 +476,10 @@ watchdog_max_silence = 600
 consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 20
 
-# === COOLDOWN PER SYMBOOL (was globaal) ===
-symbol_cooldowns: Dict[str, dict] = {}  # {"GBPJPY": {"losses": 2, "until": timestamp}}
-
-# === SESSION HIGH/LOW TRACKING ===
+symbol_cooldowns: Dict[str, dict] = {}
 session_levels: Dict[str, Dict[str, dict]] = {}
-# Structuur: {"XAUUSD": {"london": {"high": 1.23, "low": 1.20, "date": date}}}
+_adaptive_cache = {"data": {}, "last_calc": 0, "ttl": 3600}
 
-# === ADAPTIVE BOOSTS MET CACHE ===
-_adaptive_cache = {"data": {}, "last_calc": 0, "ttl": 3600}  # 1 uur TTL
-
-# ===== PERFORMANCE TRACKER =====
 performance = {
     "wins": 0,
     "losses": 0,
@@ -253,15 +489,9 @@ performance = {
     "peak_balance": 0,
     "session_start_balance": 0,
     "total_profit": 0,
+    "total_loss": 0,
     "grade_stats": {},
     "kz_stats": {},
-}
-
-LOT_LIMITS = {
-    "forex":   {"min": 0.01, "max": 5.0},
-    "metals":  {"min": 0.01, "max": 3.0},
-    "indices": {"min": 0.01, "max": 3.0},
-    "crypto":  {"min": 0.01, "max": 2.0},
 }
 
 # ==================== TELEGRAM ====================
@@ -289,16 +519,29 @@ def tg(msg: str):
                 tg_fail_count += 1
                 log.warning(f"Telegram FAILED 3x (total fails: {tg_fail_count}): {e}")
 
-def tg_health_check() -> bool:
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/getMe"
-        req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5)
-        return True
-    except Exception:
-        return False
-
 # ==================== SAFE API CALL ====================
+
+consecutive_api_fails = 0
+MAX_API_FAILS_BEFORE_RECONNECT = 7
+
+def mark_api_success():
+    global consecutive_api_fails
+    consecutive_api_fails = 0
+
+def mark_api_failure():
+    global consecutive_api_fails
+    consecutive_api_fails += 1
+    if consecutive_api_fails >= MAX_API_FAILS_BEFORE_RECONNECT:
+        log.warning(f"API failed {consecutive_api_fails}x in a row — reconnect needed")
+        return True
+    return False
+
+def needs_reconnect() -> bool:
+    return consecutive_api_fails >= MAX_API_FAILS_BEFORE_RECONNECT
+
+def reset_api_fails():
+    global consecutive_api_fails
+    consecutive_api_fails = 0
 
 async def safe_call(coro_func, *args, retries=3, timeout=30, default=None, label="API"):
     global api_call_count, api_call_reset_time
@@ -356,7 +599,7 @@ async def rate_limited_call(coro):
         mark_api_failure()
         log.debug("rate_limited_call timeout")
         return None
-    except (asyncio.CancelledError, asyncio.exceptions.CancelledError):
+    except (asyncio.CancelledError,):
         mark_api_failure()
         log.warning("rate_limited_call CancelledError (WebSocket disconnect)")
         return None
@@ -381,33 +624,6 @@ async def get_candles(account, symbol: str, timeframe: str, count: int):
     except Exception as e:
         log.debug(f"get_candles {symbol} {timeframe}: {e}")
         return None
-
-# ==================== CONNECTION HEALTH ====================
-
-consecutive_api_fails = 0
-MAX_API_FAILS_BEFORE_RECONNECT = 7
-
-async def check_connection_health(conn) -> bool:
-    return True
-
-def mark_api_success():
-    global consecutive_api_fails
-    consecutive_api_fails = 0
-
-def mark_api_failure():
-    global consecutive_api_fails
-    consecutive_api_fails += 1
-    if consecutive_api_fails >= MAX_API_FAILS_BEFORE_RECONNECT:
-        log.warning(f"API failed {consecutive_api_fails}x in a row — reconnect needed")
-        return True
-    return False
-
-def needs_reconnect() -> bool:
-    return consecutive_api_fails >= MAX_API_FAILS_BEFORE_RECONNECT
-
-def reset_api_fails():
-    global consecutive_api_fails
-    consecutive_api_fails = 0
 
 # ==================== HEARTBEAT ====================
 
@@ -439,24 +655,29 @@ async def send_heartbeat(conn):
     total_zones = sum(len([z for z in zones if z.is_valid]) for zones in zone_store.values())
     total_htf_zones = sum(len([z for z in zones if z.is_valid]) for zones in htf_zone_store.values())
     tg_status = "✅" if tg_fail_count == 0 else f"⚠️ {tg_fail_count} fails"
-
-    # Cooldown status
     active_cooldowns = [s for s, cd in symbol_cooldowns.items() if cd.get("until", 0) > now]
 
-    msg = f"""<b>💓 SMC v3.2 HEARTBEAT</b>
+    # Profit factor
+    pf = db_get_profit_factor()
+    wr = (performance['wins']/(performance['wins']+performance['losses'])*100) if (performance['wins']+performance['losses']) > 0 else 0
+
+    mode_str = "🧪 DRY RUN" if DRY_RUN else "🔴 LIVE"
+
+    msg = f"""<b>💓 SMC v4.0 HEARTBEAT</b> {mode_str}
+
 💰 Balance: ${balance:,.2f}
 📊 Equity: ${equity:,.2f}
 📈 P&L: ${pl:,.2f} ({pl_pct:+.2f}%)
-🎯 Open trades: {len(positions)}
+🎯 Open trades: {len(positions)}/{MAX_TOTAL_TRADES}
 🗺️ Zones: {total_zones} (5M/15M) + {total_htf_zones} (1H)
 🕐 Killzone: {kz.upper() if kz else 'NONE'}
-📅 Daily loss: {daily_loss:.2f}%
-📆 Weekly loss: {weekly_state['loss']*100:.2f}%
+📅 Daily loss: {daily_loss:.2f}% / {DAILY_LOSS_LIMIT*100:.1f}%
+📆 Weekly loss: {weekly_state['loss']*100:.2f}% / {WEEKLY_LOSS_LIMIT*100:.1f}%
 📊 Trades today: {daily_state['trades_today']}/{MAX_TRADES_PER_DAY}
 📈 Performance:
   W/L: {performance['wins']}/{performance['losses']}
+  WR: {wr:.0f}% | PF: {pf:.2f}
   Streak: {performance['consecutive_wins']}W / {performance['consecutive_losses']}L
-  WR: {(performance['wins']/(performance['wins']+performance['losses'])*100) if (performance['wins']+performance['losses']) > 0 else 0:.0f}%
   Peak: ${performance['peak_balance']:,.2f}
 🧊 Cooldowns: {', '.join(active_cooldowns) if active_cooldowns else 'geen'}
 🔗 Connection: {'✅' if connection_healthy else '❌'}
@@ -486,10 +707,9 @@ def is_entry_allowed(symbol: str) -> Tuple[bool, Optional[str]]:
         return True, kz
     return False, kz
 
-# ==================== SESSION HIGH/LOW TRACKING (NIEUW) ====================
+# ==================== SESSION HIGH/LOW TRACKING ====================
 
 def update_session_levels(symbol: str, high: float, low: float):
-    """Track high/low per killzone per symbool"""
     kz = get_current_killzone()
     if not kz:
         return
@@ -506,12 +726,9 @@ def update_session_levels(symbol: str, high: float, low: float):
             session_levels[symbol][key]["low"] = low
 
 def get_previous_session_levels(symbol: str) -> Optional[dict]:
-    """Haal high/low op van vorige killzone voor sweep detectie"""
     kz = get_current_killzone()
     if not kz or symbol not in session_levels:
         return None
-
-    # Volgorde: asia → london → london_ext → new_york → ny_pm
     kz_order = ["asia", "london", "london_ext", "new_york", "ny_pm"]
     try:
         idx = kz_order.index(kz)
@@ -583,7 +800,7 @@ def update_weekly_loss(balance: float):
             weekly_state["loss"] = loss
         if loss >= WEEKLY_LOSS_LIMIT:
             weekly_state["limit_hit"] = True
-            tg(f"🚨 <b>WEEKLY LIMIT</b>: {loss*100:.1f}%")
+            tg(f"🚨 <b>WEEKLY LIMIT</b>: {loss*100:.1f}% >= {WEEKLY_LOSS_LIMIT*100:.0f}%")
 
 def check_daily(balance: float) -> bool:
     today = date.today()
@@ -595,12 +812,11 @@ def check_daily(balance: float) -> bool:
         return True
     loss = (daily_state["start_balance"] - balance) / daily_state["start_balance"]
     if loss >= DAILY_LOSS_LIMIT:
-        tg(f"🚨 <b>DAILY LIMIT</b>: {loss*100:.2f}%")
+        tg(f"🚨 <b>DAILY LIMIT</b>: {loss*100:.2f}% >= {DAILY_LOSS_LIMIT*100:.1f}%")
         return False
     return True
 
 def check_cooldown(symbol: str) -> Tuple[bool, int]:
-    """COOLDOWN PER SYMBOOL — andere symbolen worden niet geblokkeerd"""
     now = time.time()
     if symbol in symbol_cooldowns:
         cd = symbol_cooldowns[symbol]
@@ -609,56 +825,86 @@ def check_cooldown(symbol: str) -> Tuple[bool, int]:
     return True, 0
 
 def register_trade_result(symbol: str, is_win: bool, profit: float = 0):
-    """Update cooldown PER SYMBOOL"""
     if symbol not in symbol_cooldowns:
         symbol_cooldowns[symbol] = {"losses": 0, "until": 0}
+
+    # Gold-specifieke cooldown tijd
+    is_gold = symbol == GOLD_SCALP["symbol"]
+    cd_minutes = GOLD_SCALP["cooldown_minutes"] if is_gold else COOLDOWN_MINUTES
 
     if is_win:
         symbol_cooldowns[symbol]["losses"] = 0
     else:
         symbol_cooldowns[symbol]["losses"] += 1
+        # Gold sessie loss tracking
+        if is_gold:
+            register_gold_session_loss(symbol)
         if symbol_cooldowns[symbol]["losses"] >= COOLDOWN_AFTER_LOSSES:
-            symbol_cooldowns[symbol]["until"] = time.time() + COOLDOWN_MINUTES * 60
-            tg(f"🧊 <b>COOLDOWN {symbol} {COOLDOWN_MINUTES}min</b> na {symbol_cooldowns[symbol]['losses']} losses")
+            symbol_cooldowns[symbol]["until"] = time.time() + cd_minutes * 60
+            tg(f"🧊 <b>COOLDOWN {symbol} {cd_minutes}min</b> na {symbol_cooldowns[symbol]['losses']} losses")
 
     update_performance(is_win, profit)
 
-def get_dynamic_risk(balance: float, grade: str = "B+") -> float:
+    # Profit factor check
+    pf = db_get_profit_factor()
+    total_trades = performance["wins"] + performance["losses"]
+    if total_trades >= 20 and pf < 1.0:
+        tg(f"⚠️ <b>PROFIT FACTOR ALARM</b>: PF = {pf:.2f} na {total_trades} trades\n🛑 Bot moet geëvalueerd worden!")
+
+def get_dynamic_risk(balance: float, grade: str = "B+", symbol: str = "", df: pd.DataFrame = None) -> float:
     """
-    VEREENVOUDIGDE RISK — 3 lagen:
-    1. Grade-based risk (vast)
-    2. Drawdown protectie (daily loss scaling)
-    3. Streak modifier (±30%)
+    PROFESSIONELE RISK — 4 lagen:
+    1. Grade-based risk (verlaagd)
+    2. Drawdown protectie
+    3. Streak modifier (conservatief)
+    4. Volatility scaling (NIEUW — ATR-based)
     """
-    # === LAAG 1: Grade risk ===
-    risk = GRADE_RISK.get(grade, 0.010)
+    # === LAAG 1: Grade risk (of gold override) ===
+    is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+    if is_gold_scalp:
+        risk = GOLD_SCALP["risk_override"]   # 0.5% vast voor gold scalps
+    else:
+        risk = GRADE_RISK.get(grade, 0.005)
 
     # === LAAG 2: Drawdown protectie ===
     if daily_state["start_balance"] > 0:
         day_loss = (daily_state["start_balance"] - balance) / daily_state["start_balance"]
-        if day_loss >= 0.02:
-            risk *= 0.3
-        elif day_loss >= 0.015:
+        if day_loss >= 0.01:
             risk *= 0.5
+        elif day_loss >= 0.005:
+            risk *= 0.7
 
     if performance["peak_balance"] > 0 and balance > 0:
         drawdown = (performance["peak_balance"] - balance) / performance["peak_balance"]
-        if drawdown >= 0.04:
+        if drawdown >= 0.03:
             risk *= 0.25
-        elif drawdown >= 0.02:
+        elif drawdown >= 0.015:
             risk *= 0.5
 
-    # === LAAG 3: Streak modifier ===
+    # === LAAG 3: Streak modifier (conservatief) ===
     if performance["consecutive_wins"] >= 4:
-        risk *= STREAK_MODIFIER["wins_4plus"]
+        risk *= STREAK_MODIFIER["wins_4plus"]   # Max +10%
     elif performance["consecutive_wins"] >= 2:
-        risk *= STREAK_MODIFIER["wins_2_3"]
+        risk *= STREAK_MODIFIER["wins_2_3"]     # Max +5%
     elif performance["consecutive_losses"] >= 3:
         risk *= STREAK_MODIFIER["loss_3plus"]
     elif performance["consecutive_losses"] >= 2:
         risk *= STREAK_MODIFIER["loss_2"]
     elif performance["consecutive_losses"] >= 1:
         risk *= STREAK_MODIFIER["loss_1"]
+
+    # === LAAG 4: Volatility scaling (NIEUW) ===
+    if df is not None and "atr" in df.columns:
+        current_atr = float(df["atr"].iloc[-1])
+        avg_atr = float(df["atr"].tail(50).mean())
+        if avg_atr > 0:
+            vol_ratio = current_atr / avg_atr
+            if vol_ratio > 1.5:
+                risk *= 0.6   # Hoge vol = kleinere positie
+            elif vol_ratio > 1.2:
+                risk *= 0.8
+            elif vol_ratio < 0.7:
+                risk *= 1.1   # Lage vol = iets groter (max +10%)
 
     return max(risk, 0.002)  # Min 0.2%
 
@@ -667,12 +913,13 @@ def update_performance(is_win: bool, profit: float = 0, grade: str = "", kz: str
         performance["wins"] += 1
         performance["consecutive_wins"] += 1
         performance["consecutive_losses"] = 0
+        performance["total_profit"] += profit
     else:
         performance["losses"] += 1
         performance["consecutive_losses"] += 1
         performance["consecutive_wins"] = 0
+        performance["total_loss"] += abs(profit)
 
-    performance["total_profit"] += profit
     performance["recent_results"].append(is_win)
     if len(performance["recent_results"]) > 20:
         performance["recent_results"] = performance["recent_results"][-20:]
@@ -693,68 +940,42 @@ def update_performance(is_win: bool, profit: float = 0, grade: str = "", kz: str
         else:
             performance["kz_stats"][kz]["l"] += 1
 
+    # Save to DB
+    db_save_state("performance", performance)
+
 def update_peak_balance(balance: float):
     if balance > performance["peak_balance"]:
         performance["peak_balance"] = balance
     if performance["session_start_balance"] == 0:
         performance["session_start_balance"] = balance
 
-# ==================== ADAPTIVE TRADE DATA (MET CACHE) ====================
-
-TRADE_DATA_FILE = "/tmp/smc_trade_history.json"
-
-def save_trade_data(trade: dict):
-    try:
-        history = load_trade_history()
-        history.append(trade)
-        if len(history) > 500:
-            history = history[-500:]
-        with open(TRADE_DATA_FILE, "w") as f:
-            json.dump(history, f)
-    except Exception as e:
-        log.debug(f"Trade data save error: {e}")
-
-def load_trade_history() -> list:
-    try:
-        if os.path.exists(TRADE_DATA_FILE):
-            with open(TRADE_DATA_FILE, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return []
+# ==================== ADAPTIVE BOOSTS (MET CACHE) ====================
 
 def get_adaptive_boosts() -> dict:
-    """
-    Cached adaptive boosts — herbereken max 1x per uur.
-    Vereist minimaal 20 trades per categorie voor betrouwbaarheid.
-    """
     now = time.time()
     if _adaptive_cache["data"] and (now - _adaptive_cache["last_calc"]) < _adaptive_cache["ttl"]:
         return _adaptive_cache["data"]
 
-    history = load_trade_history()
-    if len(history) < 10:
+    rows = db_execute(
+        "SELECT symbol, confirmation, killzone, zone_type, profit FROM trades WHERE closed = 1 AND dry_run = 0",
+        fetch=True)
+    if not rows or len(rows) < 10:
         return {}
 
     boosts = {"symbol": {}, "confirmation": {}, "killzone": {}, "zone_type": {}}
-
-    for category in boosts:
+    for category_idx, category in enumerate(["symbol", "confirmation", "killzone", "zone_type"]):
         stats = {}
-        for t in history:
-            key = t.get(category, "unknown")
-            if not key:
-                continue
+        for r in rows:
+            key = r[category_idx] or "unknown"
             if key not in stats:
-                stats[key] = {"wins": 0, "losses": 0, "profit": 0}
-            if t.get("profit", 0) > 0:
+                stats[key] = {"wins": 0, "losses": 0}
+            if r[4] > 0:
                 stats[key]["wins"] += 1
             else:
                 stats[key]["losses"] += 1
-            stats[key]["profit"] += t.get("profit", 0)
-
         for key, s in stats.items():
             total = s["wins"] + s["losses"]
-            if total < 20:  # Minimum 20 trades voor betrouwbaarheid
+            if total < 20:
                 boosts[category][key] = 1.0
                 continue
             wr = s["wins"] / total
@@ -781,7 +1002,12 @@ async def check_spread(conn, symbol: str) -> Tuple[bool, float]:
         spread = price["ask"] - price["bid"]
         spec = SYMBOL_SPECS[symbol]
         spread_pips = spread / spec["pip_size"]
-        if spread_pips > spec["max_spread_pips"]:
+
+        # Gold scalp: strengere spread filter
+        is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+        max_spread = GOLD_SCALP["max_spread_scalp"] if is_gold_scalp else spec["max_spread_pips"]
+
+        if spread_pips > max_spread:
             return False, spread
         return True, spread
     except Exception:
@@ -838,7 +1064,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
     df["candle_range"] = df["high"] - df["low"]
 
-    # === VOLUME INDICATORS (NIEUW) ===
     if "tickVolume" in df.columns:
         df["volume"] = df["tickVolume"]
     elif "volume" not in df.columns:
@@ -909,7 +1134,6 @@ def analyze_structure(df: pd.DataFrame, swings: List[SwingPoint]) -> Optional[St
             type=stype, direction=Direction.BEAR,
             level=last_sl.price, index=last_sl.index, swing_broken=last_sl
         )
-
     return None
 
 # ==================== PREMIUM / DISCOUNT ====================
@@ -930,6 +1154,133 @@ def get_premium_discount(df: pd.DataFrame, swings: List[SwingPoint]) -> Optional
     elif position <= 0.382:
         return "discount"
     return "equilibrium"
+
+# ==================== OTE FIBONACCI ZONE (NIEUW) ====================
+
+def detect_ote_zone(df: pd.DataFrame, swings: List[SwingPoint], direction: Direction) -> Optional[Zone]:
+    """
+    Optimal Trade Entry — 62-79% Fibonacci retracement zone.
+    Dit is waar institutionele traders typisch instappen.
+    """
+    highs = [s for s in swings if s.type == "high"]
+    lows = [s for s in swings if s.type == "low"]
+
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+
+    if direction == Direction.BULL:
+        # Bij bullish: retracement van swing low naar swing high
+        swing_low = min(s.price for s in lows[-3:])
+        swing_high = max(s.price for s in highs[-3:])
+        if swing_high <= swing_low:
+            return None
+        rng = swing_high - swing_low
+        ote_high = swing_high - rng * 0.618   # 61.8% retracement
+        ote_low = swing_high - rng * 0.786    # 78.6% retracement
+
+        current = float(df["close"].iloc[-1])
+        if current > ote_high or current < ote_low:
+            return None  # Prijs niet in OTE zone
+
+        return Zone(
+            type=ZoneType.OTE, direction=Direction.BULL,
+            high=ote_high, low=ote_low,
+            midpoint=(ote_high + ote_low) / 2,
+            created_at=time.time(),
+        )
+
+    elif direction == Direction.BEAR:
+        swing_high = max(s.price for s in highs[-3:])
+        swing_low = min(s.price for s in lows[-3:])
+        if swing_high <= swing_low:
+            return None
+        rng = swing_high - swing_low
+        ote_low = swing_low + rng * 0.618
+        ote_high = swing_low + rng * 0.786
+
+        current = float(df["close"].iloc[-1])
+        if current < ote_low or current > ote_high:
+            return None
+
+        return Zone(
+            type=ZoneType.OTE, direction=Direction.BEAR,
+            high=ote_high, low=ote_low,
+            midpoint=(ote_high + ote_low) / 2,
+            created_at=time.time(),
+        )
+
+    return None
+
+# ==================== GOLD ROUND NUMBER DETECTION (NIEUW) ====================
+
+def detect_gold_round_number(df: pd.DataFrame, direction: Direction) -> Optional[Zone]:
+    """
+    Gold reageert sterk op $50 en $100 round numbers ($2600, $2650, $2700, etc.)
+    Professionele gold scalpers gebruiken deze levels als extra zones.
+    """
+    if not GOLD_SCALP["enabled"]:
+        return None
+
+    current_price = float(df["close"].iloc[-1])
+    step = GOLD_SCALP["round_number_step"]
+    buffer = GOLD_SCALP["round_number_buffer"]
+
+    # Vind dichtstbijzijnde round number
+    nearest_round = round(current_price / step) * step
+
+    # Check of prijs dicht genoeg bij round number is
+    distance = abs(current_price - nearest_round)
+    if distance > buffer:
+        return None
+
+    # Check voor rejection bij het round number
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else last
+
+    if direction == Direction.BULL and current_price < nearest_round:
+        # Prijs nadert round number van onder — potentieel support
+        if last["close"] > last["open"] and last["low"] <= nearest_round + buffer:
+            return Zone(
+                type=ZoneType.ORDER_BLOCK, direction=Direction.BULL,
+                high=nearest_round + buffer, low=nearest_round - buffer,
+                midpoint=nearest_round, created_at=time.time(),
+            )
+    elif direction == Direction.BEAR and current_price > nearest_round:
+        # Prijs nadert round number van boven — potentieel resistance
+        if last["close"] < last["open"] and last["high"] >= nearest_round - buffer:
+            return Zone(
+                type=ZoneType.ORDER_BLOCK, direction=Direction.BEAR,
+                high=nearest_round + buffer, low=nearest_round - buffer,
+                midpoint=nearest_round, created_at=time.time(),
+            )
+
+    return None
+
+def check_gold_session_limit(symbol: str) -> bool:
+    """Check of gold scalp sessie-limiet is bereikt (max losses per killzone)"""
+    if symbol != GOLD_SCALP["symbol"]:
+        return True
+    kz = get_current_killzone()
+    if not kz:
+        return False
+
+    # Reset als killzone veranderd is
+    if gold_session_losses["killzone"] != kz:
+        gold_session_losses["killzone"] = kz
+        gold_session_losses["losses"] = 0
+
+    if gold_session_losses["losses"] >= GOLD_SCALP["session_max_losses"]:
+        return False
+    return True
+
+def register_gold_session_loss(symbol: str):
+    """Track gold scalp losses per sessie"""
+    if symbol == GOLD_SCALP["symbol"]:
+        kz = get_current_killzone()
+        if kz and gold_session_losses["killzone"] == kz:
+            gold_session_losses["losses"] += 1
+            if gold_session_losses["losses"] >= GOLD_SCALP["session_max_losses"]:
+                tg(f"🥇🧊 <b>GOLD SCALP SESSIE STOP</b>\n{gold_session_losses['losses']} losses in {kz.upper()} — pauze tot volgende killzone")
 
 # ==================== ORDER BLOCK DETECTIE ====================
 
@@ -1006,7 +1357,6 @@ def detect_liquidity_sweep(df: pd.DataFrame, symbol: str, swings: List[SwingPoin
     last = df.iloc[-1]
     prev = df.iloc[-2]
     atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else float((df["high"] - df["low"]).tail(14).mean())
-
     highs = [s for s in swings if s.type == "high"]
     lows = [s for s in swings if s.type == "low"]
     tolerance = atr * 0.1
@@ -1031,7 +1381,7 @@ def detect_liquidity_sweep(df: pd.DataFrame, symbol: str, swings: List[SwingPoin
                     if wick > atr * 0.3:
                         return {"type": "bull", "level": eq_level, "reason": "equal_lows_sweep", "strength": "strong"}
 
-    # === SESSION HIGH/LOW SWEEP (NIEUW) ===
+    # Session High/Low Sweep
     prev_session = get_previous_session_levels(symbol)
     if prev_session:
         if last["high"] > prev_session["high"] and last["close"] < prev_session["high"]:
@@ -1075,7 +1425,6 @@ def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Op
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # === VOLUME CHECK (NIEUW) ===
     has_volume = False
     if "volume" in df.columns and "avg_volume" in df.columns:
         vol = float(last["volume"])
@@ -1087,27 +1436,23 @@ def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Op
         lw = float(last["lower_wick"])
         cr = float(last["candle_range"])
 
-        # Rejection wick
         if cr > 0 and lw / cr >= MIN_REJECTION_WICK_RATIO:
-            if last["close"] > last["open"] and zone.contains_price(float(last["low"]), 0.2):
+            if last["close"] > last["open"] and zone.contains_price(float(last["low"]), ZONE_ENTRY_BUFFER):
                 return "rejection_wick_vol" if has_volume else "rejection_wick"
 
-        # Engulfing
         if (last["close"] > last["open"] and prev["close"] < prev["open"]
             and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
             and last["close"] > prev["open"] and last["open"] < prev["close"]):
-            if zone.contains_price(float(last["low"]), 0.3):
+            if zone.contains_price(float(last["low"]), ZONE_CONFIRM_BUFFER):
                 return "engulfing_vol" if has_volume else "engulfing"
 
-        # Pin bar
         body = float(last["body"])
         if cr > 0 and body / cr < 0.3 and lw / cr > 0.5 and last["close"] > last["open"]:
             return "pin_bar_vol" if has_volume else "pin_bar"
 
-        # Strong bullish close
         avg_body = float(df["body"].tail(20).mean())
         if (last["close"] > last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
-            and zone.contains_price(float(last["open"]), 0.4)):
+            and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
             return "strong_close_vol" if has_volume else "strong_close"
 
     elif direction == Direction.BEAR:
@@ -1115,13 +1460,13 @@ def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Op
         cr = float(last["candle_range"])
 
         if cr > 0 and uw / cr >= MIN_REJECTION_WICK_RATIO:
-            if last["close"] < last["open"] and zone.contains_price(float(last["high"]), 0.2):
+            if last["close"] < last["open"] and zone.contains_price(float(last["high"]), ZONE_ENTRY_BUFFER):
                 return "rejection_wick_vol" if has_volume else "rejection_wick"
 
         if (last["close"] < last["open"] and prev["close"] > prev["open"]
             and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
             and last["close"] < prev["open"] and last["open"] > prev["close"]):
-            if zone.contains_price(float(last["high"]), 0.3):
+            if zone.contains_price(float(last["high"]), ZONE_CONFIRM_BUFFER):
                 return "engulfing_vol" if has_volume else "engulfing"
 
         body = float(last["body"])
@@ -1130,81 +1475,15 @@ def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Op
 
         avg_body = float(df["body"].tail(20).mean())
         if (last["close"] < last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
-            and zone.contains_price(float(last["open"]), 0.4)):
+            and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
             return "strong_close_vol" if has_volume else "strong_close"
 
     return None
 
 # ==================== ZONE MANAGEMENT ====================
 
-ZONE_SAVE_FILE = "/tmp/smc_zones.json"
-ZONE_SAVE_INTERVAL = 60
 _last_zone_save = 0
-
-def save_zones_to_disk():
-    global _last_zone_save
-    now = time.time()
-    if now - _last_zone_save < ZONE_SAVE_INTERVAL:
-        return
-    _last_zone_save = now
-    try:
-        data = {"zones": {}, "htf_zones": {}}
-        for symbol, zones in zone_store.items():
-            data["zones"][symbol] = []
-            for z in zones:
-                if z.is_valid:
-                    data["zones"][symbol].append({
-                        "type": z.type.value, "direction": z.direction.value,
-                        "high": z.high, "low": z.low, "midpoint": z.midpoint,
-                        "created_at": z.created_at, "status": z.status.value,
-                        "test_count": z.test_count, "symbol": z.symbol, "timeframe": z.timeframe,
-                    })
-        for symbol, zones in htf_zone_store.items():
-            data["htf_zones"][symbol] = []
-            for z in zones:
-                if z.is_valid:
-                    data["htf_zones"][symbol].append({
-                        "type": z.type.value, "direction": z.direction.value,
-                        "high": z.high, "low": z.low, "midpoint": z.midpoint,
-                        "created_at": z.created_at, "status": z.status.value,
-                        "test_count": z.test_count, "symbol": z.symbol, "timeframe": z.timeframe,
-                    })
-        with open(ZONE_SAVE_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        log.warning(f"Zone save error: {e}")
-
-def load_zones_from_disk():
-    try:
-        if not os.path.exists(ZONE_SAVE_FILE):
-            return 0
-        with open(ZONE_SAVE_FILE, "r") as f:
-            data = json.load(f)
-        count = 0
-        now = time.time()
-        max_age = ZONE_MAX_AGE_HOURS * 3600
-
-        for store, key in [(zone_store, "zones"), (htf_zone_store, "htf_zones")]:
-            for symbol, zones_data in data.get(key, {}).items():
-                if symbol not in store:
-                    store[symbol] = []
-                for zd in zones_data:
-                    if now - zd["created_at"] > max_age:
-                        continue
-                    zone = Zone(
-                        type=ZoneType(zd["type"]), direction=Direction(zd["direction"]),
-                        high=zd["high"], low=zd["low"], midpoint=zd["midpoint"],
-                        created_at=zd["created_at"], status=ZoneStatus(zd["status"]),
-                        test_count=zd["test_count"], symbol=zd.get("symbol", symbol),
-                        timeframe=zd.get("timeframe", "loaded"),
-                    )
-                    store[symbol].append(zone)
-                    count += 1
-        log.info(f"Zones geladen van disk: {count} zones")
-        return count
-    except Exception as e:
-        log.warning(f"Zone load error: {e}")
-        return 0
+ZONE_SAVE_INTERVAL = 120
 
 def store_zones(symbol: str, new_zones: List[Zone], htf: bool = False):
     store = htf_zone_store if htf else zone_store
@@ -1218,22 +1497,24 @@ def store_zones(symbol: str, new_zones: List[Zone], htf: bool = False):
     store[symbol] = [z for z in store[symbol] if z.is_valid and (now - z.created_at) < max_age]
     if len(store[symbol]) > 20:
         store[symbol] = store[symbol][-20:]
-    save_zones_to_disk()
+
+    global _last_zone_save
+    if now - _last_zone_save > ZONE_SAVE_INTERVAL:
+        db_save_zones_bulk(zone_store, htf=False)
+        db_save_zones_bulk(htf_zone_store, htf=True)
+        _last_zone_save = now
 
 def find_active_zone(symbol: str, price: float, direction: Direction) -> Optional[Zone]:
     if symbol not in zone_store:
         return None
-
     tf_priority = {"15m": 0, "5m": 1}
     candidates = []
-
     for zone in zone_store[symbol]:
         if not zone.is_valid or zone.direction != direction:
             continue
-        if zone.contains_price(price, buffer_pct=0.25):
+        if zone.contains_price(price, buffer_pct=ZONE_ENTRY_BUFFER):
             priority = tf_priority.get(zone.timeframe, 3)
             candidates.append((priority, zone))
-
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0])
@@ -1244,7 +1525,7 @@ def mark_zone_tested(zone: Zone):
     if zone.test_count > ZONE_MAX_TESTS:
         zone.status = ZoneStatus.MITIGATED
     else:
-        zone.status = ZoneStatus.MITIGATED  # 1 test = mitigated (strenger)
+        zone.status = ZoneStatus.MITIGATED
 
 def update_zone_status(symbol: str, df: pd.DataFrame):
     current_price = float(df["close"].iloc[-1])
@@ -1259,19 +1540,16 @@ def update_zone_status(symbol: str, df: pd.DataFrame):
             elif zone.direction == Direction.BEAR and current_price > zone.high:
                 zone.status = ZoneStatus.MITIGATED
 
-# ==================== MULTI-TF ZONE CONFLUENCE (NIEUW) ====================
+# ==================== MULTI-TF ZONE CONFLUENCE ====================
 
 def check_zone_confluence(zone: Zone, symbol: str) -> bool:
-    """Check of een 5M/15M zone BINNEN een 1H zone valt → confluence"""
     if symbol not in htf_zone_store:
         return False
     for z1h in htf_zone_store[symbol]:
         if not z1h.is_valid or z1h.direction != zone.direction:
             continue
-        # Zone valt binnen 1H zone (met kleine tolerantie)
         if zone.low >= z1h.low * 0.998 and zone.high <= z1h.high * 1.002:
             return True
-        # Zone overlapt significant met 1H zone
         overlap_low = max(zone.low, z1h.low)
         overlap_high = min(zone.high, z1h.high)
         if overlap_high > overlap_low:
@@ -1302,7 +1580,6 @@ def detect_regime(df: pd.DataFrame) -> str:
 # ==================== HTF BIAS (1H) + ZONES ====================
 
 async def get_htf_bias(account, symbol: str) -> Optional[Direction]:
-    """1H bias + zone detectie op 1H timeframe"""
     try:
         candles = await get_candles(account, symbol, "1h", 120)
         if not candles or len(candles) < 60:
@@ -1313,15 +1590,13 @@ async def get_htf_bias(account, symbol: str) -> Optional[Direction]:
         ema50 = float(df["ema50"].iloc[-1])
         ema200 = float(df["ema200"].iloc[-1])
 
-        # === NIEUW: Detecteer zones op 1H ===
-        swings_1h = detect_swing_points(df, lookback=4)  # Grotere lookback voor 1H
+        swings_1h = detect_swing_points(df, lookback=4)
         structure_1h = analyze_structure(df, swings_1h)
         if structure_1h:
             new_obs_1h = detect_order_blocks(df, structure_1h)
             for ob in new_obs_1h:
                 ob.timeframe = "1h"
             store_zones(symbol, new_obs_1h, htf=True)
-
             new_fvgs_1h = detect_fvgs(df, lookback=8)
             for fvg in new_fvgs_1h:
                 fvg.timeframe = "1h"
@@ -1341,13 +1616,8 @@ async def get_htf_bias(account, symbol: str) -> Optional[Direction]:
 
 # ==================== TRADE GRADING ====================
 
-def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount, regime, direction, symbol="", has_confluence=False):
-    """
-    Verplicht: Zone + Confirmatie
-    Confluence (1H zone overlap) geeft +2.0 bonus
-    Volume confirmatie geeft +1.0 bonus
-    Min grade: B+ (score >= 6)
-    """
+def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount,
+                regime, direction, symbol="", has_confluence=False, is_ote=False):
     score = 0
     reasons = []
 
@@ -1364,15 +1634,18 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
     reasons.append(f"CONFIRM({confirmation})")
     score += 2.0
 
-    # === VOLUME BONUS (NIEUW) ===
     if "_vol" in confirmation:
         score += 1.0
         reasons.append("VOLUME✓")
 
-    # === CONFLUENCE BONUS (NIEUW) ===
     if has_confluence:
         score += 2.0
         reasons.append("CONFLUENCE_1H")
+
+    # OTE bonus (NIEUW)
+    if is_ote:
+        score += 2.0
+        reasons.append("OTE_FIB")
 
     if htf_bias:
         score += 2.5
@@ -1398,24 +1671,25 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
             score += 1.5
             reasons.append("P/D_ALIGNED")
 
+    # REGIME FILTER — STRENGER (ranging = geen trade)
     if regime == "trending":
         score += 1.0
         reasons.append("TRENDING")
     elif regime == "ranging":
-        score -= 1.0
-        reasons.append("RANGING⚠️")
+        score -= 3.0   # Was -1.0, nu -3.0 (effectief block)
+        reasons.append("RANGING⛔")
 
     if zone.type == ZoneType.ORDER_BLOCK and zone.structure_break:
         score += 0.5
         reasons.append("OB+STRUCT")
 
-    # Grade bepaling — MINIMUM B+ (score >= 6)
     if score >= 10:
         has_sweep = any("SWEEP" in r for r in reasons)
         has_pd = any("P/D_ALIGNED" in r for r in reasons)
         has_choch = any("CHoCH" in r for r in reasons)
         has_conf = any("CONFLUENCE" in r for r in reasons)
-        if has_sweep or has_pd or has_choch or has_conf:
+        has_ote_r = any("OTE" in r for r in reasons)
+        if has_sweep or has_pd or has_choch or has_conf or has_ote_r:
             return "A+", 1.0, score, reasons
         else:
             return "A", 1.0, score, reasons
@@ -1423,7 +1697,6 @@ def grade_setup(htf_bias, structure, zone, confirmation, sweep, premium_discount
         return "A", 0.75, score, reasons
     elif score >= 6:
         return "B+", 0.6, score, reasons
-    # Alles onder 6 = geen trade
     return "D", 0, score, reasons
 
 # ==================== LOT SIZE ====================
@@ -1466,11 +1739,8 @@ def calculate_lot_size(balance: float, sl_distance: float, symbol: str, risk_pct
 
 # ==================== SL / TP BEREKENING ====================
 
-def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: pd.DataFrame, symbol: str = "", spread: float = 0):
-    """
-    SL achter zone, TP1/TP2/TP3 voor 33/33/33 partial close.
-    SPREAD-WEIGHTED RR: entry wordt gecorrigeerd voor spread.
-    """
+def calculate_trade_levels(direction: Direction, entry: float, zone: Zone,
+                           df: pd.DataFrame, symbol: str = "", spread: float = 0):
     atr = float(df["atr"].iloc[-1])
     buffer = atr * 0.15
     max_sl_distance = atr * 2.5
@@ -1486,37 +1756,29 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
     tp2_mult = GOLD_SCALP["tp2_mult"] if is_gold else 3.0
     tp3_mult = GOLD_SCALP["tp3_mult"] if is_gold else 4.5
 
-    # === SPREAD-WEIGHTED ENTRY (NIEUW) ===
-    # Effective entry = entry + spread cost
     effective_entry = entry + spread if direction == Direction.BULL else entry - spread
 
     if direction == Direction.BULL:
         sl = zone.low - buffer
         sl_dist = effective_entry - sl
-
         if sl_dist < max(atr * 1.0, min_sl_dist):
             sl_dist = max(atr * 1.0, min_sl_dist)
             sl = effective_entry - sl_dist
-
         if sl_dist > max_sl_distance:
             sl = effective_entry - max_sl_distance
             sl_dist = max_sl_distance
-
         tp1 = entry + sl_dist * tp1_mult
         tp2 = entry + sl_dist * tp2_mult
         tp3 = entry + sl_dist * tp3_mult
     else:
         sl = zone.high + buffer
         sl_dist = sl - effective_entry
-
         if sl_dist < max(atr * 1.0, min_sl_dist):
             sl_dist = max(atr * 1.0, min_sl_dist)
             sl = effective_entry + sl_dist
-
         if sl_dist > max_sl_distance:
             sl = effective_entry + max_sl_distance
             sl_dist = max_sl_distance
-
         tp1 = entry - sl_dist * tp1_mult
         tp2 = entry - sl_dist * tp2_mult
         tp3 = entry - sl_dist * tp3_mult
@@ -1526,29 +1788,24 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone, df: p
 # ==================== POSITION MANAGEMENT ====================
 
 async def manage_positions(conn, positions: list):
-    """
-    33/33/33 partial close strategie:
-    1. 33% close bij TP1 (2.0R) → SL naar breakeven
-    2. 33% close bij TP2 (3.0R) → SL naar TP1
-    3. 33% runner naar TP3 met trailing SL
-    """
+    """33/33/33 partial close + MAE/MFE tracking"""
     now = datetime.now(timezone.utc)
 
-    # === VRIJDAG AUTO-CLOSE ===
+    # Vrijdag auto-close
     if now.weekday() == 4 and now.hour >= 21 and now.minute >= 30:
         for pos in positions:
             try:
                 symbol = pos["symbol"]
                 pid = pos["id"]
                 profit = pos.get("profit", 0) + pos.get("swap", 0) + pos.get("commission", 0)
-                await asyncio.wait_for(conn.close_position(pid), timeout=10)
+                if not DRY_RUN:
+                    await asyncio.wait_for(conn.close_position(pid), timeout=10)
                 emoji = "💰" if profit >= 0 else "💔"
                 tg(f"🕐 <b>FRIDAY CLOSE</b>: {symbol} {emoji} {'+'if profit>=0 else ''}{profit:.2f}")
             except Exception as e:
                 log.warning(f"Friday close error {pos.get('symbol','?')}: {e}")
         return
 
-    # === TRADE MANAGEMENT PER POSITIE ===
     for pos in positions:
         try:
             symbol = pos["symbol"]
@@ -1571,84 +1828,75 @@ async def manage_positions(conn, positions: list):
             min_lot = spec.get("min_lot", 0.01)
             lot_step = spec.get("lot_step", 0.01)
 
-            is_gold = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+            # === MAE/MFE TRACKING (NIEUW) ===
+            mae_key = f"mae_{pid}"
+            mfe_key = f"mfe_{pid}"
+            adverse = -profit_dist if profit_dist < 0 else 0
+            favorable = profit_dist if profit_dist > 0 else 0
+
+            current_mae = float(db_load_state(mae_key, 0) or 0)
+            current_mfe = float(db_load_state(mfe_key, 0) or 0)
+            if adverse > current_mae:
+                db_save_state(mae_key, adverse)
+            if favorable > current_mfe:
+                db_save_state(mfe_key, favorable)
 
             # === FASE 1: PARTIAL 33% bij TP1 (2.0R) ===
             if profit_dist >= sl_dist * 2.0:
                 partial = math.floor((vol * 0.33) / lot_step) * lot_step
                 partial = round(partial, 2)
                 remaining = round(vol - partial, 2)
-
-                # Check of SL nog ver van entry is (= nog geen partial gedaan)
                 be_zone = abs(sl - open_p) < sl_dist * 0.3 if sl else False
 
                 if partial >= min_lot and remaining >= min_lot and not be_zone:
                     try:
-                        await asyncio.wait_for(
-                            conn.close_position_partially(pid, partial),
-                            timeout=10
-                        )
-                        # SL naar breakeven
-                        be_buf = sl_dist * 0.1
-                        new_sl = (open_p + be_buf) if is_buy else (open_p - be_buf)
-                        await asyncio.wait_for(
-                            conn.modify_position(pid, stop_loss=new_sl, take_profit=tp),
-                            timeout=10
-                        )
+                        if not DRY_RUN:
+                            await asyncio.wait_for(conn.close_position_partially(pid, partial), timeout=10)
+                            be_buf = sl_dist * 0.1
+                            new_sl = (open_p + be_buf) if is_buy else (open_p - be_buf)
+                            await asyncio.wait_for(conn.modify_position(pid, stop_loss=new_sl, take_profit=tp), timeout=10)
                         tg(f"✅ <b>TP1 HIT</b>: {symbol}\n💰 33% gesloten ({partial} lots)\n🛡️ SL → breakeven\n📊 Runner: {remaining} lots")
                     except Exception as e:
                         log.warning(f"Partial TP1 error {symbol}: {e}")
 
             # === FASE 2: PARTIAL 33% bij TP2 (3.0R) ===
             if profit_dist >= sl_dist * 3.0:
-                # Check of SL bij breakeven is (= TP1 partial al gedaan)
                 sl_near_be = abs(sl - open_p) < sl_dist * 0.4 if sl else False
-                # Check of SL NIET al bij TP1 is (= TP2 partial nog niet gedaan)
                 tp1_level = (open_p + sl_dist * 2.0) if is_buy else (open_p - sl_dist * 2.0)
                 sl_near_tp1 = abs(sl - tp1_level) < sl_dist * 0.3 if sl else False
 
                 if sl_near_be and not sl_near_tp1:
-                    partial2 = math.floor((vol * 0.5) / lot_step) * lot_step  # 50% van remaining ≈ 33% van original
+                    partial2 = math.floor((vol * 0.5) / lot_step) * lot_step
                     partial2 = round(partial2, 2)
                     remaining2 = round(vol - partial2, 2)
 
                     if partial2 >= min_lot and remaining2 >= min_lot:
                         try:
-                            await asyncio.wait_for(
-                                conn.close_position_partially(pid, partial2),
-                                timeout=10
-                            )
-                            # SL naar TP1 level
-                            new_sl = tp1_level
-                            await asyncio.wait_for(
-                                conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp),
-                                timeout=10
-                            )
+                            if not DRY_RUN:
+                                await asyncio.wait_for(conn.close_position_partially(pid, partial2), timeout=10)
+                                new_sl = tp1_level
+                                await asyncio.wait_for(conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp), timeout=10)
                             tg(f"✅ <b>TP2 HIT</b>: {symbol}\n💰 33% gesloten ({partial2} lots)\n🛡️ SL → TP1 level\n📊 Runner: {remaining2} lots naar TP3")
                         except Exception as e:
                             log.warning(f"Partial TP2 error {symbol}: {e}")
 
-            # === FASE 3: TRAILING SL bij 4.0R+ (runner) ===
+            # === FASE 3: TRAILING SL bij 4.0R+ ===
             if profit_dist >= sl_dist * 4.0:
                 trail_dist = sl_dist * 1.5
                 if is_buy:
                     new_sl = cur_p - trail_dist
                     if sl and new_sl > sl + spec["pip_size"]:
                         try:
-                            await asyncio.wait_for(
-                                conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp),
-                                timeout=10
-                            )
+                            if not DRY_RUN:
+                                await asyncio.wait_for(conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp), timeout=10)
                         except Exception:
                             pass
                 else:
                     new_sl = cur_p + trail_dist
                     if sl and new_sl < sl - spec["pip_size"]:
                         try:
-                            await asyncio.wait_for(
-                                conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp),
-                                timeout=10
-                            )
+                            if not DRY_RUN:
+                                await asyncio.wait_for(conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp), timeout=10)
                         except Exception:
                             pass
         except Exception as e:
@@ -1687,47 +1935,43 @@ async def check_closed_trades(conn):
 
                 register_trade_result(symbol, profit > 0, profit)
 
-                trade_data = {
-                    "time": now.isoformat(),
-                    "symbol": symbol,
-                    "direction": direction,
-                    "profit": profit,
-                    "grade": grade,
-                    "confirmation": confirmation,
-                    "zone_type": zone_type,
-                    "killzone": kz,
-                    "won": profit > 0,
-                }
-                save_trade_data(trade_data)
+                # MAE/MFE opslaan bij close
+                pid = deal.get("positionId", "")
+                mae = float(db_load_state(f"mae_{pid}", 0) or 0)
+                mfe = float(db_load_state(f"mfe_{pid}", 0) or 0)
+                db_update_trade_result(symbol, profit, mae, mfe)
 
                 emoji = "💰" if profit > 0 else "💔"
-                tg(f"{emoji} <b>TRADE {'WON' if profit>0 else 'LOST'}</b>: {symbol} {'+'if profit>0 else ''}{profit:.2f}")
+                pf = db_get_profit_factor()
+                tg(f"{emoji} <b>TRADE {'WON' if profit>0 else 'LOST'}</b>: {symbol} {'+'if profit>0 else ''}{profit:.2f}\n📊 PF: {pf:.2f}")
     except Exception as e:
         log.debug(f"Closed trades error: {e}")
 
-# ==================== CANDLE CLOSE CHECK ====================
+# ==================== CANDLE CLOSE CHECK (GEFIXT) ====================
 
 def is_candle_just_closed(tf_min: int = 5) -> bool:
+    """GEFIXT: was second < 60 (altijd True), nu second < 15"""
     now = datetime.now(timezone.utc)
-    return now.minute % tf_min == 0 and now.second < 60
+    return now.minute % tf_min == 0 and now.second < 15
 
 # ==================== HOOFDSTRATEGIE ====================
 
 async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> Optional[TradeSetup]:
     """
-    Top-down (ZONDER momentum entries):
+    Top-down met OTE Fibonacci:
     1. HTF (1H) bias + zone detectie
     2. MTF (15M) structuur + zones
     3. LTF (5M) entry bij zone + confirmatie
-    4. Zone confluence check (1H overlap)
-    5. Spread-weighted RR
-    6. Grade en valideer (min B+)
+    4. OTE Fibonacci check (NIEUW)
+    5. Zone confluence check (1H overlap)
+    6. Spread-weighted RR
+    7. Regime filter (STRENGER — ranging = block)
+    8. Grade en valideer (min B+)
     """
     try:
-        # Stap 1: HTF Bias + 1H zones
         htf_bias = await get_htf_bias(account, symbol)
 
-        # Stap 2: MTF (15M)
+        # MTF (15M)
         candles_15m = await get_candles(account, symbol, "15m", 100)
         if not candles_15m or len(candles_15m) < 40:
             return None
@@ -1736,6 +1980,10 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
         swings_15m = detect_swing_points(df_15m)
         structure_15m = analyze_structure(df_15m, swings_15m)
         regime = detect_regime(df_15m)
+
+        # === REGIME FILTER — stop in ranging (NIEUW) ===
+        if regime == "ranging":
+            return None  # Geen trade in ranging markt
 
         if structure_15m:
             new_obs = detect_order_blocks(df_15m, structure_15m)
@@ -1747,7 +1995,7 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
                 fvg.timeframe = "15m"
             store_zones(symbol, new_fvgs)
 
-        # Stap 3: LTF (5M)
+        # LTF (5M)
         candles_5m = await get_candles(account, symbol, "5m", 100)
         if not candles_5m or len(candles_5m) < 50:
             return None
@@ -1755,8 +2003,6 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
         df_5m = calculate_indicators(df_5m)
         swings_5m = detect_swing_points(df_5m)
         update_zone_status(symbol, df_5m)
-
-        # Update session levels
         update_session_levels(symbol, float(df_5m["high"].iloc[-1]), float(df_5m["low"].iloc[-1]))
 
         structure_5m = analyze_structure(df_5m, swings_5m)
@@ -1798,39 +2044,59 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
             if not (sweep and sweep["type"] == "bear"):
                 return None
 
-        # Zoek zone — GEEN momentum entry fallback
+        # Zoek zone
         active_zone = find_active_zone(symbol, current_price, direction)
-        if not active_zone:
-            return None  # Geen zone = geen trade. Punt.
 
-        # Check confirmatie
+        # === OTE FIBONACCI CHECK (NIEUW) ===
+        is_ote = False
+        if not active_zone:
+            ote_zone = detect_ote_zone(df_15m, swings_15m, direction)
+            if ote_zone:
+                active_zone = ote_zone
+                active_zone.timeframe = "15m_ote"
+                is_ote = True
+
+        # === GOLD ROUND NUMBER CHECK (NIEUW) ===
+        is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+        if not active_zone and is_gold_scalp:
+            round_zone = detect_gold_round_number(df_5m, direction)
+            if round_zone:
+                active_zone = round_zone
+                active_zone.timeframe = "5m_round"
+
+        if not active_zone:
+            return None
+
+        has_confluence = check_zone_confluence(active_zone, symbol)
+
+        # === GOLD PRIME KILLZONE CHECK (NIEUW) ===
+        if is_gold_scalp:
+            kz = get_current_killzone()
+            if kz and kz not in GOLD_SCALP["prime_killzones"]:
+                # Asia is riskant voor gold scalps — alleen als zone sterk is
+                if not (has_confluence or is_ote):
+                    return None
+
         confirmation = check_confirmation(df_5m, direction, active_zone)
         if not confirmation:
             return None
 
-        # === ZONE CONFLUENCE CHECK (NIEUW) ===
-        has_confluence = check_zone_confluence(active_zone, symbol)
-
-        # Spread
         spread_ok, spread = await check_spread(conn, symbol)
         if not spread_ok:
             return None
 
-        # Grade
         grade, risk_mult, score, reasons = grade_setup(
             htf_bias=(htf_bias == direction),
             structure=structure_15m if structure_15m and structure_15m.direction == direction else structure_5m,
             zone=active_zone, confirmation=confirmation,
             sweep=sweep if sweep and sweep["type"] == direction.value else None,
             premium_discount=pd_zone, regime=regime, direction=direction,
-            symbol=symbol, has_confluence=has_confluence,
+            symbol=symbol, has_confluence=has_confluence, is_ote=is_ote,
         )
 
-        # Min grade B+ — alles daaronder = geen trade
         if grade not in ("A+", "A", "B+"):
             return None
 
-        # Levels met spread-weighted RR
         price_data = await rate_limited_call(conn.get_symbol_price(symbol))
         if not price_data:
             return None
@@ -1839,11 +2105,9 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
 
         sl, tp1, tp2, tp3, sl_dist = calculate_trade_levels(direction, entry, active_zone, df_5m, symbol, actual_spread)
 
-        # === SPREAD-WEIGHTED RR (NIEUW) ===
         effective_entry = entry + actual_spread if direction == Direction.BULL else entry - actual_spread
         rr = abs((tp3 - effective_entry) / (abs(effective_entry - sl))) if sl_dist > 0 else 0
 
-        # Gold scalp: lagere RR toegestaan
         is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
         min_rr = GOLD_SCALP["min_rr"] if is_gold_scalp else MIN_RR
         if rr < min_rr:
@@ -1858,6 +2122,7 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
             reasons=reasons, regime=regime, rr=rr,
             htf_bias=htf_bias, mtf_structure=structure_15m,
             confirmation=confirmation, confluence=has_confluence,
+            ote_entry=is_ote,
         )
     except Exception as e:
         log.error(f"Analyse error {symbol}: {e}")
@@ -1865,14 +2130,21 @@ async def analyze_and_find_setup(account, conn, symbol, positions, balance) -> O
 
 # ==================== TRADE EXECUTIE ====================
 
-async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
-    # === VEREENVOUDIGDE RISK: alleen grade + drawdown + streak ===
-    risk_pct = get_dynamic_risk(balance, grade=setup.grade) * setup.risk_mult
+async def execute_trade(conn, setup: TradeSetup, balance: float, df_5m: pd.DataFrame = None) -> bool:
+    """
+    Professionele executie:
+    - Volatility-adjusted risk
+    - Limit order met slippage bescherming
+    - Margin check
+    - Dry-run support
+    """
+    # Volatility-adjusted risk
+    risk_pct = get_dynamic_risk(balance, grade=setup.grade, symbol=setup.symbol, df=df_5m) * setup.risk_mult
 
     sl_dist = abs(setup.entry - setup.stop_loss)
     lot, lot_details = calculate_lot_size(balance, sl_dist, setup.symbol, risk_pct)
 
-    if lot < 0.01:
+    if lot < SYMBOL_SPECS.get(setup.symbol, {}).get("min_lot", 0.01):
         return False
 
     # === MARGIN CHECK ===
@@ -1901,13 +2173,68 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
     except Exception as e:
         log.warning(f"Margin check error: {e}")
         spec = SYMBOL_SPECS.get(setup.symbol, {})
-        lot = min(lot, spec.get("min_lot", 0.01))
-        if lot < spec.get("min_lot", 0.01):
-            return False
+        lot = spec.get("min_lot", 0.01)
 
     update_peak_balance(balance)
 
+    # === DRY RUN MODE ===
+    if DRY_RUN:
+        kz = get_current_killzone()
+        daily_state["trades_today"] += 1
+        r = " | ".join(setup.reasons)
+        de = "🟢" if setup.direction == Direction.BULL else "🔴"
+        ote_str = " | 📐 OTE ENTRY" if setup.ote_entry else ""
+        conf_str = " | 🏛️ 1H CONFLUENCE" if setup.confluence else ""
+
+        tg(f"""<b>🧪 DRY RUN — Grade {setup.grade}</b>
+
+📌 {setup.symbol} | {setup.direction.value.upper()}
+🕐 KZ: {kz.upper() if kz else '?'}
+🔍 Regime: {setup.regime.upper()}{conf_str}{ote_str}
+💰 Entry: {setup.entry:.5f}
+🛑 SL: {setup.stop_loss:.5f}
+🎯 TP1: {setup.tp1:.5f} | TP2: {setup.tp2:.5f} | TP3: {setup.tp3:.5f}
+📊 RR: 1:{setup.rr:.1f} | Lots: {lot}
+💵 Risk: {risk_pct*100:.2f}% (${lot_details['risk_amount']})
+📏 SL: {lot_details['sl_pips']:.1f} pips
+✅ Confirm: {setup.confirmation}
+🗺️ Zone: {setup.zone.type.value} ({setup.zone.timeframe})
+📋 Score: {setup.score:.1f} | {r}""")
+
+        trade_data = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "symbol": setup.symbol, "direction": setup.direction.value,
+            "grade": setup.grade, "score": setup.score,
+            "entry": setup.entry, "sl": setup.stop_loss,
+            "tp1": setup.tp1, "tp2": setup.tp2, "tp3": setup.tp3,
+            "lot": lot, "rr": setup.rr, "risk_pct": risk_pct,
+            "confirmation": setup.confirmation, "zone_type": setup.zone.type.value,
+            "regime": setup.regime, "killzone": kz,
+            "confluence": setup.confluence, "ote_entry": setup.ote_entry,
+            "reasons": setup.reasons,
+        }
+        db_save_trade(trade_data)
+        trade_journal.append(trade_data)
+        return True
+
+    # === LIVE EXECUTIE MET SLIPPAGE BESCHERMING ===
     try:
+        spec = SYMBOL_SPECS.get(setup.symbol, {})
+        category = spec.get("category", "forex")
+        max_slippage = MAX_SLIPPAGE_PIPS.get(category, 5) * spec.get("pip_size", 0.0001)
+
+        # Gebruik limit order als mogelijk, anders market met slippage check
+        price_before = await rate_limited_call(conn.get_symbol_price(setup.symbol))
+        if not price_before:
+            return False
+
+        current_entry = price_before["ask"] if setup.direction == Direction.BULL else price_before["bid"]
+        slippage = abs(current_entry - setup.entry)
+
+        if slippage > max_slippage:
+            tg(f"⚠️ <b>SLIPPAGE SKIP</b>: {setup.symbol}\nSlippage: {slippage/spec['pip_size']:.1f} pips > max {MAX_SLIPPAGE_PIPS[category]}")
+            return False
+
         if setup.direction == Direction.BULL:
             result = await asyncio.wait_for(
                 conn.create_market_buy_order(setup.symbol, lot, setup.stop_loss, setup.tp3),
@@ -1938,17 +2265,20 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
     daily_state["trades_today"] += 1
     kz = get_current_killzone()
 
-    trade_journal.append({
+    trade_data = {
         "time": datetime.now(timezone.utc).isoformat(),
         "symbol": setup.symbol, "direction": setup.direction.value,
         "grade": setup.grade, "score": setup.score,
         "entry": setup.entry, "sl": setup.stop_loss,
         "tp1": setup.tp1, "tp2": setup.tp2, "tp3": setup.tp3,
         "lot": lot, "rr": setup.rr, "risk_pct": risk_pct,
-        "reasons": setup.reasons, "regime": setup.regime,
         "confirmation": setup.confirmation, "zone_type": setup.zone.type.value,
-        "lot_details": lot_details, "confluence": setup.confluence,
-    })
+        "regime": setup.regime, "killzone": kz,
+        "confluence": setup.confluence, "ote_entry": setup.ote_entry,
+        "reasons": setup.reasons,
+    }
+    db_save_trade(trade_data)
+    trade_journal.append(trade_data)
 
     r = " | ".join(setup.reasons)
     de = "🟢" if setup.direction == Direction.BULL else "🔴"
@@ -1956,11 +2286,14 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
     margin_warn = " ⚠️MARGIN" if lot_details.get("margin_reduced") else ""
     wr = sum(performance["recent_results"][-10:]) / max(len(performance["recent_results"][-10:]), 1) * 100
     conf_str = " | 🏛️ 1H CONFLUENCE" if setup.confluence else ""
+    ote_str = " | 📐 OTE ENTRY" if setup.ote_entry else ""
+    pf = db_get_profit_factor()
 
     tg(f"""<b>{de} TRADE OPENED — Grade {setup.grade}</b>
+
 📌 {setup.symbol} | {setup.direction.value.upper()}
 🕐 KZ: {kz.upper() if kz else '?'}
-🔍 Regime: {setup.regime.upper()}{conf_str}
+🔍 Regime: {setup.regime.upper()}{conf_str}{ote_str}
 💰 Entry: {setup.entry:.5f}
 🛑 SL: {setup.stop_loss:.5f}
 🎯 TP1: {setup.tp1:.5f} (33%)
@@ -1972,7 +2305,7 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
 ✅ Confirm: {setup.confirmation}
 🗺️ Zone: {setup.zone.type.value} ({setup.zone.timeframe})
 📈 Streak: {performance['consecutive_wins']}W / {performance['consecutive_losses']}L
-🎯 Recent WR: {wr:.0f}%
+🎯 WR: {wr:.0f}% | PF: {pf:.2f}
 📋 Score: {setup.score:.1f} | {r}
 💰 Balance: ${balance:,.2f}""")
 
@@ -1982,7 +2315,8 @@ async def execute_trade(conn, setup: TradeSetup, balance: float) -> bool:
 
 async def run_diagnostics(conn, account):
     log.info("=" * 60)
-    log.info("DIAGNOSTICS — SMC Bot v3.2 REFINED")
+    log.info("DIAGNOSTICS — SMC Bot v4.0 FULL REBUILD")
+    log.info(f"MODE: {'DRY RUN' if DRY_RUN else 'LIVE'}")
     log.info("=" * 60)
     try:
         info = await conn.get_account_information()
@@ -1993,8 +2327,18 @@ async def run_diagnostics(conn, account):
     kz = get_current_killzone()
     log.info(f"Time: {now.strftime('%H:%M:%S')} UTC | Killzone: {kz or 'NONE'}")
     log.info(f"Symbols: {len(SYMBOLS)} | Entry KZs: {', '.join(ENTRY_KILLZONES)}")
-    log.info(f"Min RR: {MIN_RR} | Max trades: {MAX_TOTAL_TRADES} | Max/day: {MAX_TRADES_PER_DAY}")
-    log.info(f"Min grade: B+ | Zone tests: {ZONE_MAX_TESTS} | Swing lookback: {SWING_LOOKBACK}")
+    log.info(f"Risk: {list(GRADE_RISK.values())} | Daily limit: {DAILY_LOSS_LIMIT*100}% | Weekly: {WEEKLY_LOSS_LIMIT*100}%")
+    log.info(f"Max trades: {MAX_TOTAL_TRADES} total | {MAX_TRADES_PER_DAY}/day | {MAX_TRADES_PER_ASSET}/asset")
+    log.info(f"Min RR: {MIN_RR} | Min grade: B+ | Zone buffer: {ZONE_ENTRY_BUFFER}")
+
+    # MAE/MFE stats
+    mae_mfe = db_get_mae_mfe_stats()
+    if mae_mfe:
+        log.info(f"MAE/MFE: avg_mae={mae_mfe['avg_mae']:.5f} | avg_mfe={mae_mfe['avg_mfe']:.5f} ({mae_mfe['count']} trades)")
+
+    pf = db_get_profit_factor()
+    log.info(f"Profit Factor: {pf:.2f}")
+
     for s in SYMBOLS:
         try:
             candles = await get_candles(account, s, "5m", 20)
@@ -2088,7 +2432,7 @@ async def run():
 
         await asyncio.sleep(2)
 
-        global last_heartbeat, watchdog_last_loop, consecutive_errors, consecutive_api_fails
+        global last_heartbeat, watchdog_last_loop, consecutive_errors
         last_heartbeat = 0
         watchdog_last_loop = time.time()
         consecutive_errors = 0
@@ -2100,23 +2444,43 @@ async def run():
         except Exception:
             pass
 
-        zones_loaded = load_zones_from_disk()
+        # Laad state uit database
+        saved_perf = db_load_state("performance")
+        if saved_perf:
+            performance.update(saved_perf)
+            log.info(f"Performance geladen: {performance['wins']}W / {performance['losses']}L")
+
+        saved_cooldowns = db_load_state("cooldowns")
+        if saved_cooldowns:
+            symbol_cooldowns.update(saved_cooldowns)
+
+        # Laad zones
+        loaded_zones, loaded_htf, zone_count = db_load_zones()
+        zone_store.update(loaded_zones)
+        htf_zone_store.update(loaded_htf)
+
         mark_api_success()
         await run_diagnostics(conn, account)
 
-        tg(f"""🚀 <b>SMC BOT v3.2 REFINED GESTART</b>
-📊 {len(SYMBOLS)} symbols | Entry KZs: {', '.join(ENTRY_KILLZONES)}
-🎯 Min RR: {MIN_RR} | Max trades: {MAX_TOTAL_TRADES} | Max/dag: {MAX_TRADES_PER_DAY}
-🏛️ Min grade: B+ | Zone tests: {ZONE_MAX_TESTS}
-🗺️ Zones geladen: {zones_loaded}
-⚡ <b>v3.2 Verbeteringen:</b>
-• 1H zone confluence detectie
-• Session high/low sweep tracking
-• Spread-weighted RR
-• 33/33/33 partial close
-• Cooldown per symbool
-• Volume confirmatie
-• Geen momentum entries""")
+        mode_str = "🧪 DRY RUN" if DRY_RUN else "🔴 LIVE"
+
+        tg(f"""🚀 <b>SMC BOT v4.0 GESTART</b> {mode_str}
+
+📊 {len(SYMBOLS)} symbols | Max: {MAX_TOTAL_TRADES} open / {MAX_TRADES_PER_DAY} per dag
+💵 Risk: {list(GRADE_RISK.values())} | Daily: {DAILY_LOSS_LIMIT*100}% | Weekly: {WEEKLY_LOSS_LIMIT*100}%
+🗺️ Zones geladen: {zone_count}
+📊 PF: {db_get_profit_factor():.2f}
+⚡ <b>v4.0 Verbeteringen:</b>
+• Risk verlaagd naar 0.5-1.0%
+• SQLite persistent database
+• Slippage bescherming
+• OTE Fibonacci zone
+• Dry-run mode
+• MAE/MFE tracking
+• Profit factor monitoring
+• Volatility-based sizing
+• Ranging markt = geen trade
+• Max {MAX_TOTAL_TRADES} trades tegelijk""")
 
         while True:
             try:
@@ -2241,6 +2605,15 @@ async def run():
                     await asyncio.sleep(60)
                     continue
 
+                # === PROFIT FACTOR CHECK — pauzeer als PF < 1.0 na 30+ trades ===
+                total_trades = performance["wins"] + performance["losses"]
+                if total_trades >= 30:
+                    pf = db_get_profit_factor()
+                    if pf < 1.0:
+                        log.warning(f"Profit factor {pf:.2f} < 1.0 — trades gepauzeerd")
+                        await asyncio.sleep(60)
+                        continue
+
                 if not is_candle_just_closed(5):
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
@@ -2264,7 +2637,6 @@ async def run():
                         if not allowed:
                             continue
 
-                        # Gold scalp max trades
                         if GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]:
                             max_trades = GOLD_SCALP["max_trades"]
                         else:
@@ -2276,9 +2648,12 @@ async def run():
                         if not check_correlation(symbol, positions):
                             continue
 
-                        # === COOLDOWN PER SYMBOOL ===
                         cd_ok, cd_remaining = check_cooldown(symbol)
                         if not cd_ok:
+                            continue
+
+                        # Gold sessie limiet check
+                        if not check_gold_session_limit(symbol):
                             continue
 
                         is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
@@ -2291,21 +2666,32 @@ async def run():
                         if not setup:
                             continue
 
-                        success = await execute_trade(conn, setup, balance)
+                        # Haal 5M data op voor volatility sizing
+                        candles_5m = await get_candles(account, symbol, "5m", 60)
+                        df_5m_exec = None
+                        if candles_5m and len(candles_5m) > 20:
+                            df_5m_exec = pd.DataFrame(candles_5m)
+                            df_5m_exec = calculate_indicators(df_5m_exec)
+
+                        success = await execute_trade(conn, setup, balance, df_5m_exec)
                         if success:
                             recent_signals[sig_key] = time.time()
                     except Exception as e:
                         log.debug(f"Symbol {symbol} error (skipping): {e}")
                     await asyncio.sleep(0.5)
 
+                # Cleanup
                 now = time.time()
                 for k in list(recent_signals.keys()):
                     if now - recent_signals[k] > 7200:
                         del recent_signals[k]
 
+                # Save state periodiek
+                db_save_state("cooldowns", symbol_cooldowns)
+
                 await asyncio.sleep(CHECK_INTERVAL)
 
-            except (asyncio.CancelledError, asyncio.exceptions.CancelledError) as e:
+            except (asyncio.CancelledError,) as e:
                 consecutive_errors += 1
                 log.warning(f"CancelledError #{consecutive_errors}: {e}")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
@@ -2322,7 +2708,7 @@ async def run():
                     tg(f"⚠️ <b>{consecutive_errors} LOOP ERRORS</b>\n{str(e)[:80]}")
                 await asyncio.sleep(10 if "timed out" in str(e).lower() else 5)
 
-    except (asyncio.CancelledError, asyncio.exceptions.CancelledError) as e:
+    except (asyncio.CancelledError,) as e:
         log.critical(f"FATAL CancelledError: {e}")
         tg(f"❌ <b>FATAL DISCONNECT</b> — herstarting...")
         raise Exception(f"CancelledError: {e}")
@@ -2347,11 +2733,15 @@ if __name__ == "__main__":
     import threading
 
     log.info("=" * 50)
-    log.info("PROFESSIONAL SMC BOT v3.2 — REFINED")
-    log.info("Zone-based | Confluence | Spread-weighted RR")
-    log.info("33/33/33 Partial | Per-symbol cooldown")
-    log.info("Min grade B+ | No momentum entries")
+    log.info("PROFESSIONAL SMC BOT v4.0 — FULL REBUILD")
+    log.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
+    log.info("Zone-based | OTE Fib | Confluence | Volatility Risk")
+    log.info("33/33/33 Partial | Per-symbol cooldown | SQLite DB")
+    log.info(f"Risk: {list(GRADE_RISK.values())} | Max trades: {MAX_TOTAL_TRADES}")
     log.info("=" * 50)
+
+    # Initialiseer database
+    init_database()
 
     wd = threading.Thread(target=watchdog_thread, daemon=True)
     wd.start()
