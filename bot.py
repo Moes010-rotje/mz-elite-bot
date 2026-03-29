@@ -2675,8 +2675,7 @@ async def run_diagnostics(conn, account, state: BotState):
 
 # ==================== HOOFDLOOP ====================
 
-async def run():
-    state = BotState()
+async def run(state: BotState):
 
     # Graceful shutdown handler
     def handle_shutdown(signum, frame):
@@ -3120,7 +3119,7 @@ if __name__ == "__main__":
             restart_count += 1
             if restart_count > 1:
                 tg(f"🔄 <b>AUTO RESTART #{restart_count}</b>", _boot_state)
-            asyncio.run(run())
+            asyncio.run(run(_boot_state))
             # Als run() normaal eindigt (graceful shutdown), stop
             if _boot_state.shutdown_requested:
                 log.info("Graceful shutdown — geen restart")
