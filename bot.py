@@ -2833,6 +2833,7 @@ async def run(state: BotState):
 
                     for attempt in range(3):
                         try:
+                            state.watchdog_last_loop = time.time()  # Watchdog: we leven nog
                             log.info(f"Soft reconnect {attempt + 1}/3...")
                             try:
                                 await conn.close()
@@ -2855,6 +2856,7 @@ async def run(state: BotState):
                     if not reconnected:
                         log.info("Soft reconnect failed — wacht 2 min...")
                         state.consecutive_api_fails = 0
+                        state.watchdog_last_loop = time.time()  # Watchdog: we leven nog
                         await asyncio.sleep(120)
                         try:
                             conn = account.get_rpc_connection()
@@ -2870,6 +2872,7 @@ async def run(state: BotState):
 
                     if not reconnected:
                         log.info("Trying undeploy/redeploy...")
+                        state.watchdog_last_loop = time.time()  # Watchdog: we leven nog
                         try:
                             await account.undeploy()
                             await asyncio.sleep(15)
@@ -2889,7 +2892,10 @@ async def run(state: BotState):
                     if not reconnected:
                         state.consecutive_api_fails = 0
                         tg("⚠️ <b>CONNECTION DOWN</b> — wacht 5 min...", state)
-                        await asyncio.sleep(300)
+                        # Split 5 min in stukken zodat watchdog niet triggert
+                        for _ in range(10):
+                            state.watchdog_last_loop = time.time()
+                            await asyncio.sleep(30)
                         try:
                             conn = account.get_rpc_connection()
                             await conn.connect()
