@@ -2896,21 +2896,19 @@ async def run(state: BotState):
                             log.error(f"Redeploy failed: {e}")
 
                     if not reconnected:
-                        state.consecutive_api_fails = 0
-                        tg("⚠️ <b>CONNECTION DOWN</b> — wacht 5 min...", state)
-                        # Split 5 min in stukken zodat watchdog niet triggert
-                        for _ in range(10):
-                            state.watchdog_last_loop = time.time()
-                            await asyncio.sleep(30)
+                        # ALLE reconnect pogingen gefaald — SDK instance is corrupt
+                        # Force een volledige herstart met verse MetaApi instance
+                        tg("🔄 <b>FULL RESTART</b> — alle reconnects gefaald, SDK wordt opnieuw aangemaakt...", state)
+                        log.error("All reconnect attempts failed — forcing full restart with fresh SDK instance")
+
+                        # Cleanup huidige connectie
                         try:
-                            conn = account.get_rpc_connection()
-                            await conn.connect()
-                            await asyncio.wait_for(conn.wait_synchronized(), timeout=60)
-                            state.consecutive_api_fails = 0
-                            tg("✅ <b>RECOVERED</b> na 5 min", state)
+                            await conn.close()
                         except Exception:
-                            log.warning("Nog steeds geen connectie")
-                        continue
+                            pass
+
+                        # Gooi exception om de outer restart loop te triggeren
+                        raise Exception("All reconnect attempts exhausted — need fresh MetaApi instance")
 
                 kz = get_current_killzone()
 
@@ -3143,6 +3141,13 @@ if __name__ == "__main__":
         except Exception as e:
             tg(f"💥 <b>CRASH #{restart_count}</b>: {str(e)[:80]}\n🔄 Restart in 15s...", _boot_state)
             log.error(f"Crash #{restart_count}: {e}")
-            wait = min(15 * restart_count, 60)
+            # Reset connection state voor verse start (behoud performance data)
+            _boot_state.consecutive_api_fails = 0
+            _boot_state.consecutive_errors = 0
+            _boot_state.connection_healthy = True
+            _boot_state.shutdown_requested = False
+            _boot_state.last_reconnect_heartbeat = 0
+            _boot_state.watchdog_last_loop = time.time()
+            wait = min(15 * restart_count, 120)  # Max 2 min wacht
             log.info(f"Restart in {wait}s...")
             time.sleep(wait)
