@@ -335,12 +335,12 @@ MIN_SL_PIPS = {
 COOLDOWN_AFTER_LOSSES = 3
 COOLDOWN_MINUTES = 45
 ZONE_MAX_AGE_HOURS = 48
-ZONE_MAX_TESTS = 1
+ZONE_MAX_TESTS = 2           # Was 1 — zones werden na 1 check verbrand
 MAX_API_CALLS_PER_MIN = 50
 SWING_LOOKBACK = 3
-MIN_REJECTION_WICK_RATIO = 0.45
-MIN_ENGULFING_BODY_RATIO = 1.1
-MIN_STRONG_CLOSE_BODY_RATIO = 1.5
+MIN_REJECTION_WICK_RATIO = 0.35    # Was 0.45 — te streng voor 5M candles
+MIN_ENGULFING_BODY_RATIO = 1.0     # Was 1.1 — net iets groter is al engulfing
+MIN_STRONG_CLOSE_BODY_RATIO = 1.3  # Was 1.5 — 1.3x avg is al sterk
 
 # === ZONE BUFFER ===
 ZONE_ENTRY_BUFFER = 0.1
@@ -2272,8 +2272,8 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         structure_15m = analyze_structure(df_15m, swings_15m)
         regime = detect_regime(df_15m)
 
-        if regime == "ranging":
-            return None
+        # Regime wordt meegenomen in grading als score penalty (-3 voor ranging)
+        # GEEN hard block meer — was redundant en te streng
 
         if structure_15m:
             new_obs = detect_order_blocks(df_15m, structure_15m)
@@ -2310,7 +2310,7 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         pd_zone = get_premium_discount(df_15m, swings_15m)
         current_price = float(df_5m["close"].iloc[-1])
 
-        # Bepaal richting
+        # Bepaal richting — versoepeld: BOS alleen is nu ook voldoende
         direction = None
         if htf_bias == Direction.BULL and (not structure_15m or structure_15m.direction == Direction.BULL):
             direction = Direction.BULL
@@ -2322,16 +2322,22 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
             direction = htf_bias
         elif structure_15m and structure_15m.type == StructureType.BOS:
             direction = structure_15m.direction
+        # FIX 5: Als 5M structuur er is maar 15M niet, gebruik 5M
+        elif structure_5m:
+            direction = structure_5m.direction
 
         if not direction:
+            log.debug(f"  {symbol}: geen richting (htf={htf_bias}, 15m_struct={structure_15m is not None}, 5m_struct={structure_5m is not None})")
             return None
 
         # P/D filter
         if direction == Direction.BULL and pd_zone == "premium":
             if not (sweep and sweep["type"] == "bull"):
+                log.debug(f"  {symbol}: BULL in premium zonder sweep")
                 return None
         if direction == Direction.BEAR and pd_zone == "discount":
             if not (sweep and sweep["type"] == "bear"):
+                log.debug(f"  {symbol}: BEAR in discount zonder sweep")
                 return None
 
         # Zoek zone
@@ -2355,6 +2361,9 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
                 active_zone.timeframe = "5m_round"
 
         if not active_zone:
+            zone_count = len(state.zone_store.get(symbol, []))
+            valid_zones = len([z for z in state.zone_store.get(symbol, []) if z.is_valid and z.direction == direction])
+            log.debug(f"  {symbol}: geen zone bij prijs {current_price:.2f} ({direction.value}) — {zone_count} zones, {valid_zones} valid in richting")
             return None
 
         has_confluence = check_zone_confluence(state, active_zone, symbol)
@@ -2368,10 +2377,12 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
 
         confirmation = check_confirmation(df_5m, direction, active_zone)
         if not confirmation:
+            log.info(f"  📍 {symbol}: IN ZONE ({active_zone.type.value} {active_zone.timeframe}) — wacht op confirmatie candle")
             return None
 
         spread_ok, spread = await check_spread(conn, symbol, state)
         if not spread_ok:
+            log.info(f"  ❌ {symbol}: spread te hoog")
             return None
 
         # FIX: htf_aligned is nu altijd een bool
@@ -2388,6 +2399,7 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         )
 
         if grade not in ("A+", "A", "B+"):
+            log.info(f"  ❌ {symbol}: grade {grade} (score {score:.1f}) te laag — {' | '.join(reasons[:5])}")
             return None
 
         price_data = await rate_limited_call(conn.get_symbol_price(symbol), state, label=f"price_{symbol}")
@@ -2403,9 +2415,13 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
 
         min_rr = GOLD_SCALP["min_rr"] if is_gold_scalp else MIN_RR
         if rr < min_rr:
+            log.info(f"  ❌ {symbol}: RR {rr:.1f} < min {min_rr}")
             return None
 
+        # Zone pas markeren als ALLE checks geslaagd zijn
         mark_zone_tested(active_zone)
+
+        log.info(f"  ✅ {symbol}: SETUP GEVONDEN — {grade} (score {score:.1f}) RR 1:{rr:.1f} {direction.value.upper()}")
 
         return TradeSetup(
             symbol=symbol, direction=direction, entry=entry,
@@ -3090,6 +3106,11 @@ async def run(state: BotState):
                     except Exception as e:
                         log.warning(f"Symbol {symbol} error (skipping): {e}")
                     await asyncio.sleep(0.5)
+
+                # Scan summary
+                total_zones = sum(len([z for z in zl if z.is_valid]) for zl in state.zone_store.values())
+                total_htf = sum(len([z for z in zl if z.is_valid]) for zl in state.htf_zone_store.values())
+                log.info(f"📊 Scan klaar | Zones: {total_zones} (LTF) + {total_htf} (HTF) | KZ: {get_current_killzone() or 'NONE'}")
 
                 cleanup_recent_signals(state)
                 db_save_state("cooldowns", state.symbol_cooldowns)
