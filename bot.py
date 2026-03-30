@@ -2832,7 +2832,6 @@ async def run(state: BotState):
         while not state.shutdown_requested:
             try:
                 state.watchdog_last_loop = time.time()
-                state.consecutive_errors = 0
 
                 # Weekend check — ICMarkets gesloten vr 22:00 - zo 22:00 UTC
                 now_utc = datetime.now(timezone.utc)
@@ -2933,18 +2932,33 @@ async def run(state: BotState):
 
                     if not reconnected:
                         # ALLE reconnect pogingen gefaald — SDK instance is corrupt
-                        # Force een volledige herstart met verse MetaApi instance
-                        tg("🔄 <b>FULL RESTART</b> — alle reconnects gefaald, SDK wordt opnieuw aangemaakt...", state)
-                        log.error("All reconnect attempts failed — forcing full restart with fresh SDK instance")
+                        # asyncio.run() in dezelfde process hergebruikt SDK singleton state
+                        # ENIGE fix: kill process, laat Railway/Docker opnieuw starten
+                        tg("🔄 <b>PROCESS RESTART</b> — alle reconnects gefaald, process wordt gekilld voor schone herstart...", state)
+                        log.error("All reconnect attempts failed — flushing DB and killing process")
 
-                        # Cleanup huidige connectie
+                        # Flush database zodat niets verloren gaat
+                        try:
+                            db_save_state("performance", state.performance)
+                            db_save_state("cooldowns", state.symbol_cooldowns)
+                            db_save_zones_bulk(state.zone_store, htf=False)
+                            db_save_zones_bulk(state.htf_zone_store, htf=True)
+                            log.info("DB flushed successfully before exit")
+                        except Exception as flush_err:
+                            log.error(f"DB flush failed: {flush_err}")
+
+                        # Cleanup connectie
                         try:
                             await conn.close()
                         except Exception:
                             pass
 
-                        # Gooi exception om de outer restart loop te triggeren
-                        raise Exception("All reconnect attempts exhausted — need fresh MetaApi instance")
+                        # Wacht 30s zodat Railway niet te snel herstart (rate limit bescherming)
+                        log.info("Wacht 30s voor process exit...")
+                        await asyncio.sleep(30)
+
+                        # HARD EXIT — Railway herstart container met verse process + SDK
+                        os._exit(1)
 
                 kz = get_current_killzone()
 
@@ -3080,6 +3094,7 @@ async def run(state: BotState):
                 cleanup_recent_signals(state)
                 db_save_state("cooldowns", state.symbol_cooldowns)
 
+                state.consecutive_errors = 0  # Reset alleen na succesvolle loop
                 await asyncio.sleep(CHECK_INTERVAL)
 
             except asyncio.CancelledError as e:
@@ -3091,13 +3106,15 @@ async def run(state: BotState):
                 await asyncio.sleep(15)
             except Exception as e:
                 state.consecutive_errors += 1
+                err_str = str(e)
+
                 log.error(f"Loop error #{state.consecutive_errors}: {e}")
                 if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    tg(f"🚨 <b>{MAX_CONSECUTIVE_ERRORS} CONSECUTIVE ERRORS</b> — force restart\n{str(e)[:60]}", state)
+                    tg(f"🚨 <b>{MAX_CONSECUTIVE_ERRORS} CONSECUTIVE ERRORS</b> — force restart\n{err_str[:60]}", state)
                     raise Exception(f"Too many consecutive errors: {state.consecutive_errors}")
                 if state.consecutive_errors % 5 == 0:
-                    tg(f"⚠️ <b>{state.consecutive_errors} LOOP ERRORS</b>\n{str(e)[:80]}", state)
-                await asyncio.sleep(10 if "timed out" in str(e).lower() else 5)
+                    tg(f"⚠️ <b>{state.consecutive_errors} LOOP ERRORS</b>\n{err_str[:80]}", state)
+                await asyncio.sleep(10 if "timed out" in err_str.lower() else 5)
 
         # Graceful shutdown
         log.info("Graceful shutdown compleet")
