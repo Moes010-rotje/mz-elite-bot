@@ -681,53 +681,43 @@ def tg(msg: str, state: 'BotState' = None):
 
 # ==================== UNIFIED RATE LIMITED CALL ====================
 
-async def rate_limited_call(coro, state: 'BotState', retries: int = 3,
-                            timeout: int = 30, label: str = "API"):
+async def rate_limited_call(coro, state: 'BotState', timeout: int = 30, label: str = "API"):
     """
-    Enkele wrapper voor alle API calls — vervangt safe_call + rate_limited_call.
-    Consistente rate limiting, retry logic en error handling.
+    Enkele wrapper voor alle API calls.
+    GEEN retries — coroutines kunnen niet opnieuw ge-await worden.
+    Increment fail counter op ELKE failure zodat reconnect altijd triggert.
     """
-    for attempt in range(retries):
-        try:
-            now = time.time()
-            if now - state.api_call_reset_time > 60:
-                state.api_call_count = 0
-                state.api_call_reset_time = now
-            if state.api_call_count >= MAX_API_CALLS_PER_MIN:
-                wait = 60 - (now - state.api_call_reset_time)
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                state.api_call_count = 0
-                state.api_call_reset_time = time.time()
+    try:
+        now = time.time()
+        if now - state.api_call_reset_time > 60:
+            state.api_call_count = 0
+            state.api_call_reset_time = now
+        if state.api_call_count >= MAX_API_CALLS_PER_MIN:
+            wait = 60 - (now - state.api_call_reset_time)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            state.api_call_count = 0
+            state.api_call_reset_time = time.time()
 
-            state.api_call_count += 1
-            result = await asyncio.wait_for(coro, timeout=timeout)
-            state.consecutive_api_fails = 0
-            return result
+        state.api_call_count += 1
+        result = await asyncio.wait_for(coro, timeout=timeout)
+        state.consecutive_api_fails = 0
+        return result
 
-        except asyncio.TimeoutError:
-            log.warning(f"{label} timeout (poging {attempt+1}/{retries})")
-            await asyncio.sleep(2 * (attempt + 1))
+    except asyncio.TimeoutError:
+        state.consecutive_api_fails += 1
+        log.warning(f"{label} timeout (fails: {state.consecutive_api_fails})")
+        return None
 
-        except asyncio.CancelledError:
-            state.consecutive_api_fails += 1
-            log.warning(f"{label} CancelledError (WebSocket disconnect)")
-            return None
+    except asyncio.CancelledError:
+        state.consecutive_api_fails += 1
+        log.warning(f"{label} CancelledError (fails: {state.consecutive_api_fails})")
+        return None
 
-        except Exception as e:
-            err = str(e).lower()
-            if "not connected" in err or "not synchronized" in err or "socket" in err:
-                state.consecutive_api_fails += 1
-                log.warning(f"{label} connection error: {e}")
-                await asyncio.sleep(3)
-            elif attempt < retries - 1:
-                log.warning(f"{label} error (poging {attempt+1}): {e}")
-                await asyncio.sleep(2)
-            else:
-                log.warning(f"{label} failed after {retries}: {e}")
-                state.consecutive_api_fails += 1
-
-    return None
+    except Exception as e:
+        state.consecutive_api_fails += 1
+        log.warning(f"{label} error (fails: {state.consecutive_api_fails}): {e}")
+        return None
 
 
 def needs_reconnect(state: BotState) -> bool:
@@ -781,7 +771,7 @@ async def get_dynamic_pip_value(conn, symbol: str, state: BotState) -> Optional[
     # Dynamisch berekenen voor JPY pairs
     try:
         price = await rate_limited_call(
-            conn.get_symbol_price(symbol), state, retries=2, timeout=10, label=f"pip_val_{symbol}")
+            conn.get_symbol_price(symbol), state, timeout=10, label=f"pip_val_{symbol}")
         if price and price.get("bid", 0) > 0:
             rate = price["bid"]
             pip_value = (spec["pip_size"] / rate) * spec["contract"]
@@ -805,7 +795,7 @@ async def get_candles(account, symbol: str, timeframe: str, count: int, state: B
     try:
         result = await rate_limited_call(
             account.get_historical_candles(symbol, timeframe, start),
-            state, retries=2, timeout=20, label=f"candles_{symbol}_{timeframe}"
+            state, timeout=20, label=f"candles_{symbol}_{timeframe}"
         )
         return result
     except Exception as e:
@@ -823,7 +813,10 @@ async def send_heartbeat(conn, state: BotState):
     try:
         info = await rate_limited_call(conn.get_account_information(), state, label="heartbeat")
         if not info or "balance" not in info:
-            tg(f"💓 <b>HEARTBEAT</b> (limited)\n⚠️ Account info niet beschikbaar\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC", state)
+            # Force reconnect — als heartbeat geen data kan halen is connectie dood
+            state.consecutive_api_fails = MAX_API_FAILS_BEFORE_RECONNECT
+            state.connection_healthy = False
+            tg(f"💓 <b>HEARTBEAT</b> (limited)\n⚠️ Account info niet beschikbaar — forcing reconnect\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC", state)
             return
         balance = info["balance"]
         equity = info["equity"]
@@ -832,7 +825,9 @@ async def send_heartbeat(conn, state: BotState):
             positions = []
     except Exception as e:
         log.error(f"Heartbeat error: {e}")
-        tg(f"💓 <b>HEARTBEAT</b> (limited)\n⚠️ Data ophalen mislukt: {str(e)[:60]}", state)
+        state.consecutive_api_fails = MAX_API_FAILS_BEFORE_RECONNECT
+        state.connection_healthy = False
+        tg(f"💓 <b>HEARTBEAT</b> (limited)\n⚠️ Data ophalen mislukt — forcing reconnect: {str(e)[:60]}", state)
         return
 
     pl = equity - balance
@@ -2819,6 +2814,17 @@ async def run(state: BotState):
             try:
                 state.watchdog_last_loop = time.time()
                 state.consecutive_errors = 0
+
+                # Weekend check — ICMarkets gesloten vr 22:00 - zo 22:00 UTC
+                now_utc = datetime.now(timezone.utc)
+                is_weekend = (now_utc.weekday() == 5) or \
+                             (now_utc.weekday() == 4 and now_utc.hour >= 22) or \
+                             (now_utc.weekday() == 6 and now_utc.hour < 22)
+                if is_weekend:
+                    if now_utc.minute == 0 and now_utc.second < 15:
+                        log.info("Weekend — market gesloten, wacht...")
+                    await asyncio.sleep(60)
+                    continue
 
                 await send_heartbeat(conn, state)
 
