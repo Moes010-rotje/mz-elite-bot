@@ -2747,12 +2747,31 @@ async def run(state: BotState):
             tg("❌ <b>FATAL: Kon niet verbinden na 5 pogingen</b>", state)
             raise Exception("Connection failed after 5 attempts")
 
-        try:
-            test_info = await asyncio.wait_for(conn.get_account_information(), timeout=15)
-            log.info(f"Connection verified: ${test_info['balance']} balance")
-        except Exception as e:
-            tg(f"⚠️ Connection verificatie mislukt: {e}", state)
-            raise Exception(f"Connection verification failed: {e}")
+        # Verification — rate limit aware, niet fataal
+        verified = False
+        for verify_attempt in range(3):
+            try:
+                test_info = await asyncio.wait_for(conn.get_account_information(), timeout=15)
+                log.info(f"Connection verified: ${test_info['balance']} balance")
+                verified = True
+                break
+            except Exception as e:
+                err_str = str(e)
+                if "TooManyRequests" in err_str or "rate" in err_str.lower() or "cpu credits" in err_str.lower():
+                    # Rate limited — wacht de aanbevolen tijd
+                    wait_mins = 4 * (verify_attempt + 1)  # 4, 8, 12 min
+                    log.warning(f"Rate limited bij verificatie — wacht {wait_mins} min...")
+                    tg(f"⏳ <b>RATE LIMITED</b> — wacht {wait_mins} min voor retry...", state)
+                    for _ in range(wait_mins * 2):  # 30s stukken
+                        state.watchdog_last_loop = time.time()
+                        await asyncio.sleep(30)
+                else:
+                    log.warning(f"Verificatie poging {verify_attempt+1} mislukt: {e}")
+                    await asyncio.sleep(5)
+
+        if not verified:
+            log.warning("Verificatie mislukt na 3 pogingen — ga toch door (connectie kan nog werken)")
+            tg("⚠️ <b>Verificatie mislukt</b> — bot draait door, eerste heartbeat zal status tonen", state)
 
         await asyncio.sleep(2)
 
@@ -2839,7 +2858,7 @@ async def run(state: BotState):
 
                     for attempt in range(3):
                         try:
-                            state.watchdog_last_loop = time.time()  # Watchdog: we leven nog
+                            state.watchdog_last_loop = time.time()
                             log.info(f"Soft reconnect {attempt + 1}/3...")
                             try:
                                 await conn.close()
@@ -2857,6 +2876,14 @@ async def run(state: BotState):
                                 tg("✅ <b>RECOVERED</b>", state)
                                 break
                         except Exception as e:
+                            err_str = str(e)
+                            if "TooManyRequests" in err_str or "cpu credits" in err_str.lower():
+                                log.warning(f"Rate limited tijdens reconnect — wacht 5 min...")
+                                tg("⏳ <b>RATE LIMITED</b> — wacht 5 min...", state)
+                                for _ in range(10):
+                                    state.watchdog_last_loop = time.time()
+                                    await asyncio.sleep(30)
+                                break  # Stop reconnect pogingen, probeer opnieuw na wacht
                             log.warning(f"Soft reconnect {attempt + 1}/3: {e}")
 
                     if not reconnected:
@@ -2874,7 +2901,12 @@ async def run(state: BotState):
                                 reconnected = True
                                 tg("✅ <b>RECOVERED</b> na 2 min", state)
                         except Exception as e:
-                            log.warning(f"2-min retry failed: {e}")
+                            err_str = str(e)
+                            if "TooManyRequests" in err_str or "cpu credits" in err_str.lower():
+                                log.warning("Rate limited bij 2-min retry — skip naar full restart")
+                                tg("⏳ <b>RATE LIMITED</b> — full restart met wacht...", state)
+                            else:
+                                log.warning(f"2-min retry failed: {e}")
 
                     if not reconnected:
                         log.info("Trying undeploy/redeploy...")
@@ -2893,7 +2925,11 @@ async def run(state: BotState):
                                 reconnected = True
                                 tg("✅ <b>RECOVERED via REDEPLOY</b>", state)
                         except Exception as e:
-                            log.error(f"Redeploy failed: {e}")
+                            err_str = str(e)
+                            if "TooManyRequests" in err_str or "cpu credits" in err_str.lower():
+                                log.warning("Rate limited bij redeploy — skip naar full restart")
+                            else:
+                                log.error(f"Redeploy failed: {e}")
 
                     if not reconnected:
                         # ALLE reconnect pogingen gefaald — SDK instance is corrupt
@@ -3139,8 +3175,18 @@ if __name__ == "__main__":
             log.info("Stopped by user")
             break
         except Exception as e:
-            tg(f"💥 <b>CRASH #{restart_count}</b>: {str(e)[:80]}\n🔄 Restart in 15s...", _boot_state)
-            log.error(f"Crash #{restart_count}: {e}")
+            err_str = str(e)
+            is_rate_limited = "rate" in err_str.lower() or "cpu credits" in err_str.lower() or "TooManyRequests" in err_str
+
+            if is_rate_limited:
+                wait = 300  # 5 min voor rate limits
+                tg(f"⏳ <b>RATE LIMITED</b> — wacht {wait//60} min...", _boot_state)
+                log.warning(f"Rate limited — wacht {wait}s voor restart")
+            else:
+                tg(f"💥 <b>CRASH #{restart_count}</b>: {err_str[:80]}\n🔄 Restart...", _boot_state)
+                log.error(f"Crash #{restart_count}: {e}")
+                wait = min(15 * restart_count, 120)
+
             # Reset connection state voor verse start (behoud performance data)
             _boot_state.consecutive_api_fails = 0
             _boot_state.consecutive_errors = 0
@@ -3148,6 +3194,9 @@ if __name__ == "__main__":
             _boot_state.shutdown_requested = False
             _boot_state.last_reconnect_heartbeat = 0
             _boot_state.watchdog_last_loop = time.time()
-            wait = min(15 * restart_count, 120)  # Max 2 min wacht
             log.info(f"Restart in {wait}s...")
-            time.sleep(wait)
+            # Sleep in stukken zodat watchdog niet triggert
+            for _ in range(wait // 30 + 1):
+                _boot_state.watchdog_last_loop = time.time()
+                time.sleep(min(30, wait))
+                wait = max(0, wait - 30)
