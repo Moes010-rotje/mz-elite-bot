@@ -272,6 +272,7 @@ GRADE_RISK = {
     "A+": 0.010,   # 1.0%
     "A":  0.0075,  # 0.75%
     "B+": 0.005,   # 0.5%
+    "B":  0.004,   # 0.4% — lager risk voor basis-setups
 }
 
 # === STRENGERE LIMIETEN ===
@@ -1530,7 +1531,7 @@ def detect_order_blocks(df: pd.DataFrame, structure: Optional[StructureBreak]) -
             break
         c = df.iloc[i]
         body = abs(c["close"] - c["open"])
-        if body < avg_body * 2.0:
+        if body < avg_body * 1.5:    # Was 2.0 — te streng, veel valide OBs gemist
             continue
         if structure.direction == Direction.BULL and c["close"] > c["open"]:
             for j in range(i - 1, max(i - 6, 0), -1):
@@ -1567,14 +1568,14 @@ def detect_fvgs(df: pd.DataFrame, lookback: int = 10) -> List[Zone]:
     for i in range(len(df) - 1, max(len(df) - lookback, 2), -1):
         c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
         mid_body = abs(c2["close"] - c2["open"])
-        if c3["low"] > c1["high"] and mid_body > avg_body * 1.5:
+        if c3["low"] > c1["high"] and mid_body > avg_body * 1.2:    # Was 1.5
             zones.append(Zone(
                 type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
                 high=float(c3["low"]), low=float(c1["high"]),
                 midpoint=float((c3["low"] + c1["high"]) / 2),
                 created_at=time.time(),
             ))
-        elif c3["high"] < c1["low"] and mid_body > avg_body * 1.5:
+        elif c3["high"] < c1["low"] and mid_body > avg_body * 1.2:    # Was 1.5
             zones.append(Zone(
                 type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
                 high=float(c1["low"]), low=float(c3["high"]),
@@ -1848,6 +1849,17 @@ async def get_htf_bias(account, symbol: str, state: BotState) -> Optional[Direct
             return Direction.BULL
         if ema50 < ema200 * 0.999 and price < ema200:
             return Direction.BEAR
+
+        # FIX: Structuur-based fallback als EMAs gemixed zijn
+        if structure_1h:
+            return structure_1h.direction
+
+        # Laatste fallback: price vs EMA200
+        if price > ema200:
+            return Direction.BULL
+        elif price < ema200:
+            return Direction.BEAR
+
         return None
     except Exception:
         return None
@@ -1873,6 +1885,9 @@ def grade_setup(state: BotState, htf_aligned: bool, structure, zone, confirmatio
     if hasattr(zone, 'timeframe') and zone.timeframe == "15m":
         score += 1.0
         reasons.append("HTF_ZONE")
+    elif hasattr(zone, 'timeframe') and zone.timeframe == "5m":
+        score += 0.5
+        reasons.append("LTF_ZONE")
 
     reasons.append(f"CONFIRM({confirmation})")
     score += 2.0
@@ -1964,8 +1979,10 @@ def grade_setup(state: BotState, htf_aligned: bool, structure, zone, confirmatio
             return "A", 1.0, score, reasons
     elif score >= 8:
         return "A", 0.75, score, reasons
-    elif score >= 6:
+    elif score >= 5.5:     # Was 6 — met 5m zone bonus is dit nu realistisch
         return "B+", 0.6, score, reasons
+    elif score >= 4.5:     # NEW: B grade voor setups met basis-kwaliteit
+        return "B", 0.4, score, reasons
     return "D", 0, score, reasons
 
 
@@ -2238,8 +2255,9 @@ async def check_closed_trades(conn, state: BotState):
 # ==================== CANDLE CLOSE CHECK ====================
 
 def is_candle_just_closed(tf_min: int = 5) -> bool:
+    """FIX: Window van 15s naar 55s — heartbeat + API calls voor de scan kosten 10-30s"""
     now = datetime.now(timezone.utc)
-    return now.minute % tf_min == 0 and now.second < 15
+    return now.minute % tf_min == 0 and now.second < 55
 
 
 # ==================== BOUNDED SIGNAL CLEANUP ====================
@@ -2398,7 +2416,7 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
             symbol=symbol, has_confluence=has_confluence, is_ote=is_ote,
         )
 
-        if grade not in ("A+", "A", "B+"):
+        if grade not in ("A+", "A", "B+", "B"):
             log.info(f"  ❌ {symbol}: grade {grade} (score {score:.1f}) te laag — {' | '.join(reasons[:5])}")
             return None
 
@@ -3026,14 +3044,18 @@ async def run(state: BotState):
                     await asyncio.sleep(60)
                     continue
 
-                # Profit factor check
+                # Profit factor check — soft reduction i.p.v. hard stop (death spiral)
                 total_trades = state.performance["wins"] + state.performance["losses"]
+                pf_gate_active = False
                 if total_trades >= 30:
                     pf = db_get_profit_factor()
-                    if pf < 1.0:
-                        log.warning(f"Profit factor {pf:.2f} < 1.0 — trades gepauzeerd")
-                        await asyncio.sleep(60)
+                    if pf < 0.7:
+                        log.warning(f"Profit factor {pf:.2f} < 0.7 — trades gepauzeerd tot PF verbetert")
+                        await asyncio.sleep(300)  # 5 min pauze, niet permanent
                         continue
+                    elif pf < 1.0:
+                        pf_gate_active = True  # Wordt gebruikt in risk calc
+                        log.info(f"Profit factor {pf:.2f} < 1.0 — alleen A+/A grades toegestaan")
 
                 if not is_candle_just_closed(5):
                     await asyncio.sleep(CHECK_INTERVAL)
