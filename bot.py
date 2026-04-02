@@ -2318,7 +2318,18 @@ async def check_closed_trades(conn, state: BotState):
         history = await rate_limited_call(conn.get_deals_by_time_range(start, now), state, label="deals")
         if not history:
             return
-        for deal in history[-5:]:
+
+        # MetaAPI kan deals als list of als ander object teruggeven
+        deals = history
+        if isinstance(history, dict):
+            deals = history.get("deals", [])
+        try:
+            deals = list(deals)  # Force to list voor slicing
+        except Exception:
+            log.warning(f"Deals niet itereerbaar: {type(history)}")
+            return
+
+        for deal in deals[-5:]:
             profit = deal.get("profit", 0)
             did = deal.get("id", "")
             dk = f"deal_{did}"
@@ -2843,9 +2854,11 @@ async def run(state: BotState):
         account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
 
         conn = None
+        redeployed = False  # Track of we al redeployed hebben
         for attempt in range(5):
             try:
                 log.info(f"Connection poging {attempt + 1}/5...")
+                state.watchdog_last_loop = time.time()  # Watchdog: we leven nog
                 account_info = account.state
                 log.info(f"Account state: {account_info}")
 
@@ -2855,23 +2868,25 @@ async def run(state: BotState):
                         await account.deploy()
                     except Exception as e:
                         log.warning(f"Deploy fout (kan normaal zijn): {e}")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(10)
 
                 try:
                     await asyncio.wait_for(account.wait_connected(), timeout=60)
                     log.info("Account connected!")
                 except asyncio.TimeoutError:
                     log.warning(f"Account connect timeout poging {attempt + 1}")
-                    if attempt >= 2:
-                        log.info("Forcing undeploy + redeploy...")
+                    # Alleen 1x redeploy — niet op elke poging
+                    if attempt == 3 and not redeployed:
+                        log.info("Forcing undeploy + redeploy (eenmalig)...")
+                        redeployed = True
                         try:
                             await account.undeploy()
-                            await asyncio.sleep(10)
+                            await asyncio.sleep(15)
                             await account.deploy()
-                            await asyncio.sleep(10)
+                            await asyncio.sleep(30)  # Was 10 — geef server tijd
                         except Exception as e:
                             log.warning(f"Redeploy fout: {e}")
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(15)  # Was 10
                     continue
 
                 conn = account.get_rpc_connection()
