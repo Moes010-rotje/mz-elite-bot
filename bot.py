@@ -291,9 +291,9 @@ STREAK_MODIFIER = {
 }
 
 MIN_RR = 2.0
-MAX_TRADES_PER_ASSET = 2
-MAX_TOTAL_TRADES = 4
-MAX_TRADES_PER_DAY = 6
+MAX_TRADES_PER_ASSET = 1       # Was 2 — voorkomt stacking in hetzelfde symbol
+MAX_TOTAL_TRADES = 3           # Was 4 — minder maar betere trades
+MAX_TRADES_PER_DAY = 4         # Was 6 — quality over quantity
 
 # === SYMBOL HEALTH ===
 SYMBOL_MIN_TRADES_FOR_EVAL = 15
@@ -310,9 +310,9 @@ MAX_SLIPPAGE_PIPS = {
 GOLD_SCALP = {
     "enabled": True,
     "symbol": "XAUUSD",
-    "max_trades": 3,
-    "min_rr": 1.3,
-    "min_grade": "B+",
+    "max_trades": 1,
+    "min_rr": 1.5,            # Minimum RR voor gold scalps
+    "min_grade": "B+",        # B+ toegestaan voor gold scalps (niet alleen A+/A)
     "risk_override": 0.005,
     "tp1_mult": 1.5,
     "tp2_mult": 2.5,
@@ -321,9 +321,11 @@ GOLD_SCALP = {
     "max_spread_scalp": 20,
     "session_max_losses": 2,
     "prime_killzones": ["london", "london_ext", "new_york"],
-    "round_number_step": 50,
-    "round_number_buffer": 3.0,
+    "round_number_step": 25,       # Was 50 — gold reageert ook op $25 levels
+    "round_number_buffer": 8.0,    # Was 3.0 — veel te krap op $4500+ gold
+    "round_number_strong": 50,     # $50/$100 levels zijn sterker → extra score
     "cooldown_minutes": 30,
+    "scalp_sl_pips": 40,           # Max 40 pips ($4.0) SL voor scalps — strakker dan ATR
 }
 
 # === MINIMUM SL AFSTAND PER CATEGORIE ===
@@ -1466,30 +1468,57 @@ def detect_ote_zone(df: pd.DataFrame, swings: List[SwingPoint], direction: Direc
 # ==================== GOLD ROUND NUMBER DETECTION ====================
 
 def detect_gold_round_number(df: pd.DataFrame, direction: Direction) -> Optional[Zone]:
+    """
+    Gold reageert sterk op round numbers:
+    - $100 levels ($4500, $4600) = sterkste
+    - $50 levels ($4550, $4650) = sterk
+    - $25 levels ($4525, $4575) = medium
+    Detecteert of price bij een round number is + candle reactie toont.
+    """
     if not GOLD_SCALP["enabled"]:
         return None
     current_price = float(df["close"].iloc[-1])
-    step = GOLD_SCALP["round_number_step"]
-    buffer = GOLD_SCALP["round_number_buffer"]
+    step = GOLD_SCALP["round_number_step"]       # 25
+    buffer = GOLD_SCALP["round_number_buffer"]    # 8.0
+    strong_step = GOLD_SCALP["round_number_strong"]  # 50
+
     nearest_round = round(current_price / step) * step
     distance = abs(current_price - nearest_round)
     if distance > buffer:
         return None
+
+    # Bepaal sterkte van het level
+    is_strong = (nearest_round % strong_step == 0)  # $50 of $100 levels
+    is_super = (nearest_round % 100 == 0)            # $100 levels ($4500, $4600)
+
     last = df.iloc[-1]
-    if direction == Direction.BULL and current_price < nearest_round:
-        if last["close"] > last["open"] and last["low"] <= nearest_round + buffer:
-            return Zone(
+    atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 5.0
+
+    # Dynamische buffer gebaseerd op level sterkte
+    zone_buffer = buffer if is_strong else buffer * 0.6
+
+    if direction == Direction.BULL and current_price <= nearest_round + zone_buffer:
+        # Bullish reactie: prijs bij of onder round number, candle toont koopkracht
+        if last["close"] > last["open"]:  # Groene candle
+            zone = Zone(
                 type=ZoneType.ORDER_BLOCK, direction=Direction.BULL,
-                high=nearest_round + buffer, low=nearest_round - buffer,
+                high=nearest_round + zone_buffer, low=nearest_round - zone_buffer,
                 midpoint=nearest_round, created_at=time.time(),
             )
-    elif direction == Direction.BEAR and current_price > nearest_round:
-        if last["close"] < last["open"] and last["high"] >= nearest_round - buffer:
-            return Zone(
+            zone.timeframe = "5m_round_strong" if is_strong else "5m_round"
+            return zone
+
+    elif direction == Direction.BEAR and current_price >= nearest_round - zone_buffer:
+        # Bearish reactie: prijs bij of boven round number, candle toont verkoopdruk
+        if last["close"] < last["open"]:  # Rode candle
+            zone = Zone(
                 type=ZoneType.ORDER_BLOCK, direction=Direction.BEAR,
-                high=nearest_round + buffer, low=nearest_round - buffer,
+                high=nearest_round + zone_buffer, low=nearest_round - zone_buffer,
                 midpoint=nearest_round, created_at=time.time(),
             )
+            zone.timeframe = "5m_round_strong" if is_strong else "5m_round"
+            return zone
+
     return None
 
 
@@ -1658,6 +1687,11 @@ def detect_liquidity_sweep(df: pd.DataFrame, symbol: str, swings: List[SwingPoin
 # ==================== CONFIRMATION CANDLE ====================
 
 def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Optional[str]:
+    """
+    Alleen sterke confirmaties: engulfing en strong_close.
+    rejection_wick en pin_bar zijn VERWIJDERD — te onbetrouwbaar op 5M.
+    Engulfing wordt EERST gecheckt om volgorde-bugs te voorkomen.
+    """
     if len(df) < 3:
         return None
     last = df.iloc[-1]
@@ -1670,51 +1704,100 @@ def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Op
         if avg_vol > 0 and vol > avg_vol * 1.3:
             has_volume = True
 
+    avg_body = float(df["body"].tail(20).mean())
+
     if direction == Direction.BULL:
-        lw = float(last["lower_wick"])
-        cr = float(last["candle_range"])
-
-        if cr > 0 and lw / cr >= MIN_REJECTION_WICK_RATIO:
-            if last["close"] > last["open"] and zone.contains_price(float(last["low"]), ZONE_ENTRY_BUFFER):
-                return "rejection_wick_vol" if has_volume else "rejection_wick"
-
+        # === ENGULFING (sterkste confirmatie) ===
         if (last["close"] > last["open"] and prev["close"] < prev["open"]
             and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
             and last["close"] > prev["open"] and last["open"] < prev["close"]):
             if zone.contains_price(float(last["low"]), ZONE_CONFIRM_BUFFER):
                 return "engulfing_vol" if has_volume else "engulfing"
 
-        body = float(last["body"])
-        if cr > 0 and body / cr < 0.3 and lw / cr > 0.5 and last["close"] > last["open"]:
-            return "pin_bar_vol" if has_volume else "pin_bar"
-
-        avg_body = float(df["body"].tail(20).mean())
+        # === STRONG CLOSE ===
         if (last["close"] > last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
             and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
             return "strong_close_vol" if has_volume else "strong_close"
 
     elif direction == Direction.BEAR:
-        uw = float(last["upper_wick"])
-        cr = float(last["candle_range"])
-
-        if cr > 0 and uw / cr >= MIN_REJECTION_WICK_RATIO:
-            if last["close"] < last["open"] and zone.contains_price(float(last["high"]), ZONE_ENTRY_BUFFER):
-                return "rejection_wick_vol" if has_volume else "rejection_wick"
-
+        # === ENGULFING ===
         if (last["close"] < last["open"] and prev["close"] > prev["open"]
             and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
             and last["close"] < prev["open"] and last["open"] > prev["close"]):
             if zone.contains_price(float(last["high"]), ZONE_CONFIRM_BUFFER):
                 return "engulfing_vol" if has_volume else "engulfing"
 
-        body = float(last["body"])
-        if cr > 0 and body / cr < 0.3 and uw / cr > 0.5 and last["close"] < last["open"]:
-            return "pin_bar_vol" if has_volume else "pin_bar"
-
-        avg_body = float(df["body"].tail(20).mean())
+        # === STRONG CLOSE ===
         if (last["close"] < last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
             and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
             return "strong_close_vol" if has_volume else "strong_close"
+
+    return None
+
+
+# ==================== GOLD SCALP CONFIRMATION ====================
+
+def check_gold_scalp_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Optional[str]:
+    """
+    Gold round number confirmatie — rejection_wick is TOEGESTAAN hier.
+    Gold bounced van round numbers met wicks, dat is het standaard signaal.
+    Engulfing en strong_close ook geaccepteerd.
+    """
+    if len(df) < 3:
+        return None
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    has_volume = False
+    if "volume" in df.columns and "avg_volume" in df.columns:
+        vol = float(last["volume"])
+        avg_vol = float(last["avg_volume"])
+        if avg_vol > 0 and vol > avg_vol * 1.3:
+            has_volume = True
+
+    avg_body = float(df["body"].tail(20).mean())
+
+    if direction == Direction.BULL:
+        cr = float(last["candle_range"])
+        lw = float(last["lower_wick"])
+
+        # ENGULFING
+        if (last["close"] > last["open"] and prev["close"] < prev["open"]
+            and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
+            and last["close"] > prev["open"] and last["open"] < prev["close"]):
+            if zone.contains_price(float(last["low"]), ZONE_CONFIRM_BUFFER):
+                return "engulfing_vol" if has_volume else "engulfing"
+
+        # STRONG CLOSE
+        if (last["close"] > last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
+            and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
+            return "strong_close_vol" if has_volume else "strong_close"
+
+        # REJECTION WICK — toegestaan voor gold round numbers
+        if cr > 0 and lw / cr >= 0.40 and last["close"] > last["open"]:
+            if zone.contains_price(float(last["low"]), ZONE_ENTRY_BUFFER):
+                return "gold_wick_vol" if has_volume else "gold_wick"
+
+    elif direction == Direction.BEAR:
+        cr = float(last["candle_range"])
+        uw = float(last["upper_wick"])
+
+        # ENGULFING
+        if (last["close"] < last["open"] and prev["close"] > prev["open"]
+            and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
+            and last["close"] < prev["open"] and last["open"] > prev["close"]):
+            if zone.contains_price(float(last["high"]), ZONE_CONFIRM_BUFFER):
+                return "engulfing_vol" if has_volume else "engulfing"
+
+        # STRONG CLOSE
+        if (last["close"] < last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
+            and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
+            return "strong_close_vol" if has_volume else "strong_close"
+
+        # REJECTION WICK — toegestaan voor gold round numbers
+        if cr > 0 and uw / cr >= 0.40 and last["close"] < last["open"]:
+            if zone.contains_price(float(last["high"]), ZONE_ENTRY_BUFFER):
+                return "gold_wick_vol" if has_volume else "gold_wick"
 
     return None
 
@@ -1820,8 +1903,8 @@ def detect_regime(df: pd.DataFrame) -> str:
 
 async def get_htf_bias(account, symbol: str, state: BotState) -> Optional[Direction]:
     try:
-        candles = await get_candles(account, symbol, "1h", 120, state)
-        if not candles or len(candles) < 60:
+        candles = await get_candles(account, symbol, "1h", 250, state)  # Was 120 — EMA200 heeft 200+ nodig
+        if not candles or len(candles) < 100:  # Was 60
             return None
         df = pd.DataFrame(candles)
         df = calculate_indicators(df)
@@ -1879,8 +1962,16 @@ def grade_setup(state: BotState, htf_aligned: bool, structure, zone, confirmatio
     if not zone or not confirmation:
         return "D", 0, 0, ["NO_ZONE" if not zone else "NO_CONFIRM"]
 
-    reasons.append(f"ZONE({zone.type.value})")
-    score += 2.0
+    # FIX 8: OB krijgt meer punten dan FVG
+    if zone.type == ZoneType.ORDER_BLOCK:
+        reasons.append(f"ZONE(ob)")
+        score += 2.0
+    elif zone.type == ZoneType.FAIR_VALUE_GAP:
+        reasons.append(f"ZONE(fvg)")
+        score += 1.0  # Was 2.0 — FVG is minder sterk dan OB
+    else:
+        reasons.append(f"ZONE({zone.type.value})")
+        score += 1.5
 
     if hasattr(zone, 'timeframe') and zone.timeframe == "15m":
         score += 1.0
@@ -1938,6 +2029,14 @@ def grade_setup(state: BotState, htf_aligned: bool, structure, zone, confirmatio
     if zone.type == ZoneType.ORDER_BLOCK and zone.structure_break:
         score += 0.5
         reasons.append("OB+STRUCT")
+
+    # Gold round number bonus
+    if hasattr(zone, 'timeframe') and zone.timeframe and 'round_strong' in zone.timeframe:
+        score += 1.5
+        reasons.append("GOLD_ROUND_$50")
+    elif hasattr(zone, 'timeframe') and zone.timeframe and 'round' in zone.timeframe:
+        score += 0.5
+        reasons.append("GOLD_ROUND_$25")
 
     # Adaptive boosts
     boosts = get_adaptive_boosts(state)
@@ -2045,6 +2144,12 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone,
     tp1_mult = GOLD_SCALP["tp1_mult"] if is_gold else 2.0
     tp2_mult = GOLD_SCALP["tp2_mult"] if is_gold else 3.0
     tp3_mult = GOLD_SCALP["tp3_mult"] if is_gold else 4.5
+
+    # Gold scalps: strakker SL dan ATR-based
+    if is_gold and hasattr(zone, 'timeframe') and 'round' in (zone.timeframe or ''):
+        scalp_sl_dist = GOLD_SCALP["scalp_sl_pips"] * spec.get("pip_size", 0.1)  # 40 pips = $4.0
+        min_sl_dist = min(scalp_sl_dist, min_sl_dist)  # Gebruik de strakkere van de twee
+        max_sl_distance = scalp_sl_dist  # Cap SL op scalp niveau
 
     effective_entry = entry + spread if direction == Direction.BULL else entry - spread
 
@@ -2280,6 +2385,11 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
     try:
         htf_bias = await get_htf_bias(account, symbol, state)
 
+        # === FIX: HTF BIAS VERPLICHT — geen trading zonder 1H richting ===
+        if not htf_bias:
+            log.debug(f"  {symbol}: geen HTF bias — skip")
+            return None
+
         # MTF (15M)
         candles_15m = await get_candles(account, symbol, "15m", 100, state)
         if not candles_15m or len(candles_15m) < 40:
@@ -2290,8 +2400,15 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         structure_15m = analyze_structure(df_15m, swings_15m)
         regime = detect_regime(df_15m)
 
-        # Regime wordt meegenomen in grading als score penalty (-3 voor ranging)
-        # GEEN hard block meer — was redundant en te streng
+        # === FIX: Regime filter — ranging altijd blokkeren, transitioning alleen als HTF bias sterk is ===
+        if regime == "ranging":
+            log.debug(f"  {symbol}: regime ranging — skip")
+            return None
+        if regime == "transitioning":
+            # Transitioning OK als HTF bias duidelijk is (pullback in trend)
+            # Maar niet als regime unknown is
+            log.debug(f"  {symbol}: regime transitioning — HTF bias is {htf_bias.value}, doorgaan")
+            # (HTF bias is al verplicht hierboven, dus we weten dat er richting is)
 
         if structure_15m:
             new_obs = detect_order_blocks(df_15m, structure_15m)
@@ -2328,35 +2445,22 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         pd_zone = get_premium_discount(df_15m, swings_15m)
         current_price = float(df_5m["close"].iloc[-1])
 
-        # Bepaal richting — versoepeld: BOS alleen is nu ook voldoende
-        direction = None
-        if htf_bias == Direction.BULL and (not structure_15m or structure_15m.direction == Direction.BULL):
-            direction = Direction.BULL
-        elif htf_bias == Direction.BEAR and (not structure_15m or structure_15m.direction == Direction.BEAR):
-            direction = Direction.BEAR
-        elif structure_15m and structure_15m.type == StructureType.CHOCH:
-            direction = structure_15m.direction
-        elif htf_bias:
-            direction = htf_bias
-        elif structure_15m and structure_15m.type == StructureType.BOS:
-            direction = structure_15m.direction
-        # FIX 5: Als 5M structuur er is maar 15M niet, gebruik 5M
-        elif structure_5m:
-            direction = structure_5m.direction
+        # === FIX 5: DIRECTION = HTF BIAS — geen fallbacks meer ===
+        # HTF bias is verplicht (hierboven al gecheckt) en bepaalt richting
+        # 15M structuur moet ALIGNEN, niet overrulen
+        direction = htf_bias
 
-        if not direction:
-            log.debug(f"  {symbol}: geen richting (htf={htf_bias}, 15m_struct={structure_15m is not None}, 5m_struct={structure_5m is not None})")
+        if structure_15m and structure_15m.direction != direction:
+            log.debug(f"  {symbol}: 15M structuur ({structure_15m.direction.value}) conflict met HTF ({direction.value}) — skip")
             return None
 
-        # P/D filter
+        # === FIX 11: P/D HARD ENFORCE ===
         if direction == Direction.BULL and pd_zone == "premium":
-            if not (sweep and sweep["type"] == "bull"):
-                log.debug(f"  {symbol}: BULL in premium zonder sweep")
-                return None
+            log.debug(f"  {symbol}: BULL in premium — skip")
+            return None
         if direction == Direction.BEAR and pd_zone == "discount":
-            if not (sweep and sweep["type"] == "bear"):
-                log.debug(f"  {symbol}: BEAR in discount zonder sweep")
-                return None
+            log.debug(f"  {symbol}: BEAR in discount — skip")
+            return None
 
         # Zoek zone
         active_zone = find_active_zone(state, symbol, current_price, direction)
@@ -2372,11 +2476,13 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
 
         # Gold round number check
         is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
+        is_gold_round = False
         if not active_zone and is_gold_scalp:
             round_zone = detect_gold_round_number(df_5m, direction)
             if round_zone:
                 active_zone = round_zone
-                active_zone.timeframe = "5m_round"
+                is_gold_round = True
+                # timeframe is al gezet in detect_gold_round_number
 
         if not active_zone:
             zone_count = len(state.zone_store.get(symbol, []))
@@ -2386,14 +2492,26 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
 
         has_confluence = check_zone_confluence(state, active_zone, symbol)
 
+        # === FIX 3: 5M zones ALLEEN met HTF confluence (gold round numbers uitgezonderd) ===
+        if hasattr(active_zone, 'timeframe') and active_zone.timeframe == "5m":
+            if not has_confluence:
+                log.debug(f"  {symbol}: 5M zone zonder HTF confluence — skip (noise)")
+                return None
+
         # Gold prime killzone check
         if is_gold_scalp:
             kz = get_current_killzone()
             if kz and kz not in GOLD_SCALP["prime_killzones"]:
-                if not (has_confluence or is_ote):
+                if not (has_confluence or is_ote or is_gold_round):
                     return None
 
-        confirmation = check_confirmation(df_5m, direction, active_zone)
+        # === CONFIRMATIE ===
+        # Gold round number zones mogen rejection_wick gebruiken (standaard gold scalp signal)
+        if is_gold_round:
+            confirmation = check_gold_scalp_confirmation(df_5m, direction, active_zone)
+        else:
+            confirmation = check_confirmation(df_5m, direction, active_zone)
+
         if not confirmation:
             log.info(f"  📍 {symbol}: IN ZONE ({active_zone.type.value} {active_zone.timeframe}) — wacht op confirmatie candle")
             return None
@@ -2403,8 +2521,7 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
             log.info(f"  ❌ {symbol}: spread te hoog")
             return None
 
-        # FIX: htf_aligned is nu altijd een bool
-        htf_aligned = (htf_bias == direction) if htf_bias else False
+        htf_aligned = True  # Altijd true want HTF bias = direction
 
         grade, risk_mult, score, reasons = grade_setup(
             state=state,
@@ -2416,9 +2533,15 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
             symbol=symbol, has_confluence=has_confluence, is_ote=is_ote,
         )
 
-        if grade not in ("A+", "A", "B+", "B"):
-            log.info(f"  ❌ {symbol}: grade {grade} (score {score:.1f}) te laag — {' | '.join(reasons[:5])}")
-            return None
+        # === GRADE FILTER — gold scalps mogen B+ ===
+        if is_gold_scalp:
+            if grade not in ("A+", "A", "B+"):
+                log.info(f"  ❌ {symbol}: grade {grade} (score {score:.1f}) — gold scalp min B+ | {' | '.join(reasons[:5])}")
+                return None
+        else:
+            if grade not in ("A+", "A"):
+                log.info(f"  ❌ {symbol}: grade {grade} (score {score:.1f}) — alleen A+/A | {' | '.join(reasons[:5])}")
+                return None
 
         price_data = await rate_limited_call(conn.get_symbol_price(symbol), state, label=f"price_{symbol}")
         if not price_data:
@@ -3105,10 +3228,10 @@ async def run(state: BotState):
                         if not check_gold_session_limit(state, symbol):
                             continue
 
-                        is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
-                        dedup_secs = GOLD_SCALP["dedup_seconds"] if is_gold_scalp else 900
-                        sig_key = f"{symbol}_{int(time.time()/dedup_secs)}"
-                        if sig_key in state.recent_signals:
+                        # === FIX 7: Max 1 trade per symbol per killzone per dag ===
+                        kz_now = get_current_killzone() or "none"
+                        kz_dir_key = f"{symbol}_{kz_now}_{date.today()}"
+                        if kz_dir_key in state.recent_signals:
                             continue
 
                         setup = await analyze_and_find_setup(account, conn, symbol, positions, balance, state)
@@ -3124,7 +3247,7 @@ async def run(state: BotState):
 
                         success = await execute_trade(conn, setup, balance, state, df_5m_exec)
                         if success:
-                            state.recent_signals[sig_key] = time.time()
+                            state.recent_signals[kz_dir_key] = time.time()
                     except Exception as e:
                         log.warning(f"Symbol {symbol} error (skipping): {e}")
                     await asyncio.sleep(0.5)
