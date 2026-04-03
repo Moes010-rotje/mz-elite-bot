@@ -17,7 +17,7 @@ from enum import Enum
 from metaapi_cloud_sdk import MetaApi
 
 # ================================================================
-# PROFESSIONAL SMC BOT v4.1 — PROFIT-CRITICAL REBUILD
+# PROFESSIONAL SMC BOT v5.0 — SWEEP STRATEGY
 #
 # CHANGES vs v4.0 Bugfix Edition:
 #
@@ -136,18 +136,13 @@ class TradeSetup:
     tp1: float
     tp2: float
     tp3: float
-    zone: Zone
-    grade: str
-    score: float
-    risk_mult: float
-    reasons: List[str]
-    regime: str
+    zone: Zone           # The FVG used for entry
     rr: float
-    htf_bias: Optional[Direction] = None
-    mtf_structure: Optional[StructureBreak] = None
-    confirmation: str = ""
-    confluence: bool = False
-    ote_entry: bool = False
+    sweep_level: float   # Price level that was swept
+    sweep_type: str      # e.g. "equal_highs", "swing_high", "session_high"
+    displacement_body: float  # Body size of displacement candle
+    htf_direction: Optional[Direction] = None
+    reasons: List[str] = field(default_factory=list)
 
 # ==================== BOT STATE CLASS (VERVANGT GLOBALS) ====================
 
@@ -267,20 +262,16 @@ class BotState:
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 CHECK_INTERVAL = 5
 
-# === VERLAAGDE RISK — professioneel niveau ===
-GRADE_RISK = {
-    "A+": 0.010,   # 1.0%
-    "A":  0.0075,  # 0.75%
-    "B+": 0.005,   # 0.5%
-    "B":  0.004,   # 0.4% — lager risk voor basis-setups
-}
+# === RISK — simpel en consistent ===
+RISK_PER_TRADE = 0.0075       # 0.75% per trade
+RISK_REDUCED = 0.005          # 0.5% na verliesstreaks
 
-# === STRENGERE LIMIETEN ===
-DAILY_LOSS_LIMIT = 0.03      # 3% dagelijks
-WEEKLY_LOSS_LIMIT = 0.08     # 8% wekelijks
-MAX_DRAWDOWN_HARD_STOP = 0.10  # 10% → bot stopt volledig
+# === LIMIETEN ===
+DAILY_LOSS_LIMIT = 0.03       # 3% dagelijks
+WEEKLY_LOSS_LIMIT = 0.08      # 8% wekelijks
+MAX_DRAWDOWN_HARD_STOP = 0.10 # 10% → bot stopt volledig
 
-# === STREAK MODIFIER — conservatiever ===
+# === STREAK MODIFIER ===
 STREAK_MODIFIER = {
     "wins_4plus": 1.1,
     "wins_2_3":   1.05,
@@ -290,42 +281,35 @@ STREAK_MODIFIER = {
     "loss_3plus": 0.4,
 }
 
-MIN_RR = 2.0
-MAX_TRADES_PER_ASSET = 1       # Was 2 — voorkomt stacking in hetzelfde symbol
-MAX_TOTAL_TRADES = 3           # Was 4 — minder maar betere trades
-MAX_TRADES_PER_DAY = 4         # Was 6 — quality over quantity
+MIN_RR = 2.5                   # Was 2.0 — hogere RR voor sweep setups
+MAX_TRADES_PER_ASSET = 1
+MAX_TOTAL_TRADES = 3
+MAX_TRADES_PER_DAY = 4
+
+# === SWEEP STRATEGIE CONFIG ===
+MIN_DISPLACEMENT_MULT = 1.5    # Displacement body moet 1.5x avg body zijn
+SWEEP_LOOKBACK_CANDLES = 20    # Hoeveel candles terug zoeken naar sweeps
+FVG_MAX_AGE_CANDLES = 10       # FVG max 10 candles oud
+FVG_ENTRY_BUFFER_PCT = 0.15    # 15% buffer rond FVG voor entry
+
+# === TP MULTIPLIERS ===
+TP1_MULT = 2.0                 # 33% sluiten op 2R
+TP2_MULT = 3.0                 # 33% sluiten op 3R
+TP3_MULT = 4.5                 # Runner naar 4.5R
+# Gold: strakkere targets
+GOLD_TP1_MULT = 1.5
+GOLD_TP2_MULT = 2.5
+GOLD_TP3_MULT = 3.5
 
 # === SYMBOL HEALTH ===
 SYMBOL_MIN_TRADES_FOR_EVAL = 15
-SYMBOL_MIN_WINRATE = 0.40  # 40% minimum winrate
+SYMBOL_MIN_WINRATE = 0.40
 
 # === SLIPPAGE BESCHERMING ===
 MAX_SLIPPAGE_PIPS = {
     "metals":  15,
     "forex":   5,
     "indices": 20,
-}
-
-# === GOLD SCALP MODE ===
-GOLD_SCALP = {
-    "enabled": True,
-    "symbol": "XAUUSD",
-    "max_trades": 1,
-    "min_rr": 1.5,            # Minimum RR voor gold scalps
-    "min_grade": "B+",        # B+ toegestaan voor gold scalps (niet alleen A+/A)
-    "risk_override": 0.005,
-    "tp1_mult": 1.5,
-    "tp2_mult": 2.5,
-    "tp3_mult": 3.5,
-    "dedup_seconds": 180,
-    "max_spread_scalp": 20,
-    "session_max_losses": 2,
-    "prime_killzones": ["london", "london_ext", "new_york"],
-    "round_number_step": 25,       # Was 50 — gold reageert ook op $25 levels
-    "round_number_buffer": 8.0,    # Was 3.0 — veel te krap op $4500+ gold
-    "round_number_strong": 50,     # $50/$100 levels zijn sterker → extra score
-    "cooldown_minutes": 30,
-    "scalp_sl_pips": 40,           # Max 40 pips ($4.0) SL voor scalps — strakker dan ATR
 }
 
 # === MINIMUM SL AFSTAND PER CATEGORIE ===
@@ -338,21 +322,14 @@ MIN_SL_PIPS = {
 COOLDOWN_AFTER_LOSSES = 3
 COOLDOWN_MINUTES = 45
 ZONE_MAX_AGE_HOURS = 48
-ZONE_MAX_TESTS = 2           # Was 1 — zones werden na 1 check verbrand
+ZONE_MAX_TESTS = 2
 MAX_API_CALLS_PER_MIN = 50
 SWING_LOOKBACK = 3
-MIN_REJECTION_WICK_RATIO = 0.35    # Was 0.45 — te streng voor 5M candles
-MIN_ENGULFING_BODY_RATIO = 1.0     # Was 1.1 — net iets groter is al engulfing
-MIN_STRONG_CLOSE_BODY_RATIO = 1.3  # Was 1.5 — 1.3x avg is al sterk
-
-# === ZONE BUFFER ===
-ZONE_ENTRY_BUFFER = 0.1
-ZONE_CONFIRM_BUFFER = 0.15
 ZONE_SAVE_INTERVAL = 120
 
 # === RECONNECT HEARTBEAT ===
-RECONNECT_HEARTBEAT_INTERVAL = 60  # Elke 60s een ping
-RECONNECT_HEARTBEAT_FAIL_THRESHOLD = 3  # 3x falen → reconnect
+RECONNECT_HEARTBEAT_INTERVAL = 60
+RECONNECT_HEARTBEAT_FAIL_THRESHOLD = 3
 
 KILLZONES = {
     "asia":       {"start": 0,  "end": 7},
@@ -385,7 +362,6 @@ CORRELATION_GROUPS = [
     {"USTEC", "US30"},
 ]
 
-GRADE_ORDER = ["D", "C", "B", "B+", "A", "A+"]
 
 LOT_LIMITS = {
     "forex":   {"min": 0.01, "max": 5.0},
@@ -861,7 +837,7 @@ async def send_heartbeat(conn, state: BotState):
     if state.performance["peak_balance"] > 0:
         dd_pct = (state.performance["peak_balance"] - equity) / state.performance["peak_balance"] * 100
 
-    msg = f"""<b>💓 SMC v4.1 HEARTBEAT</b> {mode_str}
+    msg = f"""<b>💓 SMC v5.0 HEARTBEAT</b> {mode_str}
 
 💰 Balance: ${balance:,.2f}
 📊 Equity: ${equity:,.2f}
@@ -1074,15 +1050,13 @@ def register_trade_result(state: BotState, symbol: str, is_win: bool, profit: fl
     if symbol not in state.symbol_cooldowns:
         state.symbol_cooldowns[symbol] = {"losses": 0, "until": 0}
 
-    is_gold = symbol == GOLD_SCALP["symbol"]
-    cd_minutes = GOLD_SCALP["cooldown_minutes"] if is_gold else COOLDOWN_MINUTES
+    is_gold = symbol == "XAUUSD"
+    cd_minutes = COOLDOWN_MINUTES
 
     if is_win:
         state.symbol_cooldowns[symbol]["losses"] = 0
     else:
         state.symbol_cooldowns[symbol]["losses"] += 1
-        if is_gold:
-            register_gold_session_loss(state, symbol)
         if state.symbol_cooldowns[symbol]["losses"] >= COOLDOWN_AFTER_LOSSES:
             state.symbol_cooldowns[symbol]["until"] = time.time() + cd_minutes * 60
             tg(f"🧊 <b>COOLDOWN {symbol} {cd_minutes}min</b> na {state.symbol_cooldowns[symbol]['losses']} losses", state)
@@ -1103,13 +1077,9 @@ def register_trade_result(state: BotState, symbol: str, is_win: bool, profit: fl
         tg(f"⚠️ <b>PROFIT FACTOR ALARM</b>: PF = {pf:.2f} na {total_trades} trades", state)
 
 
-def get_dynamic_risk(state: BotState, balance: float, grade: str = "B+",
+def get_dynamic_risk(state: BotState, balance: float,
                      symbol: str = "", df: pd.DataFrame = None) -> float:
-    is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
-    if is_gold_scalp:
-        risk = GOLD_SCALP["risk_override"]
-    else:
-        risk = GRADE_RISK.get(grade, 0.005)
+    risk = RISK_PER_TRADE  # 0.75% basis
 
     # Drawdown protectie
     if state.daily_state["start_balance"] > 0:
@@ -1205,43 +1175,6 @@ def update_peak_balance(state: BotState, balance: float):
         state.performance["session_start_balance"] = balance
 
 
-# ==================== ADAPTIVE BOOSTS ====================
-
-def get_adaptive_boosts(state: BotState) -> dict:
-    now = time.time()
-    if state._adaptive_cache["data"] and (now - state._adaptive_cache["last_calc"]) < state._adaptive_cache["ttl"]:
-        return state._adaptive_cache["data"]
-
-    rows = db_execute(
-        "SELECT symbol, confirmation, killzone, zone_type, profit FROM trades WHERE closed = 1 AND dry_run = 0",
-        fetch=True)
-    if not rows or len(rows) < 10:
-        return {}
-
-    boosts = {"symbol": {}, "confirmation": {}, "killzone": {}, "zone_type": {}}
-    for category_idx, category in enumerate(["symbol", "confirmation", "killzone", "zone_type"]):
-        stats = {}
-        for r in rows:
-            key = r[category_idx] or "unknown"
-            if key not in stats:
-                stats[key] = {"wins": 0, "losses": 0}
-            if r[4] > 0:
-                stats[key]["wins"] += 1
-            else:
-                stats[key]["losses"] += 1
-        for key, s in stats.items():
-            total = s["wins"] + s["losses"]
-            if total < 20:
-                boosts[category][key] = 1.0
-                continue
-            wr = s["wins"] / total
-            boosts[category][key] = round(0.6 + wr * 1.2, 2)
-
-    state._adaptive_cache["data"] = boosts
-    state._adaptive_cache["last_calc"] = now
-    return boosts
-
-
 def check_correlation(symbol: str, positions: list) -> bool:
     for group in CORRELATION_GROUPS:
         if symbol in group:
@@ -1262,9 +1195,7 @@ async def check_spread(conn, symbol: str, state: BotState) -> Tuple[bool, float]
         spread = price["ask"] - price["bid"]
         spec = SYMBOL_SPECS[symbol]
         spread_pips = spread / spec["pip_size"]
-
-        is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
-        max_spread = GOLD_SCALP["max_spread_scalp"] if is_gold_scalp else spec["max_spread_pips"]
+        max_spread = spec["max_spread_pips"]
 
         if spread_pips > max_spread:
             return False, spread
@@ -1400,191 +1331,208 @@ def analyze_structure(df: pd.DataFrame, swings: List[SwingPoint]) -> Optional[St
     return None
 
 
-# ==================== PREMIUM / DISCOUNT ====================
+# ==================== DISPLACEMENT DETECTIE ====================
 
-def get_premium_discount(df: pd.DataFrame, swings: List[SwingPoint]) -> Optional[str]:
-    highs = [s for s in swings if s.type == "high"]
-    lows = [s for s in swings if s.type == "low"]
-    if not highs or not lows:
-        return None
-    swing_high = max(s.price for s in highs[-5:])
-    swing_low = min(s.price for s in lows[-5:])
-    if swing_high <= swing_low:
-        return None
-    current = float(df["close"].iloc[-1])
-    position = (current - swing_low) / (swing_high - swing_low)
-    if position >= 0.618:
-        return "premium"
-    elif position <= 0.382:
-        return "discount"
-    return "equilibrium"
-
-
-# ==================== OTE FIBONACCI ZONE ====================
-
-def detect_ote_zone(df: pd.DataFrame, swings: List[SwingPoint], direction: Direction) -> Optional[Zone]:
-    highs = [s for s in swings if s.type == "high"]
-    lows = [s for s in swings if s.type == "low"]
-    if len(highs) < 2 or len(lows) < 2:
-        return None
-
-    if direction == Direction.BULL:
-        swing_low = min(s.price for s in lows[-3:])
-        swing_high = max(s.price for s in highs[-3:])
-        if swing_high <= swing_low:
-            return None
-        rng = swing_high - swing_low
-        ote_high = swing_high - rng * 0.618
-        ote_low = swing_high - rng * 0.786
-        current = float(df["close"].iloc[-1])
-        if current > ote_high or current < ote_low:
-            return None
-        return Zone(
-            type=ZoneType.OTE, direction=Direction.BULL,
-            high=ote_high, low=ote_low,
-            midpoint=(ote_high + ote_low) / 2,
-            created_at=time.time(),
-        )
-    elif direction == Direction.BEAR:
-        swing_high = max(s.price for s in highs[-3:])
-        swing_low = min(s.price for s in lows[-3:])
-        if swing_high <= swing_low:
-            return None
-        rng = swing_high - swing_low
-        ote_low = swing_low + rng * 0.618
-        ote_high = swing_low + rng * 0.786
-        current = float(df["close"].iloc[-1])
-        if current < ote_low or current > ote_high:
-            return None
-        return Zone(
-            type=ZoneType.OTE, direction=Direction.BEAR,
-            high=ote_high, low=ote_low,
-            midpoint=(ote_high + ote_low) / 2,
-            created_at=time.time(),
-        )
-    return None
-
-
-# ==================== GOLD ROUND NUMBER DETECTION ====================
-
-def detect_gold_round_number(df: pd.DataFrame, direction: Direction) -> Optional[Zone]:
+def detect_displacement(df: pd.DataFrame, sweep_candle_idx: int, direction: Direction) -> Optional[dict]:
     """
-    Gold reageert sterk op round numbers:
-    - $100 levels ($4500, $4600) = sterkste
-    - $50 levels ($4550, $4650) = sterk
-    - $25 levels ($4525, $4575) = medium
-    Detecteert of price bij een round number is + candle reactie toont.
+    Na een sweep, zoek een sterke candle die in de sweep-richting beweegt.
+    De displacement BEVESTIGT dat de sweep echt was (niet een breakout).
+    
+    Returns dict met displacement info of None.
     """
-    if not GOLD_SCALP["enabled"]:
-        return None
-    current_price = float(df["close"].iloc[-1])
-    step = GOLD_SCALP["round_number_step"]       # 25
-    buffer = GOLD_SCALP["round_number_buffer"]    # 8.0
-    strong_step = GOLD_SCALP["round_number_strong"]  # 50
-
-    nearest_round = round(current_price / step) * step
-    distance = abs(current_price - nearest_round)
-    if distance > buffer:
-        return None
-
-    # Bepaal sterkte van het level
-    is_strong = (nearest_round % strong_step == 0)  # $50 of $100 levels
-    is_super = (nearest_round % 100 == 0)            # $100 levels ($4500, $4600)
-
-    last = df.iloc[-1]
-    atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 5.0
-
-    # Dynamische buffer gebaseerd op level sterkte
-    zone_buffer = buffer if is_strong else buffer * 0.6
-
-    if direction == Direction.BULL and current_price <= nearest_round + zone_buffer:
-        # Bullish reactie: prijs bij of onder round number, candle toont koopkracht
-        if last["close"] > last["open"]:  # Groene candle
-            zone = Zone(
-                type=ZoneType.ORDER_BLOCK, direction=Direction.BULL,
-                high=nearest_round + zone_buffer, low=nearest_round - zone_buffer,
-                midpoint=nearest_round, created_at=time.time(),
-            )
-            zone.timeframe = "5m_round_strong" if is_strong else "5m_round"
-            return zone
-
-    elif direction == Direction.BEAR and current_price >= nearest_round - zone_buffer:
-        # Bearish reactie: prijs bij of boven round number, candle toont verkoopdruk
-        if last["close"] < last["open"]:  # Rode candle
-            zone = Zone(
-                type=ZoneType.ORDER_BLOCK, direction=Direction.BEAR,
-                high=nearest_round + zone_buffer, low=nearest_round - zone_buffer,
-                midpoint=nearest_round, created_at=time.time(),
-            )
-            zone.timeframe = "5m_round_strong" if is_strong else "5m_round"
-            return zone
-
-    return None
-
-
-def check_gold_session_limit(state: BotState, symbol: str) -> bool:
-    if symbol != GOLD_SCALP["symbol"]:
-        return True
-    kz = get_current_killzone()
-    if not kz:
-        return False
-    if state.gold_session_losses["killzone"] != kz:
-        state.gold_session_losses["killzone"] = kz
-        state.gold_session_losses["losses"] = 0
-    if state.gold_session_losses["losses"] >= GOLD_SCALP["session_max_losses"]:
-        return False
-    return True
-
-
-def register_gold_session_loss(state: BotState, symbol: str):
-    if symbol == GOLD_SCALP["symbol"]:
-        kz = get_current_killzone()
-        if kz and state.gold_session_losses["killzone"] == kz:
-            state.gold_session_losses["losses"] += 1
-            if state.gold_session_losses["losses"] >= GOLD_SCALP["session_max_losses"]:
-                tg(f"🥇🧊 <b>GOLD SCALP SESSIE STOP</b>\n{state.gold_session_losses['losses']} losses in {kz.upper()}", state)
-
-
-# ==================== ORDER BLOCK DETECTIE ====================
-
-def detect_order_blocks(df: pd.DataFrame, structure: Optional[StructureBreak]) -> List[Zone]:
-    zones = []
-    if not structure or len(df) < 20:
-        return zones
+    if sweep_candle_idx >= len(df) - 1:
+        return None  # Sweep is de laatste candle, nog geen displacement mogelijk
+    
     avg_body = float(df["body"].tail(20).mean())
-    search_start = max(0, structure.index - 2)
-    search_end = min(len(df), structure.index + 5)
-
-    for i in range(search_start, search_end):
-        if i >= len(df):
-            break
+    if avg_body <= 0:
+        return None
+    
+    # Check de candles NA de sweep (max 3 candles window)
+    for i in range(sweep_candle_idx + 1, min(sweep_candle_idx + 4, len(df))):
         c = df.iloc[i]
         body = abs(c["close"] - c["open"])
-        if body < avg_body * 1.5:    # Was 2.0 — te streng, veel valide OBs gemist
-            continue
-        if structure.direction == Direction.BULL and c["close"] > c["open"]:
-            for j in range(i - 1, max(i - 6, 0), -1):
-                ob_c = df.iloc[j]
-                if ob_c["close"] < ob_c["open"]:
-                    zones.append(Zone(
-                        type=ZoneType.ORDER_BLOCK, direction=Direction.BULL,
-                        high=float(ob_c["high"]), low=float(ob_c["low"]),
-                        midpoint=float((ob_c["high"] + ob_c["low"]) / 2),
-                        created_at=time.time(), structure_break=structure,
-                    ))
-                    break
-        elif structure.direction == Direction.BEAR and c["close"] < c["open"]:
-            for j in range(i - 1, max(i - 6, 0), -1):
-                ob_c = df.iloc[j]
-                if ob_c["close"] > ob_c["open"]:
-                    zones.append(Zone(
-                        type=ZoneType.ORDER_BLOCK, direction=Direction.BEAR,
-                        high=float(ob_c["high"]), low=float(ob_c["low"]),
-                        midpoint=float((ob_c["high"] + ob_c["low"]) / 2),
-                        created_at=time.time(), structure_break=structure,
-                    ))
-                    break
-    return zones
+        
+        if direction == Direction.BEAR:
+            # Na een high sweep → verwacht sterke bearish candle
+            if c["close"] < c["open"] and body > avg_body * MIN_DISPLACEMENT_MULT:
+                return {
+                    "index": i,
+                    "body": body,
+                    "body_ratio": body / avg_body,
+                    "candle": c,
+                }
+        elif direction == Direction.BULL:
+            # Na een low sweep → verwacht sterke bullish candle
+            if c["close"] > c["open"] and body > avg_body * MIN_DISPLACEMENT_MULT:
+                return {
+                    "index": i,
+                    "body": body,
+                    "body_ratio": body / avg_body,
+                    "candle": c,
+                }
+    
+    return None
+
+
+def find_displacement_fvg(df: pd.DataFrame, disp_index: int, direction: Direction) -> Optional[Zone]:
+    """
+    Zoek een FVG gecreëerd door de displacement candle.
+    De FVG is het gat tussen candle vóór displacement en candle ná displacement.
+    """
+    if disp_index < 1 or disp_index >= len(df) - 1:
+        return None
+    
+    c_before = df.iloc[disp_index - 1]
+    c_disp = df.iloc[disp_index]
+    c_after = df.iloc[disp_index + 1] if disp_index + 1 < len(df) else None
+    
+    if c_after is None:
+        # Displacement is de laatste candle — FVG is het gat tot de candle ervoor
+        if direction == Direction.BEAR:
+            gap_high = float(c_before["low"])
+            gap_low = float(c_disp["high"]) if c_disp["high"] < c_before["low"] else None
+            if gap_low is not None and gap_high > gap_low:
+                return Zone(
+                    type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
+                    high=gap_high, low=gap_low,
+                    midpoint=(gap_high + gap_low) / 2,
+                    created_at=time.time(), timeframe="5m_disp",
+                )
+        elif direction == Direction.BULL:
+            gap_low = float(c_before["high"])
+            gap_high = float(c_disp["low"]) if c_disp["low"] > c_before["high"] else None
+            if gap_high is not None and gap_high > gap_low:
+                return Zone(
+                    type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
+                    high=gap_high, low=gap_low,
+                    midpoint=(gap_high + gap_low) / 2,
+                    created_at=time.time(), timeframe="5m_disp",
+                )
+        return None
+    
+    # Standaard 3-candle FVG
+    if direction == Direction.BEAR:
+        if float(c_after["high"]) < float(c_before["low"]):
+            return Zone(
+                type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
+                high=float(c_before["low"]), low=float(c_after["high"]),
+                midpoint=float((c_before["low"] + c_after["high"]) / 2),
+                created_at=time.time(), timeframe="5m_disp",
+            )
+    elif direction == Direction.BULL:
+        if float(c_after["low"]) > float(c_before["high"]):
+            return Zone(
+                type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
+                high=float(c_after["low"]), low=float(c_before["high"]),
+                midpoint=float((c_after["low"] + c_before["high"]) / 2),
+                created_at=time.time(), timeframe="5m_disp",
+            )
+    return None
+
+
+def find_sweep_setup(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
+                     state: BotState, htf_direction: Direction) -> Optional[dict]:
+    """
+    Hoofd-strategie: SWEEP → DISPLACEMENT → FVG
+    
+    1. Zoek een recente sweep (prijs neemt swing high/low uit, sluit er weer voorbij)
+    2. Check of er displacement na de sweep is (sterke candle)
+    3. Check of de displacement een FVG heeft gecreëerd
+    4. Check of huidige prijs bij de FVG is
+    
+    Returns dict met alle setup info, of None.
+    """
+    if len(df) < SWEEP_LOOKBACK_CANDLES:
+        return None
+    
+    highs = [s for s in swings if s.type == "high"]
+    lows = [s for s in swings if s.type == "low"]
+    current_price = float(df["close"].iloc[-1])
+    atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0
+    tolerance = atr * 0.1 if atr > 0 else 0
+    
+    best_setup = None
+    
+    # Scan recente candles voor sweeps
+    scan_start = max(0, len(df) - SWEEP_LOOKBACK_CANDLES)
+    
+    for i in range(scan_start, len(df)):
+        c = df.iloc[i]
+        
+        # === BEARISH SWEEP: prijs breekt boven swing high, sluit eronder ===
+        if htf_direction == Direction.BEAR:
+            for sh in highs:
+                if sh.index >= i:
+                    continue  # Swing moet vóór de sweep-candle zijn
+                if float(c["high"]) > sh.price and float(c["close"]) < sh.price:
+                    # Sweep gevonden! Check displacement
+                    disp = detect_displacement(df, i, Direction.BEAR)
+                    if not disp:
+                        continue
+                    
+                    # Zoek FVG van displacement
+                    fvg = find_displacement_fvg(df, disp["index"], Direction.BEAR)
+                    if not fvg:
+                        continue
+                    
+                    # Check of prijs bij FVG is (retest)
+                    entry_buffer = (fvg.high - fvg.low) * FVG_ENTRY_BUFFER_PCT
+                    if current_price >= fvg.low - entry_buffer and current_price <= fvg.high + entry_buffer:
+                        # Bepaal sweep type
+                        sweep_type = "swing_high"
+                        # Check equal highs
+                        for sh2 in highs:
+                            if sh2 != sh and abs(sh2.price - sh.price) < tolerance:
+                                sweep_type = "equal_highs"
+                                break
+                        
+                        quality = disp["body_ratio"]  # Hoe sterker displacement, hoe beter
+                        if not best_setup or quality > best_setup["quality"]:
+                            best_setup = {
+                                "direction": Direction.BEAR,
+                                "sweep_level": sh.price,
+                                "sweep_type": sweep_type,
+                                "sweep_index": i,
+                                "displacement": disp,
+                                "fvg": fvg,
+                                "quality": quality,
+                            }
+        
+        # === BULLISH SWEEP: prijs breekt onder swing low, sluit erboven ===
+        if htf_direction == Direction.BULL:
+            for sl_point in lows:
+                if sl_point.index >= i:
+                    continue
+                if float(c["low"]) < sl_point.price and float(c["close"]) > sl_point.price:
+                    disp = detect_displacement(df, i, Direction.BULL)
+                    if not disp:
+                        continue
+                    
+                    fvg = find_displacement_fvg(df, disp["index"], Direction.BULL)
+                    if not fvg:
+                        continue
+                    
+                    entry_buffer = (fvg.high - fvg.low) * FVG_ENTRY_BUFFER_PCT
+                    if current_price >= fvg.low - entry_buffer and current_price <= fvg.high + entry_buffer:
+                        sweep_type = "swing_low"
+                        for sl2 in lows:
+                            if sl2 != sl_point and abs(sl2.price - sl_point.price) < tolerance:
+                                sweep_type = "equal_lows"
+                                break
+                        
+                        quality = disp["body_ratio"]
+                        if not best_setup or quality > best_setup["quality"]:
+                            best_setup = {
+                                "direction": Direction.BULL,
+                                "sweep_level": sl_point.price,
+                                "sweep_type": sweep_type,
+                                "sweep_index": i,
+                                "displacement": disp,
+                                "fvg": fvg,
+                                "quality": quality,
+                            }
+    
+    return best_setup
 
 
 # ==================== FVG DETECTIE ====================
@@ -1684,124 +1632,6 @@ def detect_liquidity_sweep(df: pd.DataFrame, symbol: str, swings: List[SwingPoin
     return None
 
 
-# ==================== CONFIRMATION CANDLE ====================
-
-def check_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Optional[str]:
-    """
-    Alleen sterke confirmaties: engulfing en strong_close.
-    rejection_wick en pin_bar zijn VERWIJDERD — te onbetrouwbaar op 5M.
-    Engulfing wordt EERST gecheckt om volgorde-bugs te voorkomen.
-    """
-    if len(df) < 3:
-        return None
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    has_volume = False
-    if "volume" in df.columns and "avg_volume" in df.columns:
-        vol = float(last["volume"])
-        avg_vol = float(last["avg_volume"])
-        if avg_vol > 0 and vol > avg_vol * 1.3:
-            has_volume = True
-
-    avg_body = float(df["body"].tail(20).mean())
-
-    if direction == Direction.BULL:
-        # === ENGULFING (sterkste confirmatie) ===
-        if (last["close"] > last["open"] and prev["close"] < prev["open"]
-            and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
-            and last["close"] > prev["open"] and last["open"] < prev["close"]):
-            if zone.contains_price(float(last["low"]), ZONE_CONFIRM_BUFFER):
-                return "engulfing_vol" if has_volume else "engulfing"
-
-        # === STRONG CLOSE ===
-        if (last["close"] > last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
-            and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
-            return "strong_close_vol" if has_volume else "strong_close"
-
-    elif direction == Direction.BEAR:
-        # === ENGULFING ===
-        if (last["close"] < last["open"] and prev["close"] > prev["open"]
-            and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
-            and last["close"] < prev["open"] and last["open"] > prev["close"]):
-            if zone.contains_price(float(last["high"]), ZONE_CONFIRM_BUFFER):
-                return "engulfing_vol" if has_volume else "engulfing"
-
-        # === STRONG CLOSE ===
-        if (last["close"] < last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
-            and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
-            return "strong_close_vol" if has_volume else "strong_close"
-
-    return None
-
-
-# ==================== GOLD SCALP CONFIRMATION ====================
-
-def check_gold_scalp_confirmation(df: pd.DataFrame, direction: Direction, zone: Zone) -> Optional[str]:
-    """
-    Gold round number confirmatie — rejection_wick is TOEGESTAAN hier.
-    Gold bounced van round numbers met wicks, dat is het standaard signaal.
-    Engulfing en strong_close ook geaccepteerd.
-    """
-    if len(df) < 3:
-        return None
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    has_volume = False
-    if "volume" in df.columns and "avg_volume" in df.columns:
-        vol = float(last["volume"])
-        avg_vol = float(last["avg_volume"])
-        if avg_vol > 0 and vol > avg_vol * 1.3:
-            has_volume = True
-
-    avg_body = float(df["body"].tail(20).mean())
-
-    if direction == Direction.BULL:
-        cr = float(last["candle_range"])
-        lw = float(last["lower_wick"])
-
-        # ENGULFING
-        if (last["close"] > last["open"] and prev["close"] < prev["open"]
-            and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
-            and last["close"] > prev["open"] and last["open"] < prev["close"]):
-            if zone.contains_price(float(last["low"]), ZONE_CONFIRM_BUFFER):
-                return "engulfing_vol" if has_volume else "engulfing"
-
-        # STRONG CLOSE
-        if (last["close"] > last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
-            and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
-            return "strong_close_vol" if has_volume else "strong_close"
-
-        # REJECTION WICK — toegestaan voor gold round numbers
-        if cr > 0 and lw / cr >= 0.40 and last["close"] > last["open"]:
-            if zone.contains_price(float(last["low"]), ZONE_ENTRY_BUFFER):
-                return "gold_wick_vol" if has_volume else "gold_wick"
-
-    elif direction == Direction.BEAR:
-        cr = float(last["candle_range"])
-        uw = float(last["upper_wick"])
-
-        # ENGULFING
-        if (last["close"] < last["open"] and prev["close"] > prev["open"]
-            and last["body"] > prev["body"] * MIN_ENGULFING_BODY_RATIO
-            and last["close"] < prev["open"] and last["open"] > prev["close"]):
-            if zone.contains_price(float(last["high"]), ZONE_CONFIRM_BUFFER):
-                return "engulfing_vol" if has_volume else "engulfing"
-
-        # STRONG CLOSE
-        if (last["close"] < last["open"] and last["body"] > avg_body * MIN_STRONG_CLOSE_BODY_RATIO
-            and zone.contains_price(float(last["open"]), ZONE_CONFIRM_BUFFER)):
-            return "strong_close_vol" if has_volume else "strong_close"
-
-        # REJECTION WICK — toegestaan voor gold round numbers
-        if cr > 0 and uw / cr >= 0.40 and last["close"] < last["open"]:
-            if zone.contains_price(float(last["high"]), ZONE_ENTRY_BUFFER):
-                return "gold_wick_vol" if has_volume else "gold_wick"
-
-    return None
-
-
 # ==================== ZONE MANAGEMENT ====================
 
 def store_zones(state: BotState, symbol: str, new_zones: List[Zone], htf: bool = False):
@@ -1880,209 +1710,49 @@ def check_zone_confluence(state: BotState, zone: Zone, symbol: str) -> bool:
     return False
 
 
-# ==================== MARKET REGIME ====================
+# ==================== HTF BIAS (1H) — STRUCTUUR-ONLY ====================
 
-def detect_regime(df: pd.DataFrame) -> str:
-    if len(df) < 30:
-        return "unknown"
-    atr = float(df["atr"].iloc[-1])
-    atr_avg = float(df["atr"].tail(20).mean())
-    ema_dist = abs(float(df["ema50"].iloc[-1]) - float(df["ema200"].iloc[-1]))
-    ratio = ema_dist / atr if atr > 0 else 0
-    above_ema = (df["close"].tail(10) > df["ema50"].tail(10)).sum()
-    vol_expanding = atr > atr_avg * 1.2
-
-    if ratio > 2 and (above_ema >= 8 or above_ema <= 2) and vol_expanding:
-        return "trending"
-    elif ratio < 0.5 and not vol_expanding:
-        return "ranging"
-    return "transitioning"
-
-
-# ==================== HTF BIAS (1H) + ZONES ====================
-
-async def get_htf_bias(account, symbol: str, state: BotState) -> Optional[Direction]:
+async def get_htf_direction(account, symbol: str, state: BotState) -> Optional[Direction]:
+    """
+    Simpele HTF bias op basis van 1H market structure.
+    Geen EMAs, geen regime — alleen: wat is de laatse structuur break op 1H?
+    
+    Returns Direction of None als geen duidelijke richting.
+    """
     try:
-        candles = await get_candles(account, symbol, "1h", 250, state)  # Was 120 — EMA200 heeft 200+ nodig
-        if not candles or len(candles) < 100:  # Was 60
+        candles = await get_candles(account, symbol, "1h", 150, state)
+        if not candles or len(candles) < 50:
             return None
         df = pd.DataFrame(candles)
         df = calculate_indicators(df)
-        price = float(df["close"].iloc[-1])
-        ema50 = float(df["ema50"].iloc[-1])
-        ema200 = float(df["ema200"].iloc[-1])
-
+        
         swings_1h = detect_swing_points(df, lookback=4)
         structure_1h = analyze_structure(df, swings_1h)
+        
+        # Sla 1H zones op voor confluence checks
         if structure_1h:
-            new_obs_1h = detect_order_blocks(df, structure_1h)
-            for ob in new_obs_1h:
-                ob.timeframe = "1h"
-            store_zones(state, symbol, new_obs_1h, htf=True)
             new_fvgs_1h = detect_fvgs(df, lookback=8)
             for fvg in new_fvgs_1h:
                 fvg.timeframe = "1h"
             store_zones(state, symbol, new_fvgs_1h, htf=True)
-
-        if price > ema50 > ema200:
-            return Direction.BULL
-        if price < ema50 < ema200:
-            return Direction.BEAR
-        if ema50 > ema200 * 1.001 and price > ema200:
-            return Direction.BULL
-        if ema50 < ema200 * 0.999 and price < ema200:
-            return Direction.BEAR
-
-        # FIX: Structuur-based fallback als EMAs gemixed zijn
+        
+        # Structuur bepaalt richting
         if structure_1h:
             return structure_1h.direction
-
-        # Laatste fallback: price vs EMA200
-        if price > ema200:
-            return Direction.BULL
-        elif price < ema200:
-            return Direction.BEAR
-
+        
+        # Fallback: hogere highs/lows = bull, lagere highs/lows = bear
+        highs = [s for s in swings_1h if s.type == "high"]
+        lows = [s for s in swings_1h if s.type == "low"]
+        if len(highs) >= 2 and len(lows) >= 2:
+            if highs[-1].price > highs[-2].price and lows[-1].price > lows[-2].price:
+                return Direction.BULL
+            if highs[-1].price < highs[-2].price and lows[-1].price < lows[-2].price:
+                return Direction.BEAR
+        
         return None
-    except Exception:
+    except Exception as e:
+        log.warning(f"HTF bias error {symbol}: {e}")
         return None
-
-
-# ==================== TRADE GRADING ====================
-
-def grade_setup(state: BotState, htf_aligned: bool, structure, zone, confirmation, sweep,
-                premium_discount, regime, direction, symbol="",
-                has_confluence=False, is_ote=False):
-    """
-    FIX: htf_aligned is nu altijd een bool — geen type-inconsistentie meer.
-    """
-    score = 0
-    reasons = []
-
-    if not zone or not confirmation:
-        return "D", 0, 0, ["NO_ZONE" if not zone else "NO_CONFIRM"]
-
-    # FIX 8: OB krijgt meer punten dan FVG
-    if zone.type == ZoneType.ORDER_BLOCK:
-        reasons.append(f"ZONE(ob)")
-        score += 2.0
-    elif zone.type == ZoneType.FAIR_VALUE_GAP:
-        reasons.append(f"ZONE(fvg)")
-        score += 1.0  # Was 2.0 — FVG is minder sterk dan OB
-    else:
-        reasons.append(f"ZONE({zone.type.value})")
-        score += 1.5
-
-    if hasattr(zone, 'timeframe') and zone.timeframe == "15m":
-        score += 1.0
-        reasons.append("HTF_ZONE")
-    elif hasattr(zone, 'timeframe') and zone.timeframe == "5m":
-        score += 0.5
-        reasons.append("LTF_ZONE")
-
-    reasons.append(f"CONFIRM({confirmation})")
-    score += 2.0
-
-    if "_vol" in confirmation:
-        score += 1.0
-        reasons.append("VOLUME✓")
-
-    if has_confluence:
-        score += 2.0
-        reasons.append("CONFLUENCE_1H")
-
-    if is_ote:
-        score += 2.0
-        reasons.append("OTE_FIB")
-
-    if htf_aligned:
-        score += 2.5
-        reasons.append("HTF_ALIGNED")
-
-    if structure:
-        if structure.type == StructureType.CHOCH:
-            score += 2.0
-            reasons.append("CHoCH")
-        else:
-            score += 1.5
-            reasons.append("BOS")
-
-    if sweep:
-        strength = sweep.get("strength", "weak")
-        pts = {"strong": 2.5, "medium": 1.5, "weak": 0.5}.get(strength, 0.5)
-        score += pts
-        reasons.append(f"SWEEP_{strength.upper()}({sweep['reason']})")
-
-    if premium_discount:
-        if (direction == Direction.BULL and premium_discount == "discount") or \
-           (direction == Direction.BEAR and premium_discount == "premium"):
-            score += 1.5
-            reasons.append("P/D_ALIGNED")
-
-    if regime == "trending":
-        score += 1.0
-        reasons.append("TRENDING")
-    elif regime == "ranging":
-        score -= 3.0
-        reasons.append("RANGING⛔")
-
-    if zone.type == ZoneType.ORDER_BLOCK and zone.structure_break:
-        score += 0.5
-        reasons.append("OB+STRUCT")
-
-    # Gold round number bonus
-    if hasattr(zone, 'timeframe') and zone.timeframe and 'round_strong' in zone.timeframe:
-        score += 1.5
-        reasons.append("GOLD_ROUND_$50")
-    elif hasattr(zone, 'timeframe') and zone.timeframe and 'round' in zone.timeframe:
-        score += 0.5
-        reasons.append("GOLD_ROUND_$25")
-
-    # Adaptive boosts
-    boosts = get_adaptive_boosts(state)
-    adaptive_adjustment = 0
-    if boosts:
-        sym_boost = boosts.get("symbol", {}).get(symbol, 1.0)
-        if sym_boost != 1.0:
-            adaptive_adjustment += (sym_boost - 1.0) * 2
-            reasons.append(f"ADP_SYM({sym_boost:.2f})")
-
-        conf_boost = boosts.get("confirmation", {}).get(confirmation, 1.0)
-        if conf_boost != 1.0:
-            adaptive_adjustment += (conf_boost - 1.0) * 1.5
-            reasons.append(f"ADP_CONF({conf_boost:.2f})")
-
-        kz = get_current_killzone() or "unknown"
-        kz_boost = boosts.get("killzone", {}).get(kz, 1.0)
-        if kz_boost != 1.0:
-            adaptive_adjustment += (kz_boost - 1.0) * 1.0
-            reasons.append(f"ADP_KZ({kz_boost:.2f})")
-
-        zt_boost = boosts.get("zone_type", {}).get(zone.type.value, 1.0)
-        if zt_boost != 1.0:
-            adaptive_adjustment += (zt_boost - 1.0) * 1.0
-            reasons.append(f"ADP_ZT({zt_boost:.2f})")
-
-        adaptive_adjustment = max(-2.0, min(2.0, adaptive_adjustment))
-        score += adaptive_adjustment
-
-    if score >= 10:
-        has_sweep = any("SWEEP" in r for r in reasons)
-        has_pd = any("P/D_ALIGNED" in r for r in reasons)
-        has_choch = any("CHoCH" in r for r in reasons)
-        has_conf = any("CONFLUENCE" in r for r in reasons)
-        has_ote_r = any("OTE" in r for r in reasons)
-        if has_sweep or has_pd or has_choch or has_conf or has_ote_r:
-            return "A+", 1.0, score, reasons
-        else:
-            return "A", 1.0, score, reasons
-    elif score >= 8:
-        return "A", 0.75, score, reasons
-    elif score >= 5.5:     # Was 6 — met 5m zone bonus is dit nu realistisch
-        return "B+", 0.6, score, reasons
-    elif score >= 4.5:     # NEW: B grade voor setups met basis-kwaliteit
-        return "B", 0.4, score, reasons
-    return "D", 0, score, reasons
 
 
 # ==================== LOT SIZE ====================
@@ -2128,36 +1798,35 @@ def calculate_lot_size(balance: float, sl_distance: float, symbol: str,
 
 # ==================== SL / TP BEREKENING ====================
 
-def calculate_trade_levels(direction: Direction, entry: float, zone: Zone,
-                           df: pd.DataFrame, symbol: str = "", spread: float = 0):
+def calculate_sweep_trade_levels(direction: Direction, entry: float, sweep_level: float,
+                                  df: pd.DataFrame, symbol: str = "", spread: float = 0):
+    """
+    SL achter het sweep level (waar liquidity gepakt werd).
+    Dit is logischer dan ATR-based SL — als prijs voorbij sweep gaat, was de setup verkeerd.
+    """
     atr = float(df["atr"].iloc[-1])
-    buffer = atr * 0.15
-    max_sl_distance = atr * 2.5
+    buffer = atr * 0.3  # Buffer achter sweep level
 
     spec = SYMBOL_SPECS.get(symbol, {})
     category = spec.get("category", "forex")
     pip_size = spec.get("pip_size", 0.0001)
     min_sl_pips = MIN_SL_PIPS.get(category, 15)
     min_sl_dist = min_sl_pips * pip_size
+    max_sl_distance = atr * 3.0
 
-    is_gold = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
-    tp1_mult = GOLD_SCALP["tp1_mult"] if is_gold else 2.0
-    tp2_mult = GOLD_SCALP["tp2_mult"] if is_gold else 3.0
-    tp3_mult = GOLD_SCALP["tp3_mult"] if is_gold else 4.5
-
-    # Gold scalps: strakker SL dan ATR-based
-    if is_gold and hasattr(zone, 'timeframe') and 'round' in (zone.timeframe or ''):
-        scalp_sl_dist = GOLD_SCALP["scalp_sl_pips"] * spec.get("pip_size", 0.1)  # 40 pips = $4.0
-        min_sl_dist = min(scalp_sl_dist, min_sl_dist)  # Gebruik de strakkere van de twee
-        max_sl_distance = scalp_sl_dist  # Cap SL op scalp niveau
+    is_gold = symbol == "XAUUSD"
+    tp1_mult = GOLD_TP1_MULT if is_gold else TP1_MULT
+    tp2_mult = GOLD_TP2_MULT if is_gold else TP2_MULT
+    tp3_mult = GOLD_TP3_MULT if is_gold else TP3_MULT
 
     effective_entry = entry + spread if direction == Direction.BULL else entry - spread
 
     if direction == Direction.BULL:
-        sl = zone.low - buffer
+        # SL onder het sweep level (de low die gesweept werd)
+        sl = sweep_level - buffer
         sl_dist = effective_entry - sl
-        if sl_dist < max(atr * 1.0, min_sl_dist):
-            sl_dist = max(atr * 1.0, min_sl_dist)
+        if sl_dist < min_sl_dist:
+            sl_dist = min_sl_dist
             sl = effective_entry - sl_dist
         if sl_dist > max_sl_distance:
             sl = effective_entry - max_sl_distance
@@ -2166,10 +1835,11 @@ def calculate_trade_levels(direction: Direction, entry: float, zone: Zone,
         tp2 = entry + sl_dist * tp2_mult
         tp3 = entry + sl_dist * tp3_mult
     else:
-        sl = zone.high + buffer
+        # SL boven het sweep level (de high die gesweept werd)
+        sl = sweep_level + buffer
         sl_dist = sl - effective_entry
-        if sl_dist < max(atr * 1.0, min_sl_dist):
-            sl_dist = max(atr * 1.0, min_sl_dist)
+        if sl_dist < min_sl_dist:
+            sl_dist = min_sl_dist
             sl = effective_entry + sl_dist
         if sl_dist > max_sl_distance:
             sl = effective_entry + max_sl_distance
@@ -2389,200 +2059,95 @@ def cleanup_recent_signals(state: BotState):
             del state.recent_signals[k]
 
 
-# ==================== HOOFDSTRATEGIE ====================
+# ==================== HOOFDSTRATEGIE: SWEEP → DISPLACEMENT → FVG ====================
 
 async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
                                   balance: float, state: BotState) -> Optional[TradeSetup]:
+    """
+    Sweep → Displacement → FVG strategie.
+    
+    1. Haal 1H richting op (structuur-based)
+    2. Haal 5M data op, zoek swings
+    3. Zoek sweep: prijs neemt swing high/low uit, sluit er weer voorbij
+    4. Check displacement: sterke candle na de sweep
+    5. Check FVG: gat gecreëerd door displacement
+    6. Entry als prijs bij FVG is
+    7. SL achter sweep level
+    
+    Dat is het. Geen regime, geen grading, geen confirmatie functies.
+    """
     try:
-        htf_bias = await get_htf_bias(account, symbol, state)
-
-        # === FIX: HTF BIAS VERPLICHT — geen trading zonder 1H richting ===
-        if not htf_bias:
-            log.debug(f"  {symbol}: geen HTF bias — skip")
+        # === STAP 1: HTF RICHTING (1H structuur) ===
+        htf_direction = await get_htf_direction(account, symbol, state)
+        if not htf_direction:
+            log.debug(f"  {symbol}: geen 1H richting — skip")
             return None
 
-        # MTF (15M)
-        candles_15m = await get_candles(account, symbol, "15m", 100, state)
-        if not candles_15m or len(candles_15m) < 40:
-            return None
-        df_15m = pd.DataFrame(candles_15m)
-        df_15m = calculate_indicators(df_15m)
-        swings_15m = detect_swing_points(df_15m)
-        structure_15m = analyze_structure(df_15m, swings_15m)
-        regime = detect_regime(df_15m)
-
-        # === FIX: Regime filter — ranging altijd blokkeren, transitioning alleen als HTF bias sterk is ===
-        if regime == "ranging":
-            log.debug(f"  {symbol}: regime ranging — skip")
-            return None
-        if regime == "transitioning":
-            # Transitioning OK als HTF bias duidelijk is (pullback in trend)
-            # Maar niet als regime unknown is
-            log.debug(f"  {symbol}: regime transitioning — HTF bias is {htf_bias.value}, doorgaan")
-            # (HTF bias is al verplicht hierboven, dus we weten dat er richting is)
-
-        if structure_15m:
-            new_obs = detect_order_blocks(df_15m, structure_15m)
-            for ob in new_obs:
-                ob.timeframe = "15m"
-            store_zones(state, symbol, new_obs)
-            new_fvgs = detect_fvgs(df_15m)
-            for fvg in new_fvgs:
-                fvg.timeframe = "15m"
-            store_zones(state, symbol, new_fvgs)
-
-        # LTF (5M)
+        # === STAP 2: 5M DATA + SWINGS ===
         candles_5m = await get_candles(account, symbol, "5m", 100, state)
         if not candles_5m or len(candles_5m) < 50:
             return None
         df_5m = pd.DataFrame(candles_5m)
         df_5m = calculate_indicators(df_5m)
         swings_5m = detect_swing_points(df_5m)
-        update_zone_status(state, symbol, df_5m)
-        update_session_levels(state, symbol, float(df_5m["high"].iloc[-1]), float(df_5m["low"].iloc[-1]))
 
-        structure_5m = analyze_structure(df_5m, swings_5m)
-        if structure_5m:
-            new_obs_5m = detect_order_blocks(df_5m, structure_5m)
-            for ob in new_obs_5m:
-                ob.timeframe = "5m"
-            store_zones(state, symbol, new_obs_5m)
-            new_fvgs_5m = detect_fvgs(df_5m)
-            for fvg in new_fvgs_5m:
-                fvg.timeframe = "5m"
-            store_zones(state, symbol, new_fvgs_5m)
-
-        sweep = detect_liquidity_sweep(df_5m, symbol, swings_5m, state)
-        pd_zone = get_premium_discount(df_15m, swings_15m)
-        current_price = float(df_5m["close"].iloc[-1])
-
-        # === FIX 5: DIRECTION = HTF BIAS — geen fallbacks meer ===
-        # HTF bias is verplicht (hierboven al gecheckt) en bepaalt richting
-        # 15M structuur moet ALIGNEN, niet overrulen
-        direction = htf_bias
-
-        if structure_15m and structure_15m.direction != direction:
-            log.debug(f"  {symbol}: 15M structuur ({structure_15m.direction.value}) conflict met HTF ({direction.value}) — skip")
+        if len(swings_5m) < 4:
+            log.debug(f"  {symbol}: te weinig swings ({len(swings_5m)})")
             return None
 
-        # === FIX 11: P/D HARD ENFORCE ===
-        if direction == Direction.BULL and pd_zone == "premium":
-            log.debug(f"  {symbol}: BULL in premium — skip")
-            return None
-        if direction == Direction.BEAR and pd_zone == "discount":
-            log.debug(f"  {symbol}: BEAR in discount — skip")
+        # === STAP 3-5: ZOEK SWEEP → DISPLACEMENT → FVG ===
+        setup_data = find_sweep_setup(df_5m, symbol, swings_5m, state, htf_direction)
+        if not setup_data:
+            log.debug(f"  {symbol}: geen sweep→displacement→FVG setup")
             return None
 
-        # Zoek zone
-        active_zone = find_active_zone(state, symbol, current_price, direction)
+        direction = setup_data["direction"]
+        fvg = setup_data["fvg"]
+        sweep_level = setup_data["sweep_level"]
+        sweep_type = setup_data["sweep_type"]
+        disp = setup_data["displacement"]
 
-        # OTE Fibonacci check
-        is_ote = False
-        if not active_zone:
-            ote_zone = detect_ote_zone(df_15m, swings_15m, direction)
-            if ote_zone:
-                active_zone = ote_zone
-                active_zone.timeframe = "15m_ote"
-                is_ote = True
-
-        # Gold round number check
-        is_gold_scalp = GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]
-        is_gold_round = False
-        if not active_zone and is_gold_scalp:
-            round_zone = detect_gold_round_number(df_5m, direction)
-            if round_zone:
-                active_zone = round_zone
-                is_gold_round = True
-                # timeframe is al gezet in detect_gold_round_number
-
-        if not active_zone:
-            zone_count = len(state.zone_store.get(symbol, []))
-            valid_zones = len([z for z in state.zone_store.get(symbol, []) if z.is_valid and z.direction == direction])
-            log.debug(f"  {symbol}: geen zone bij prijs {current_price:.2f} ({direction.value}) — {zone_count} zones, {valid_zones} valid in richting")
-            return None
-
-        has_confluence = check_zone_confluence(state, active_zone, symbol)
-
-        # === FIX 3: 5M zones ALLEEN met HTF confluence (gold round numbers uitgezonderd) ===
-        if hasattr(active_zone, 'timeframe') and active_zone.timeframe == "5m":
-            if not has_confluence:
-                log.debug(f"  {symbol}: 5M zone zonder HTF confluence — skip (noise)")
-                return None
-
-        # Gold prime killzone check
-        if is_gold_scalp:
-            kz = get_current_killzone()
-            if kz and kz not in GOLD_SCALP["prime_killzones"]:
-                if not (has_confluence or is_ote or is_gold_round):
-                    return None
-
-        # === CONFIRMATIE ===
-        # Gold round number zones mogen rejection_wick gebruiken (standaard gold scalp signal)
-        if is_gold_round:
-            confirmation = check_gold_scalp_confirmation(df_5m, direction, active_zone)
-        else:
-            confirmation = check_confirmation(df_5m, direction, active_zone)
-
-        if not confirmation:
-            log.info(f"  📍 {symbol}: IN ZONE ({active_zone.type.value} {active_zone.timeframe}) — wacht op confirmatie candle")
-            return None
-
+        # === SPREAD CHECK ===
         spread_ok, spread = await check_spread(conn, symbol, state)
         if not spread_ok:
             log.info(f"  ❌ {symbol}: spread te hoog")
             return None
 
-        htf_aligned = True  # Altijd true want HTF bias = direction
-
-        grade, risk_mult, score, reasons = grade_setup(
-            state=state,
-            htf_aligned=htf_aligned,
-            structure=structure_15m if structure_15m and structure_15m.direction == direction else structure_5m,
-            zone=active_zone, confirmation=confirmation,
-            sweep=sweep if sweep and sweep["type"] == direction.value else None,
-            premium_discount=pd_zone, regime=regime, direction=direction,
-            symbol=symbol, has_confluence=has_confluence, is_ote=is_ote,
-        )
-
-        # === GRADE FILTER — gold scalps mogen B+ ===
-        if is_gold_scalp:
-            if grade not in ("A+", "A", "B+"):
-                log.info(f"  ❌ {symbol}: grade {grade} (score {score:.1f}) — gold scalp min B+ | {' | '.join(reasons[:5])}")
-                return None
-        else:
-            if grade not in ("A+", "A"):
-                log.info(f"  ❌ {symbol}: grade {grade} (score {score:.1f}) — alleen A+/A | {' | '.join(reasons[:5])}")
-                return None
-
-        price_data = await rate_limited_call(conn.get_symbol_price(symbol), state, label=f"price_{symbol}")
+        # === ENTRY PRIJS ===
+        price_data = await rate_limited_call(
+            conn.get_symbol_price(symbol), state, label=f"price_{symbol}")
         if not price_data:
             return None
         entry = price_data["ask"] if direction == Direction.BULL else price_data["bid"]
         actual_spread = price_data["ask"] - price_data["bid"]
 
-        sl, tp1, tp2, tp3, sl_dist = calculate_trade_levels(direction, entry, active_zone, df_5m, symbol, actual_spread)
+        # === SL/TP BEREKENING — SL achter sweep level ===
+        sl, tp1, tp2, tp3, sl_dist = calculate_sweep_trade_levels(
+            direction, entry, sweep_level, df_5m, symbol, actual_spread)
 
         effective_entry = entry + actual_spread if direction == Direction.BULL else entry - actual_spread
-        rr = abs((tp3 - effective_entry) / (abs(effective_entry - sl))) if sl_dist > 0 else 0
+        rr = abs((tp3 - effective_entry) / abs(effective_entry - sl)) if sl_dist > 0 else 0
 
-        min_rr = GOLD_SCALP["min_rr"] if is_gold_scalp else MIN_RR
-        if rr < min_rr:
-            log.info(f"  ❌ {symbol}: RR {rr:.1f} < min {min_rr}")
+        if rr < MIN_RR:
+            log.info(f"  ❌ {symbol}: RR {rr:.1f} < min {MIN_RR}")
             return None
 
-        # Zone pas markeren als ALLE checks geslaagd zijn
-        mark_zone_tested(active_zone)
+        # === SETUP GEVONDEN ===
+        reasons = [
+            f"SWEEP({sweep_type})",
+            f"DISP({disp['body_ratio']:.1f}x)",
+            f"FVG({fvg.timeframe})",
+            f"HTF({htf_direction.value})",
+        ]
 
-        log.info(f"  ✅ {symbol}: SETUP GEVONDEN — {grade} (score {score:.1f}) RR 1:{rr:.1f} {direction.value.upper()}")
+        log.info(f"  ✅ {symbol}: SWEEP SETUP — {direction.value.upper()} RR 1:{rr:.1f} | {' | '.join(reasons)}")
 
         return TradeSetup(
             symbol=symbol, direction=direction, entry=entry,
-            stop_loss=sl, tp1=tp1, tp2=tp2, tp3=tp3, zone=active_zone,
-            grade=grade, score=score, risk_mult=risk_mult,
-            reasons=reasons, regime=regime, rr=rr,
-            htf_bias=htf_bias, mtf_structure=structure_15m,
-            confirmation=confirmation, confluence=has_confluence,
-            ote_entry=is_ote,
+            stop_loss=sl, tp1=tp1, tp2=tp2, tp3=tp3, zone=fvg,
+            rr=rr, sweep_level=sweep_level, sweep_type=sweep_type,
+            displacement_body=disp["body"], htf_direction=htf_direction,
+            reasons=reasons,
         )
     except Exception as e:
         log.error(f"Analyse error {symbol}: {e}")
@@ -2593,7 +2158,7 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
 
 async def execute_trade(conn, setup: TradeSetup, balance: float, state: BotState,
                         df_5m: pd.DataFrame = None) -> bool:
-    risk_pct = get_dynamic_risk(state, balance, grade=setup.grade, symbol=setup.symbol, df=df_5m) * setup.risk_mult
+    risk_pct = get_dynamic_risk(state, balance, symbol=setup.symbol, df=df_5m)
     sl_dist = abs(setup.entry - setup.stop_loss)
 
     # Dynamische pip value — GEEN FALLBACK, skip als niet beschikbaar
@@ -2645,36 +2210,33 @@ async def execute_trade(conn, setup: TradeSetup, balance: float, state: BotState
         state.daily_state["trades_today"] += 1
         r = " | ".join(setup.reasons)
         de = "🟢" if setup.direction == Direction.BULL else "🔴"
-        ote_str = " | 📐 OTE ENTRY" if setup.ote_entry else ""
-        conf_str = " | 🏛️ 1H CONFLUENCE" if setup.confluence else ""
         wr, total = state.get_symbol_winrate(setup.symbol)
 
-        tg(f"""<b>🧪 DRY RUN — Grade {setup.grade}</b>
+        tg(f"""<b>🧪 DRY RUN — SWEEP SETUP</b>
 
 📌 {setup.symbol} | {setup.direction.value.upper()}
 🕐 KZ: {kz.upper() if kz else '?'}
-🔍 Regime: {setup.regime.upper()}{conf_str}{ote_str}
+🎯 Sweep: {setup.sweep_type} @ {setup.sweep_level:.5f}
 💰 Entry: {setup.entry:.5f}
 🛑 SL: {setup.stop_loss:.5f}
 🎯 TP1: {setup.tp1:.5f} | TP2: {setup.tp2:.5f} | TP3: {setup.tp3:.5f}
 📊 RR: 1:{setup.rr:.1f} | Lots: {lot}
 💵 Risk: {risk_pct*100:.2f}% (${lot_details['risk_amount']})
 📏 SL: {lot_details['sl_pips']:.1f} pips | PipVal: {lot_details['pip_value_used']:.2f}
-✅ Confirm: {setup.confirmation}
-🗺️ Zone: {setup.zone.type.value} ({setup.zone.timeframe})
+🗺️ FVG: {setup.zone.timeframe}
 🏥 {setup.symbol} WR: {wr*100:.0f}% ({total}t)
-📋 Score: {setup.score:.1f} | {r}""", state)
+📋 {r}""", state)
 
         trade_data = {
             "time": datetime.now(timezone.utc).isoformat(),
             "symbol": setup.symbol, "direction": setup.direction.value,
-            "grade": setup.grade, "score": setup.score,
+            "grade": "SWEEP", "score": setup.displacement_body,
             "entry": setup.entry, "sl": setup.stop_loss,
             "tp1": setup.tp1, "tp2": setup.tp2, "tp3": setup.tp3,
             "lot": lot, "rr": setup.rr, "risk_pct": risk_pct,
-            "confirmation": setup.confirmation, "zone_type": setup.zone.type.value,
-            "regime": setup.regime, "killzone": kz,
-            "confluence": setup.confluence, "ote_entry": setup.ote_entry,
+            "confirmation": setup.sweep_type, "zone_type": setup.zone.type.value,
+            "regime": "sweep", "killzone": kz,
+            "confluence": False, "ote_entry": False,
             "reasons": setup.reasons,
         }
         db_save_trade(trade_data)
@@ -2741,13 +2303,13 @@ async def execute_trade(conn, setup: TradeSetup, balance: float, state: BotState
     trade_data = {
         "time": datetime.now(timezone.utc).isoformat(),
         "symbol": setup.symbol, "direction": setup.direction.value,
-        "grade": setup.grade, "score": setup.score,
+        "grade": "SWEEP", "score": setup.displacement_body,
         "entry": setup.entry, "sl": setup.stop_loss,
         "tp1": setup.tp1, "tp2": setup.tp2, "tp3": setup.tp3,
         "lot": lot, "rr": setup.rr, "risk_pct": risk_pct,
-        "confirmation": setup.confirmation, "zone_type": setup.zone.type.value,
-        "regime": setup.regime, "killzone": kz,
-        "confluence": setup.confluence, "ote_entry": setup.ote_entry,
+        "confirmation": setup.sweep_type, "zone_type": setup.zone.type.value,
+        "regime": "sweep", "killzone": kz,
+        "confluence": False, "ote_entry": False,
         "reasons": setup.reasons,
     }
     db_save_trade(trade_data)
@@ -2757,17 +2319,14 @@ async def execute_trade(conn, setup: TradeSetup, balance: float, state: BotState
     de = "🟢" if setup.direction == Direction.BULL else "🔴"
     cap_warn = " ⚠️CAP" if lot_details.get("capped") else ""
     margin_warn = " ⚠️MARGIN" if lot_details.get("margin_reduced") else ""
-    wr_recent = sum(state.performance["recent_results"][-10:]) / max(len(state.performance["recent_results"][-10:]), 1) * 100
-    conf_str = " | 🏛️ 1H CONFLUENCE" if setup.confluence else ""
-    ote_str = " | 📐 OTE ENTRY" if setup.ote_entry else ""
     pf = db_get_profit_factor()
     sym_wr, sym_total = state.get_symbol_winrate(setup.symbol)
 
-    tg(f"""<b>{de} TRADE OPENED — Grade {setup.grade}</b>
+    tg(f"""<b>{de} TRADE OPENED — SWEEP SETUP</b>
 
 📌 {setup.symbol} | {setup.direction.value.upper()}
 🕐 KZ: {kz.upper() if kz else '?'}
-🔍 Regime: {setup.regime.upper()}{conf_str}{ote_str}
+🎯 Sweep: {setup.sweep_type} @ {setup.sweep_level:.5f}
 💰 Entry: {setup.entry:.5f}
 🛑 SL: {setup.stop_loss:.5f}
 🎯 TP1: {setup.tp1:.5f} (33%)
@@ -2776,12 +2335,10 @@ async def execute_trade(conn, setup: TradeSetup, balance: float, state: BotState
 📊 RR: 1:{setup.rr:.1f} | Lots: {lot}{cap_warn}{margin_warn}
 💵 Risk: {risk_pct*100:.2f}% (${lot_details['risk_amount']})
 📏 SL: {lot_details['sl_pips']:.1f} pips | PipVal: {lot_details['pip_value_used']:.2f}
-✅ Confirm: {setup.confirmation}
-🗺️ Zone: {setup.zone.type.value} ({setup.zone.timeframe})
+🗺️ FVG: {setup.zone.timeframe}
 📈 Streak: {state.performance['consecutive_wins']}W / {state.performance['consecutive_losses']}L
-🎯 WR: {wr_recent:.0f}% | PF: {pf:.2f}
-🏥 {setup.symbol} WR: {sym_wr*100:.0f}% ({sym_total}t)
-📋 Score: {setup.score:.1f} | {r}
+🎯 PF: {pf:.2f} | {setup.symbol} WR: {sym_wr*100:.0f}% ({sym_total}t)
+📋 {r}
 💰 Balance: ${balance:,.2f}""", state)
 
     return True
@@ -2791,7 +2348,7 @@ async def execute_trade(conn, setup: TradeSetup, balance: float, state: BotState
 
 async def run_diagnostics(conn, account, state: BotState):
     log.info("=" * 60)
-    log.info("DIAGNOSTICS — SMC Bot v4.1 PROFIT-CRITICAL REBUILD")
+    log.info("DIAGNOSTICS — SMC Bot v5.0 SWEEP STRATEGY")
     log.info(f"MODE: {'DRY RUN' if DRY_RUN else 'LIVE'}")
     log.info("=" * 60)
     try:
@@ -2803,10 +2360,10 @@ async def run_diagnostics(conn, account, state: BotState):
     kz = get_current_killzone()
     log.info(f"Time: {now.strftime('%H:%M:%S')} UTC | Killzone: {kz or 'NONE'}")
     log.info(f"Symbols: {len(SYMBOLS)} | Entry KZs: {', '.join(ENTRY_KILLZONES)}")
-    log.info(f"Risk: {list(GRADE_RISK.values())} | Daily: {DAILY_LOSS_LIMIT*100}% | Weekly: {WEEKLY_LOSS_LIMIT*100}%")
+    log.info(f"Risk: {f'{RISK_PER_TRADE*100:.2f}%'} | Daily: {DAILY_LOSS_LIMIT*100}% | Weekly: {WEEKLY_LOSS_LIMIT*100}%")
     log.info(f"Max DD hard stop: {MAX_DRAWDOWN_HARD_STOP*100}%")
     log.info(f"Max trades: {MAX_TOTAL_TRADES} total | {MAX_TRADES_PER_DAY}/day | {MAX_TRADES_PER_ASSET}/asset")
-    log.info(f"Min RR: {MIN_RR} | Min grade: B+")
+    log.info(f"Min RR: {MIN_RR} | Strategy: Sweep→Displacement→FVG")
     log.info(f"Symbol min WR: {SYMBOL_MIN_WINRATE*100}% after {SYMBOL_MIN_TRADES_FOR_EVAL} trades")
 
     mae_mfe = db_get_mae_mfe_stats()
@@ -2984,22 +2541,21 @@ async def run(state: BotState):
 
         mode_str = "🧪 DRY RUN" if DRY_RUN else "🔴 LIVE"
 
-        tg(f"""🚀 <b>SMC BOT v4.1 GESTART</b> {mode_str}
+        tg(f"""🚀 <b>SMC BOT v5.0 — SWEEP STRATEGY</b> {mode_str}
 
 📊 {len(SYMBOLS)} symbols | Max: {MAX_TOTAL_TRADES} open / {MAX_TRADES_PER_DAY} per dag
-💵 Risk: {list(GRADE_RISK.values())} | Daily: {DAILY_LOSS_LIMIT*100}% | Weekly: {WEEKLY_LOSS_LIMIT*100}%
+💵 Risk: {RISK_PER_TRADE*100:.2f}% | Daily: {DAILY_LOSS_LIMIT*100}% | Weekly: {WEEKLY_LOSS_LIMIT*100}%
 📉 Max DD hard stop: {MAX_DRAWDOWN_HARD_STOP*100}%
 🗺️ Zones geladen: {zone_count}
 📊 PF: {db_get_profit_factor():.2f}
-⚡ <b>v4.1 Profit-Critical Fixes:</b>
-• TradePhase state machine (geen gemiste partials)
-• Per-symbol auto-pause (<{SYMBOL_MIN_WINRATE*100:.0f}% WR)
-• Max drawdown hard stop ({MAX_DRAWDOWN_HARD_STOP*100:.0f}%)
-• Order confirmation fix (ERR_NO_ERROR)
-• Pip value: geen fallback, skip bij onbekend
-• Reconnect heartbeat (60s ping)
-• BotState class (geen globals)
-• Graceful shutdown""", state)
+⚡ <b>Strategie: Sweep → Displacement → FVG</b>
+• 1H structuur bepaalt richting
+• 5M sweep detectie (equal highs/lows, swing points)
+• Displacement confirmatie (1.5x avg body)
+• FVG entry bij retest
+• SL achter sweep level
+• Min RR: {MIN_RR}
+• 33/33/33 partial close system""", state)
 
         while not state.shutdown_requested:
             try:
@@ -3182,18 +2738,16 @@ async def run(state: BotState):
                     await asyncio.sleep(60)
                     continue
 
-                # Profit factor check — soft reduction i.p.v. hard stop (death spiral)
+                # Profit factor check
                 total_trades = state.performance["wins"] + state.performance["losses"]
-                pf_gate_active = False
                 if total_trades >= 30:
                     pf = db_get_profit_factor()
                     if pf < 0.7:
-                        log.warning(f"Profit factor {pf:.2f} < 0.7 — trades gepauzeerd tot PF verbetert")
-                        await asyncio.sleep(300)  # 5 min pauze, niet permanent
+                        log.warning(f"Profit factor {pf:.2f} < 0.7 — trades gepauzeerd 5 min")
+                        await asyncio.sleep(300)
                         continue
                     elif pf < 1.0:
-                        pf_gate_active = True  # Wordt gebruikt in risk calc
-                        log.info(f"Profit factor {pf:.2f} < 1.0 — alleen A+/A grades toegestaan")
+                        log.info(f"Profit factor {pf:.2f} < 1.0 — caution")
 
                 if not is_candle_just_closed(5):
                     await asyncio.sleep(CHECK_INTERVAL)
@@ -3225,12 +2779,7 @@ async def run(state: BotState):
                         if not state.is_symbol_healthy(symbol):
                             continue
 
-                        if GOLD_SCALP["enabled"] and symbol == GOLD_SCALP["symbol"]:
-                            max_trades = GOLD_SCALP["max_trades"]
-                        else:
-                            max_trades = MAX_TRADES_PER_ASSET
-
-                        if sum(1 for p in positions if p["symbol"] == symbol) >= max_trades:
+                        if sum(1 for p in positions if p["symbol"] == symbol) >= MAX_TRADES_PER_ASSET:
                             continue
 
                         if not check_correlation(symbol, positions):
@@ -3240,10 +2789,7 @@ async def run(state: BotState):
                         if not cd_ok:
                             continue
 
-                        if not check_gold_session_limit(state, symbol):
-                            continue
-
-                        # === FIX 7: Max 1 trade per symbol per killzone per dag ===
+                        # Max 1 trade per symbol per killzone per dag
                         kz_now = get_current_killzone() or "none"
                         kz_dir_key = f"{symbol}_{kz_now}_{date.today()}"
                         if kz_dir_key in state.recent_signals:
@@ -3341,11 +2887,11 @@ if __name__ == "__main__":
     import threading
 
     log.info("=" * 50)
-    log.info("PROFESSIONAL SMC BOT v4.1 — PROFIT-CRITICAL REBUILD")
+    log.info("PROFESSIONAL SMC BOT v5.0 — SWEEP STRATEGY")
     log.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
     log.info("TradePhase SM | Symbol Health | Max DD Stop")
     log.info("Reconnect HB | BotState | Graceful Shutdown")
-    log.info(f"Risk: {list(GRADE_RISK.values())} | Max trades: {MAX_TOTAL_TRADES}")
+    log.info(f"Risk: {f'{RISK_PER_TRADE*100:.2f}%'} | Max trades: {MAX_TOTAL_TRADES}")
     log.info("=" * 50)
 
     init_database()
