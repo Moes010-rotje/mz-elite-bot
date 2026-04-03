@@ -175,6 +175,7 @@ class BotState:
         # === Session tracking ===
         self.asia_range_cache: Dict[str, dict] = {}
         self.session_levels: Dict[str, Dict[str, dict]] = {}
+        self.pdhl_cache: Dict[str, dict] = {}  # Previous Day High/Low
 
         # === Connection health ===
         self.connection_healthy = True
@@ -185,7 +186,6 @@ class BotState:
 
         # === Cooldowns ===
         self.symbol_cooldowns: Dict[str, dict] = {}
-        self.gold_session_losses = {"killzone": None, "losses": 0}
 
         # === Performance ===
         self.performance = {
@@ -966,6 +966,47 @@ async def update_asia_range(account, state: BotState):
             log.warning(f"Asia range error {symbol}: {e}")
 
 
+async def update_previous_day_hl(account, state: BotState):
+    """Track previous day high/low — sterkste liquidity levels voor sweeps."""
+    today = date.today()
+    for symbol in SYMBOLS:
+        if symbol in state.pdhl_cache and state.pdhl_cache[symbol]["date"] == today:
+            continue
+        try:
+            candles = await get_candles(account, symbol, "1h", 48, state)
+            if not candles or len(candles) < 20:
+                continue
+            df = pd.DataFrame(candles)
+            if "time" not in df.columns:
+                continue
+
+            def parse_ts(t):
+                try:
+                    if isinstance(t, (int, float)):
+                        if t > 1e10:
+                            t = t / 1000
+                        return datetime.utcfromtimestamp(t)
+                    return pd.to_datetime(t, utc=True).replace(tzinfo=None)
+                except Exception:
+                    return None
+
+            df["dt"] = df["time"].apply(parse_ts)
+            df = df.dropna(subset=["dt"])
+            yesterday = today - timedelta(days=1)
+            yday_start = datetime.combine(yesterday, datetime.min.time())
+            yday_end = datetime.combine(today, datetime.min.time())
+            prev_day = df[(df["dt"] >= yday_start) & (df["dt"] < yday_end)]
+            if len(prev_day) >= 10:
+                state.pdhl_cache[symbol] = {
+                    "high": float(prev_day["high"].max()),
+                    "low": float(prev_day["low"].min()),
+                    "date": today,
+                }
+                log.info(f"PDH/PDL {symbol}: {state.pdhl_cache[symbol]['low']:.5f} - {state.pdhl_cache[symbol]['high']:.5f}")
+        except Exception as e:
+            log.warning(f"PDH/PDL error {symbol}: {e}")
+
+
 # ==================== RISK MANAGEMENT ====================
 
 def reset_weekly_if_needed(state: BotState, balance: float):
@@ -1505,6 +1546,10 @@ def find_sweep_setup(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
         if symbol in state.asia_range_cache:
             ar = state.asia_range_cache[symbol]
             sweep_levels.append({"price": ar["high"], "type": "asia_high", "index": 0})
+        # Previous day high (sterkste liquidity level)
+        if symbol in state.pdhl_cache:
+            pdhl = state.pdhl_cache[symbol]
+            sweep_levels.append({"price": pdhl["high"], "type": "prev_day_high", "index": 0})
     
     elif htf_direction == Direction.BULL:
         for sl_pt in lows:
@@ -1519,6 +1564,10 @@ def find_sweep_setup(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
         if symbol in state.asia_range_cache:
             ar = state.asia_range_cache[symbol]
             sweep_levels.append({"price": ar["low"], "type": "asia_low", "index": 0})
+        # Previous day low (sterkste liquidity level)
+        if symbol in state.pdhl_cache:
+            pdhl = state.pdhl_cache[symbol]
+            sweep_levels.append({"price": pdhl["low"], "type": "prev_day_low", "index": 0})
     
     # Deduplicate levels die te dicht bij elkaar liggen
     unique_levels = []
@@ -1581,189 +1630,13 @@ def find_sweep_setup(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
     return best_setup
 
 
-# ==================== FVG DETECTIE ====================
-
-def detect_fvgs(df: pd.DataFrame, lookback: int = 10) -> List[Zone]:
-    zones = []
-    if len(df) < lookback + 2:
-        return zones
-    avg_body = float(df["body"].tail(20).mean())
-    for i in range(len(df) - 1, max(len(df) - lookback, 2), -1):
-        c1, c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
-        mid_body = abs(c2["close"] - c2["open"])
-        if c3["low"] > c1["high"] and mid_body > avg_body * 1.2:    # Was 1.5
-            zones.append(Zone(
-                type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
-                high=float(c3["low"]), low=float(c1["high"]),
-                midpoint=float((c3["low"] + c1["high"]) / 2),
-                created_at=time.time(),
-            ))
-        elif c3["high"] < c1["low"] and mid_body > avg_body * 1.2:    # Was 1.5
-            zones.append(Zone(
-                type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
-                high=float(c1["low"]), low=float(c3["high"]),
-                midpoint=float((c1["low"] + c3["high"]) / 2),
-                created_at=time.time(),
-            ))
-    return zones
-
-
-# ==================== LIQUIDITY SWEEP ====================
-
-def detect_liquidity_sweep(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
-                           state: BotState) -> Optional[dict]:
-    if len(df) < 15:
-        return None
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else float((df["high"] - df["low"]).tail(14).mean())
-    highs = [s for s in swings if s.type == "high"]
-    lows = [s for s in swings if s.type == "low"]
-    tolerance = atr * 0.1
-
-    # Equal Highs sweep
-    for i in range(len(highs) - 1):
-        for j in range(i + 1, len(highs)):
-            if abs(highs[i].price - highs[j].price) < tolerance:
-                eq_level = max(highs[i].price, highs[j].price)
-                if last["high"] > eq_level and last["close"] < eq_level:
-                    wick = last["high"] - max(last["close"], last["open"])
-                    if wick > atr * 0.3:
-                        return {"type": "bear", "level": eq_level, "reason": "equal_highs_sweep", "strength": "strong"}
-
-    # Equal Lows sweep
-    for i in range(len(lows) - 1):
-        for j in range(i + 1, len(lows)):
-            if abs(lows[i].price - lows[j].price) < tolerance:
-                eq_level = min(lows[i].price, lows[j].price)
-                if last["low"] < eq_level and last["close"] > eq_level:
-                    wick = min(last["close"], last["open"]) - last["low"]
-                    if wick > atr * 0.3:
-                        return {"type": "bull", "level": eq_level, "reason": "equal_lows_sweep", "strength": "strong"}
-
-    # Session High/Low Sweep
-    prev_session = get_previous_session_levels(state, symbol)
-    if prev_session:
-        if last["high"] > prev_session["high"] and last["close"] < prev_session["high"]:
-            wick = last["high"] - max(last["close"], last["open"])
-            if wick > atr * 0.25:
-                return {"type": "bear", "level": prev_session["high"], "reason": "session_high_sweep", "strength": "strong"}
-        if last["low"] < prev_session["low"] and last["close"] > prev_session["low"]:
-            wick = min(last["close"], last["open"]) - last["low"]
-            if wick > atr * 0.25:
-                return {"type": "bull", "level": prev_session["low"], "reason": "session_low_sweep", "strength": "strong"}
-
-    # Asia Range sweep
-    if symbol in state.asia_range_cache:
-        ar = state.asia_range_cache[symbol]
-        if last["high"] > ar["high"] and last["close"] < ar["high"]:
-            wick = last["high"] - max(last["close"], last["open"])
-            if wick > atr * 0.2:
-                return {"type": "bear", "level": ar["high"], "reason": "asia_high_sweep", "strength": "medium"}
-        if last["low"] < ar["low"] and last["close"] > ar["low"]:
-            wick = min(last["close"], last["open"]) - last["low"]
-            if wick > atr * 0.2:
-                return {"type": "bull", "level": ar["low"], "reason": "asia_low_sweep", "strength": "medium"}
-
-    # Swing point sweep
-    if len(highs) >= 2:
-        recent_sh = highs[-1]
-        if last["high"] > recent_sh.price and last["close"] < prev["close"] and last["close"] < recent_sh.price:
-            return {"type": "bear", "level": recent_sh.price, "reason": "swing_high_sweep", "strength": "weak"}
-    if len(lows) >= 2:
-        recent_sl = lows[-1]
-        if last["low"] < recent_sl.price and last["close"] > prev["close"] and last["close"] > recent_sl.price:
-            return {"type": "bull", "level": recent_sl.price, "reason": "swing_low_sweep", "strength": "weak"}
-
-    return None
-
-
-# ==================== ZONE MANAGEMENT ====================
-
-def store_zones(state: BotState, symbol: str, new_zones: List[Zone], htf: bool = False):
-    store = state.htf_zone_store if htf else state.zone_store
-    if symbol not in store:
-        store[symbol] = []
-    now = time.time()
-    max_age = ZONE_MAX_AGE_HOURS * 3600
-    for z in new_zones:
-        z.symbol = symbol
-        store[symbol].append(z)
-    store[symbol] = [z for z in store[symbol] if z.is_valid and (now - z.created_at) < max_age]
-    if len(store[symbol]) > 20:
-        store[symbol] = store[symbol][-20:]
-
-    if now - state._last_zone_save > ZONE_SAVE_INTERVAL:
-        db_save_zones_bulk(state.zone_store, htf=False)
-        db_save_zones_bulk(state.htf_zone_store, htf=True)
-        state._last_zone_save = now
-
-
-def find_active_zone(state: BotState, symbol: str, price: float, direction: Direction) -> Optional[Zone]:
-    if symbol not in state.zone_store:
-        return None
-    tf_priority = {"15m": 0, "5m": 1}
-    candidates = []
-    for zone in state.zone_store[symbol]:
-        if not zone.is_valid or zone.direction != direction:
-            continue
-        if zone.contains_price(price, buffer_pct=ZONE_ENTRY_BUFFER):
-            priority = tf_priority.get(zone.timeframe, 3)
-            candidates.append((priority, zone))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
-
-
-def mark_zone_tested(zone: Zone):
-    zone.test_count += 1
-    if zone.test_count > ZONE_MAX_TESTS:
-        zone.status = ZoneStatus.MITIGATED
-    else:
-        zone.status = ZoneStatus.TESTED
-
-
-def update_zone_status(state: BotState, symbol: str, df: pd.DataFrame):
-    current_price = float(df["close"].iloc[-1])
-    for store in [state.zone_store, state.htf_zone_store]:
-        if symbol not in store:
-            continue
-        for zone in store[symbol]:
-            if not zone.is_valid:
-                continue
-            if zone.direction == Direction.BULL and current_price < zone.low:
-                zone.status = ZoneStatus.MITIGATED
-            elif zone.direction == Direction.BEAR and current_price > zone.high:
-                zone.status = ZoneStatus.MITIGATED
-
-
-def check_zone_confluence(state: BotState, zone: Zone, symbol: str) -> bool:
-    if symbol not in state.htf_zone_store:
-        return False
-    for z1h in state.htf_zone_store[symbol]:
-        if not z1h.is_valid or z1h.direction != zone.direction:
-            continue
-        if zone.low >= z1h.low * 0.998 and zone.high <= z1h.high * 1.002:
-            return True
-        overlap_low = max(zone.low, z1h.low)
-        overlap_high = min(zone.high, z1h.high)
-        if overlap_high > overlap_low:
-            overlap_size = overlap_high - overlap_low
-            zone_size = zone.high - zone.low
-            if zone_size > 0 and overlap_size / zone_size > 0.5:
-                return True
-    return False
-
 
 # ==================== HTF BIAS (1H) — STRUCTUUR-ONLY ====================
 
 async def get_htf_direction(account, symbol: str, state: BotState) -> Optional[Direction]:
     """
-    Simpele HTF bias op basis van 1H market structure.
-    Geen EMAs, geen regime — alleen: wat is de laatse structuur break op 1H?
-    
-    Returns Direction of None als geen duidelijke richting.
+    HTF bias op basis van 1H market structure.
+    Alleen: wat is de laatste structuur break op 1H?
     """
     try:
         candles = await get_candles(account, symbol, "1h", 150, state)
@@ -1774,13 +1647,6 @@ async def get_htf_direction(account, symbol: str, state: BotState) -> Optional[D
         
         swings_1h = detect_swing_points(df, lookback=4)
         structure_1h = analyze_structure(df, swings_1h)
-        
-        # Sla 1H zones op voor confluence checks
-        if structure_1h:
-            new_fvgs_1h = detect_fvgs(df, lookback=8)
-            for fvg in new_fvgs_1h:
-                fvg.timeframe = "1h"
-            store_zones(state, symbol, new_fvgs_1h, htf=True)
         
         # Structuur bepaalt richting
         if structure_1h:
@@ -2147,6 +2013,7 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         # === STAP 3-5: ZOEK SWEEP → DISPLACEMENT → FVG ===
         # Eerst 5M scan
         setup_data = find_sweep_setup(df_5m, symbol, swings_5m, state, htf_direction)
+        sl_df = df_5m  # Track welke df voor SL berekening
 
         # Als geen 5M setup, probeer 15M (sterkere setups, minder frequent)
         if not setup_data:
@@ -2159,6 +2026,7 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
                     setup_data = find_sweep_setup(df_15m, symbol, swings_15m, state, htf_direction)
                     if setup_data:
                         setup_data["fvg"].timeframe = "15m_disp"
+                        sl_df = df_15m  # 15M ATR voor SL berekening
                         log.info(f"  📊 {symbol}: 15M sweep setup gevonden")
         if not setup_data:
             log.debug(f"  {symbol}: geen sweep→displacement→FVG setup")
@@ -2169,6 +2037,14 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         sweep_level = setup_data["sweep_level"]
         sweep_type = setup_data["sweep_type"]
         disp = setup_data["displacement"]
+
+        # === FVG MINIMUM SIZE FILTER ===
+        spec = SYMBOL_SPECS.get(symbol, {})
+        min_fvg_size = spec.get("pip_size", 0.0001) * 5  # Min 5 pips breed
+        fvg_size = fvg.high - fvg.low
+        if fvg_size < min_fvg_size:
+            log.debug(f"  {symbol}: FVG te klein ({fvg_size:.5f} < {min_fvg_size:.5f})")
+            return None
 
         # === SPREAD CHECK ===
         spread_ok, spread = await check_spread(conn, symbol, state)
@@ -2184,15 +2060,16 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         entry = price_data["ask"] if direction == Direction.BULL else price_data["bid"]
         actual_spread = price_data["ask"] - price_data["bid"]
 
-        # === SL/TP BEREKENING — SL achter sweep level ===
+        # === SL/TP BEREKENING — SL achter sweep level, ATR van juiste timeframe ===
         sl, tp1, tp2, tp3, sl_dist = calculate_sweep_trade_levels(
-            direction, entry, sweep_level, df_5m, symbol, actual_spread)
+            direction, entry, sweep_level, sl_df, symbol, actual_spread)
 
         effective_entry = entry + actual_spread if direction == Direction.BULL else entry - actual_spread
-        rr = abs((tp3 - effective_entry) / abs(effective_entry - sl)) if sl_dist > 0 else 0
+        rr_tp1 = abs((tp1 - effective_entry) / abs(effective_entry - sl)) if sl_dist > 0 else 0
+        rr_full = abs((tp3 - effective_entry) / abs(effective_entry - sl)) if sl_dist > 0 else 0
 
-        if rr < MIN_RR:
-            log.info(f"  ❌ {symbol}: RR {rr:.1f} < min {MIN_RR}")
+        if rr_tp1 < MIN_RR:
+            log.info(f"  ❌ {symbol}: RR(TP1) {rr_tp1:.1f} < min {MIN_RR}")
             return None
 
         # === SETUP GEVONDEN ===
@@ -2203,12 +2080,12 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
             f"HTF({htf_direction.value})",
         ]
 
-        log.info(f"  ✅ {symbol}: SWEEP SETUP — {direction.value.upper()} RR 1:{rr:.1f} | {' | '.join(reasons)}")
+        log.info(f"  ✅ {symbol}: SWEEP SETUP — {direction.value.upper()} RR(TP1) 1:{rr_tp1:.1f} / RR(TP3) 1:{rr_full:.1f} | {' | '.join(reasons)}")
 
         return TradeSetup(
             symbol=symbol, direction=direction, entry=entry,
             stop_loss=sl, tp1=tp1, tp2=tp2, tp3=tp3, zone=fvg,
-            rr=rr, sweep_level=sweep_level, sweep_type=sweep_type,
+            rr=rr_tp1, sweep_level=sweep_level, sweep_type=sweep_type,
             displacement_body=disp["body"], htf_direction=htf_direction,
             reasons=reasons,
         )
@@ -2755,6 +2632,10 @@ async def run(state: BotState):
 
                 if kz == "asia":
                     await update_asia_range(account, state)
+
+                # Update PDH/PDL eenmalig per dag (bij start eerste killzone)
+                if kz and kz in ENTRY_KILLZONES:
+                    await update_previous_day_hl(account, state)
 
                 if kz not in ENTRY_KILLZONES:
                     try:
