@@ -1,2890 +1,1337 @@
-import asyncio
-import pandas as pd
-import numpy as np
+"""
+╔══════════════════════════════════════════════════════════════╗
+║           XAUUSD GOLD SCALPER v1.1                          ║
+║    True Scalping · 1M/5M · SMC + Mean Reversion             ║
+║         MetaAPI Cloud SDK · Railway Deploy                   ║
+╚══════════════════════════════════════════════════════════════╝
+
+Built for real scalping on XAUUSD Gold:
+- 5M structure + 1M precision entries
+- 10-second cycle for fast execution
+- Tight SL/TP with 1:1.5 to 1:2 RR
+- 50/50 partial close system
+- Spread filter (skip when spread is too wide)
+- Session scalping: London + NY only
+- Asia range sweep entries
+- Round number reaction scalps
+- Momentum / exhaustion candle detection
+- Mean Reversion: Bollinger Bands + RSI + Stochastic RSI
+- Target: 8-15 trades per day
+"""
+
 import os
-import time
-import json
-import math
-import sqlite3
-import urllib.request
+import sys
+import asyncio
 import logging
+import sqlite3
+import time
 import signal
-from pathlib import Path
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
-from enum import Enum
-from metaapi_cloud_sdk import MetaApi
+from collections import deque
 
-# ================================================================
-# PROFESSIONAL SMC BOT v5.0 — SWEEP STRATEGY
-#
-# CHANGES vs v4.0 Bugfix Edition:
-#
-# [PROFIT-CRITICAL FIXES]
-# - TradePhase state machine: expliciete tracking van TP1/TP2/trailing
-#   → voorkomt gemiste partials en dubbele closes
-# - Per-symbol auto-pause: pauzeert symbols met <40% WR na 15+ trades
-#   → stopt bloeden op slechte symbols automatisch
-# - Max drawdown hard stop: bot stopt volledig bij 10%+ drawdown
-#   → voorkomt catastrofaal verlies
-# - Order confirmation fix: ERR_NO_ERROR is SUCCESS, niet error
-#   → voorkomt gemiste trades door foute status check
-# - Pip value fallback verwijderd: skip trade als geen actuele rate
-#   → voorkomt verkeerde lot sizes door geschatte pip values
-# - Reconnect heartbeat: detecteert stille WebSocket disconnects
-#   → voorkomt gemiste trade management
-#
-# [ARCHITECTURE FIXES]
-# - BotState class vervangt alle globals
-#   → thread-safe, testbaar, geen race conditions
-# - Enkele rate_limited_call wrapper (safe_call verwijderd)
-#   → consistente API handling overal
-# - check_weekly/check_daily geen side effects meer
-#   → split in reset + check functies
-# - grade_setup type-consistent: htf_bias altijd bool
-# - Graceful shutdown i.p.v. os._exit(1)
-#   → SQLite writes worden correct geflushed
-# - Error logging verbeterd: warnings i.p.v. debug voor echte fouten
-#
-# [TRACKING VERBETERINGEN]
-# - Per-symbol winrate tracking met auto-disable
-# - Trade phase tracking in database
-# - Reconnect heartbeat elke 60s
-# - Symbol health scoring
-# ================================================================
+try:
+    from metaapi_cloud_sdk import MetaApi
+except ImportError:
+    print("pip install metaapi-cloud-sdk")
+    sys.exit(1)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("SMC")
+try:
+    import aiohttp
+except ImportError:
+    print("pip install aiohttp")
+    sys.exit(1)
 
-# ==================== ENUMS & DATA CLASSES ====================
+
+# ═══════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class ScalpConfig:
+    """Configuration tuned for XAUUSD scalping."""
+
+    # ─── MetaAPI ──────────────────────────────────────────────────
+    META_API_TOKEN: str = os.getenv("META_API_TOKEN", "")
+    ACCOUNT_ID: str = os.getenv("META_API_ACCOUNT_ID", "")
+
+    # ─── Telegram ─────────────────────────────────────────────────
+    TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_RATE_LIMIT: float = 1.5
+
+    # ─── Symbol ───────────────────────────────────────────────────
+    SYMBOL: str = "XAUUSD"
+    POINT: float = 0.01
+
+    # ─── Timeframes ───────────────────────────────────────────────
+    TF_STRUCTURE: str = "5m"     # structure & context
+    TF_ENTRY: str = "1m"         # precision entry
+    CANDLE_LOOKBACK_5M: int = 60
+    CANDLE_LOOKBACK_1M: int = 60
+
+    # ─── Sessions / Killzones (UTC) ──────────────────────────────
+    ASIA_START: int = 0
+    ASIA_END: int = 7
+    LONDON_START: int = 7
+    LONDON_END: int = 12
+    NY_START: int = 12
+    NY_END: int = 17
+    # London-NY overlap (highest volume for gold)
+    OVERLAP_START: int = 12
+    OVERLAP_END: int = 15
+
+    # ─── Risk Management ─────────────────────────────────────────
+    RISK_PERCENT: float = 0.5          # lower risk per scalp
+    MAX_DAILY_LOSS_PERCENT: float = 3.0
+    MAX_TOTAL_DRAWDOWN_PERCENT: float = 6.0
+    MAX_CONCURRENT_TRADES: int = 2
+    MAX_DAILY_TRADES: int = 20         # scalpers need more room
+    MAX_CONSECUTIVE_LOSSES: int = 4    # pause after 4 losses in a row
+
+    # ─── Spread Filter ────────────────────────────────────────────
+    MAX_SPREAD_POINTS: float = 3.5     # skip if spread > $3.50
+    SPREAD_CHECK_ENABLED: bool = True
+
+    # ─── Scalp SL/TP ─────────────────────────────────────────────
+    ATR_PERIOD: int = 10               # shorter ATR for scalping
+    ATR_SL_MULTIPLIER: float = 0.8     # tight SL
+    MIN_SL_POINTS: float = 1.5         # minimum $1.50 SL
+    MAX_SL_POINTS: float = 6.0         # maximum $6.00 SL
+    DEFAULT_RR_RATIO: float = 1.5      # default 1:1.5 RR
+    LONDON_RR_RATIO: float = 1.5       # London session RR
+    NY_RR_RATIO: float = 2.0           # NY trends harder, wider TP
+    OVERLAP_RR_RATIO: float = 1.8      # overlap session RR
+
+    # ─── Partial Close (50/50) ────────────────────────────────────
+    PARTIAL_PERCENT: float = 0.50      # close 50% at TP1
+    TP1_RR_RATIO: float = 1.0          # TP1 at 1:1
+    MOVE_SL_TO_BE: bool = True         # breakeven after TP1
+
+    # ─── SMC Scalp Parameters ────────────────────────────────────
+    SWING_LOOKBACK: int = 3            # faster swing detection
+    OB_MAX_AGE_CANDLES: int = 20       # OBs expire faster on 1M
+    FVG_MIN_SIZE_ATR: float = 0.2      # smaller FVGs valid on 1M
+    ZONE_MAX_TESTS: int = 1            # 1 test = mitigated (scalp speed)
+
+    # ─── Momentum / Candle Filters ────────────────────────────────
+    ENGULF_BODY_RATIO: float = 0.60    # body must be 60% of candle
+    MOMENTUM_CANDLE_ATR: float = 0.8   # momentum candle min size
+    EXHAUSTION_WICK_RATIO: float = 0.65  # wick > 65% = exhaustion
+
+    # ─── Round Numbers ────────────────────────────────────────────
+    ROUND_NUMBER_INTERVAL: float = 50.0
+    ROUND_NUMBER_ZONE: float = 3.0     # tighter zone for scalping
+
+    # ─── EMA Filter ───────────────────────────────────────────────
+    EMA_FAST: int = 9
+    EMA_SLOW: int = 21
+    USE_EMA_FILTER: bool = True        # only scalp with EMA trend
+
+    # ─── Mean Reversion (Bollinger + RSI + StochRSI) ─────────────
+    USE_MEAN_REVERSION: bool = True
+    BB_PERIOD: int = 20                # Bollinger Band period
+    BB_STD_DEV: float = 2.0            # standard deviations
+    BB_SQUEEZE_THRESHOLD: float = 0.3  # band width / ATR below this = squeeze
+    RSI_PERIOD: int = 7                # shorter RSI for scalping
+    RSI_OVERSOLD: float = 25.0         # buy zone
+    RSI_OVERBOUGHT: float = 75.0       # sell zone
+    RSI_EXTREME_OVERSOLD: float = 15.0 # strong buy
+    RSI_EXTREME_OVERBOUGHT: float = 85.0  # strong sell
+    STOCH_RSI_PERIOD: int = 7          # StochRSI lookback
+    STOCH_RSI_K: int = 3               # %K smoothing
+    STOCH_RSI_OVERSOLD: float = 15.0
+    STOCH_RSI_OVERBOUGHT: float = 85.0
+    MR_REQUIRE_BB_TOUCH: bool = True   # price must touch/pierce BB
+    MR_REQUIRE_RSI: bool = True        # RSI must confirm
+    MR_CONFLUENCE_SCORE: int = 2       # score when MR triggers
+    MR_RR_RATIO: float = 1.5           # tighter RR for mean reversion
+
+    # ─── Confluence ───────────────────────────────────────────────
+    MIN_CONFLUENCE: int = 3            # lower threshold = more trades
+
+    # ─── Cycle Timing ─────────────────────────────────────────────
+    MAIN_LOOP_SECONDS: int = 10        # fast 10-second cycle
+    WATCHDOG_TIMEOUT: int = 180
+
+    # ─── Cooldown ─────────────────────────────────────────────────
+    TRADE_COOLDOWN_SECONDS: int = 120  # 2 min between trades
+    LOSS_COOLDOWN_SECONDS: int = 300   # 5 min after a loss
+
+    # ─── Database ─────────────────────────────────────────────────
+    DB_PATH: str = "gold_scalper.db"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ENUMS & DATA CLASSES
+# ═══════════════════════════════════════════════════════════════════
 
 class Direction(Enum):
-    BULL = "bull"
-    BEAR = "bear"
-
-class StructureType(Enum):
-    BOS = "bos"
-    CHOCH = "choch"
-
-class ZoneType(Enum):
-    ORDER_BLOCK = "ob"
-    FAIR_VALUE_GAP = "fvg"
-    OTE = "ote"
-
-class ZoneStatus(Enum):
-    FRESH = "fresh"
-    TESTED = "tested"
-    MITIGATED = "mitigated"
+    LONG = "buy"
+    SHORT = "sell"
 
 class TradePhase(Enum):
-    """Expliciete trade fase tracking — voorkomt gemiste/dubbele partials"""
     OPEN = "open"
-    TP1_HIT = "tp1_hit"       # 33% gesloten, SL → breakeven
-    TP2_HIT = "tp2_hit"       # 33% gesloten, SL → TP1 level
-    TRAILING = "trailing"     # 4R+ trailing SL actief
+    TP1_HIT = "tp1_hit"
     CLOSED = "closed"
+
+class Session(Enum):
+    ASIA = "asia"
+    LONDON = "london"
+    NY_OVERLAP = "ny_overlap"
+    NEW_YORK = "new_york"
+    OFF = "off"
 
 @dataclass
 class SwingPoint:
     index: int
     price: float
-    type: str
-    timestamp: float
-    broken: bool = False
+    is_high: bool
 
 @dataclass
-class StructureBreak:
-    type: StructureType
-    direction: Direction
-    level: float
-    index: int
-    swing_broken: SwingPoint
-
-@dataclass
-class Zone:
-    type: ZoneType
-    direction: Direction
+class OrderBlock:
     high: float
     low: float
-    midpoint: float
-    created_at: float
-    status: ZoneStatus = ZoneStatus.FRESH
-    test_count: int = 0
-    structure_break: Optional[StructureBreak] = None
-    symbol: str = ""
-    timeframe: str = ""
-
-    @property
-    def is_valid(self) -> bool:
-        return self.status in (ZoneStatus.FRESH, ZoneStatus.TESTED)
-
-    def contains_price(self, price: float, buffer_pct: float = 0.0) -> bool:
-        buf = (self.high - self.low) * buffer_pct
-        return (self.low - buf) <= price <= (self.high + buf)
+    direction: Direction
+    candle_index: int
+    tested: int = 0
+    mitigated: bool = False
 
 @dataclass
-class TradeSetup:
-    symbol: str
+class FairValueGap:
+    high: float
+    low: float
+    direction: Direction
+    filled: bool = False
+
+@dataclass
+class ScalpTrade:
+    id: str
     direction: Direction
     entry: float
-    stop_loss: float
+    sl: float
+    tp: float
     tp1: float
-    tp2: float
-    tp3: float
-    zone: Zone           # The FVG used for entry
-    rr: float
-    sweep_level: float   # Price level that was swept
-    sweep_type: str      # e.g. "equal_highs", "swing_high", "session_high"
-    displacement_body: float  # Body size of displacement candle
-    htf_direction: Optional[Direction] = None
-    reasons: List[str] = field(default_factory=list)
+    lots: float
+    phase: TradePhase = TradePhase.OPEN
+    open_time: float = field(default_factory=time.time)
+    pnl: float = 0.0
 
-# ==================== BOT STATE CLASS (VERVANGT GLOBALS) ====================
+
+# ═══════════════════════════════════════════════════════════════════
+#  BOT STATE
+# ═══════════════════════════════════════════════════════════════════
 
 class BotState:
-    """
-    Centrale state container — vervangt alle losse globals.
-    Thread-safe, testbaar, geen race conditions.
-    """
-    def __init__(self):
-        # === Daily/Weekly tracking ===
-        self.daily_state = {"date": None, "start_balance": 0, "trades_today": 0}
-        self.weekly_state = {"week": None, "loss": 0, "limit_hit": False, "start_balance": 0}
+    def __init__(self, cfg: ScalpConfig):
+        self.cfg = cfg
+        self.running = True
+        self.heartbeat = time.time()
 
-        # === API tracking ===
-        self.last_heartbeat = 0
-        self.api_call_count = 0
-        self.api_call_reset_time = 0
-        self.consecutive_api_fails = 0
+        # Candles
+        self.candles_5m: List[dict] = []
+        self.candles_1m: List[dict] = []
 
-        # === Zone storage ===
-        self.zone_store: Dict[str, List[Zone]] = {}
-        self.htf_zone_store: Dict[str, List[Zone]] = {}
-        self._last_zone_save = 0
+        # Session
+        self.session: Session = Session.OFF
+        self.asia_high: float = 0.0
+        self.asia_low: float = 999999.0
 
-        # === Trade tracking ===
-        self.trade_journal: List[dict] = []
-        self.recent_signals: Dict[str, float] = {}
-        self.trade_phases: Dict[str, TradePhase] = {}  # position_id → phase
+        # Trades
+        self.active_trades: Dict[str, ScalpTrade] = {}
+        self.daily_trades: int = 0
+        self.daily_pnl: float = 0.0
+        self.daily_wins: int = 0
+        self.daily_losses: int = 0
+        self.consecutive_losses: int = 0
+        self.last_trade_time: float = 0.0
+        self.last_loss_time: float = 0.0
+        self.trade_date: str = ""
 
-        # === Session tracking ===
-        self.asia_range_cache: Dict[str, dict] = {}
-        self.session_levels: Dict[str, Dict[str, dict]] = {}
-        self.pdhl_cache: Dict[str, dict] = {}  # Previous Day High/Low
+        # Balance
+        self.start_balance: float = 0.0
+        self.balance: float = 0.0
+        self.equity: float = 0.0
 
-        # === Connection health ===
-        self.connection_healthy = True
-        self.last_connection_check = 0
-        self.last_reconnect_heartbeat = 0
-        self.watchdog_last_loop = time.time()
-        self.consecutive_errors = 0
+        # Trend
+        self.trend_5m: Optional[Direction] = None
+        self.ema_fast: float = 0.0
+        self.ema_slow: float = 0.0
 
-        # === Cooldowns ===
-        self.symbol_cooldowns: Dict[str, dict] = {}
-
-        # === Performance ===
-        self.performance = {
-            "wins": 0,
-            "losses": 0,
-            "consecutive_wins": 0,
-            "consecutive_losses": 0,
-            "recent_results": [],
-            "peak_balance": 0,
-            "session_start_balance": 0,
-            "total_profit": 0,
-            "total_loss": 0,
-            "grade_stats": {},
-            "kz_stats": {},
-            "symbol_stats": {},  # NEW: per-symbol tracking
-        }
-
-        # === Caches ===
-        self._adaptive_cache = {"data": {}, "last_calc": 0, "ttl": 3600}
-        self._pip_value_cache: Dict[str, dict] = {}
-
-        # === Telegram rate limiting ===
-        self.tg_fail_count = 0
-        self.tg_last_success = time.time()
-        self._tg_timestamps: List[float] = []
-
-        # === Shutdown flag ===
-        self.shutdown_requested = False
-        self.hard_stop = False  # True = drawdown stop, geen trades meer
-
-    def get_trade_phase(self, position_id: str) -> TradePhase:
-        return self.trade_phases.get(position_id, TradePhase.OPEN)
-
-    def set_trade_phase(self, position_id: str, phase: TradePhase):
-        self.trade_phases[position_id] = phase
-        db_save_state("trade_phases", {k: v.value for k, v in self.trade_phases.items()})
-
-    def cleanup_trade_phases(self, active_position_ids: set):
-        """Verwijder phases van gesloten posities"""
-        closed = [pid for pid in self.trade_phases if pid not in active_position_ids]
-        for pid in closed:
-            del self.trade_phases[pid]
-
-    def get_symbol_winrate(self, symbol: str) -> Tuple[float, int]:
-        """Returns (winrate, total_trades) voor een symbol"""
-        stats = self.performance["symbol_stats"].get(symbol)
-        if not stats:
-            return 0.5, 0  # Default 50% als geen data
-        total = stats["w"] + stats["l"]
-        if total == 0:
-            return 0.5, 0
-        return stats["w"] / total, total
-
-    def is_symbol_healthy(self, symbol: str, min_trades: int = 15, min_wr: float = 0.40) -> bool:
-        """Check of symbol nog getradet mag worden op basis van winrate"""
-        wr, total = self.get_symbol_winrate(symbol)
-        if total < min_trades:
-            return True  # Niet genoeg data, laat door
-        return wr >= min_wr
-
-    def update_symbol_stats(self, symbol: str, is_win: bool):
-        """Track per-symbol performance"""
-        if symbol not in self.performance["symbol_stats"]:
-            self.performance["symbol_stats"][symbol] = {"w": 0, "l": 0}
-        if is_win:
-            self.performance["symbol_stats"][symbol]["w"] += 1
-        else:
-            self.performance["symbol_stats"][symbol]["l"] += 1
+        # Telegram
+        self.last_tg_time: float = 0.0
 
 
-# ==================== CONFIGURATIE ====================
+# ═══════════════════════════════════════════════════════════════════
+#  LOGGING
+# ═══════════════════════════════════════════════════════════════════
 
-# === MODUS ===
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-CHECK_INTERVAL = 5
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("GoldScalper")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    fh = logging.FileHandler("gold_scalper.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
 
-# === RISK — simpel en consistent ===
-RISK_PER_TRADE = 0.0075       # 0.75% per trade
-RISK_REDUCED = 0.005          # 0.5% na verliesstreaks
-
-# === LIMIETEN ===
-DAILY_LOSS_LIMIT = 0.03       # 3% dagelijks
-WEEKLY_LOSS_LIMIT = 0.08      # 8% wekelijks
-MAX_DRAWDOWN_HARD_STOP = 0.10 # 10% → bot stopt volledig
-
-# === STREAK MODIFIER ===
-STREAK_MODIFIER = {
-    "wins_4plus": 1.1,
-    "wins_2_3":   1.05,
-    "neutral":    1.0,
-    "loss_1":     0.85,
-    "loss_2":     0.65,
-    "loss_3plus": 0.4,
-}
-
-MIN_RR = 2.0                   # Was 2.5 — met sweep edge is 2.0 prima
-MAX_TRADES_PER_ASSET = 1
-MAX_TOTAL_TRADES = 3
-MAX_TRADES_PER_DAY = 4
-
-# === SWEEP STRATEGIE CONFIG ===
-MIN_DISPLACEMENT_MULT = 1.5    # Displacement body moet 1.5x avg body zijn
-SWEEP_LOOKBACK_CANDLES = 50    # Was 20 — sweep kan uren geleden zijn, FVG retest later
-FVG_MAX_AGE_CANDLES = 30       # Was 10 — FVGs blijven lang geldig
-FVG_ENTRY_BUFFER_PCT = 0.25    # Was 0.15 — ruimere buffer voor entry
-SWEEP_CLOSE_TOLERANCE = 0.05   # Sweep mag sluiten BINNEN 5% ATR van het level
-MAX_DISPLACEMENT_WINDOW = 5    # Was 3 — displacement kan 5 candles duren
-
-# === TP MULTIPLIERS ===
-TP1_MULT = 2.0                 # 33% sluiten op 2R
-TP2_MULT = 3.0                 # 33% sluiten op 3R
-TP3_MULT = 4.5                 # Runner naar 4.5R
-# Gold: strakkere targets
-GOLD_TP1_MULT = 1.5
-GOLD_TP2_MULT = 2.5
-GOLD_TP3_MULT = 3.5
-
-# === SYMBOL HEALTH ===
-SYMBOL_MIN_TRADES_FOR_EVAL = 15
-SYMBOL_MIN_WINRATE = 0.40
-
-# === SLIPPAGE BESCHERMING ===
-MAX_SLIPPAGE_PIPS = {
-    "metals":  15,
-    "forex":   5,
-    "indices": 20,
-}
-
-# === MINIMUM SL AFSTAND PER CATEGORIE ===
-MIN_SL_PIPS = {
-    "metals": 50,
-    "forex": 15,
-    "indices": 200,
-}
-
-COOLDOWN_AFTER_LOSSES = 3
-COOLDOWN_MINUTES = 45
-ZONE_MAX_AGE_HOURS = 48
-ZONE_MAX_TESTS = 2
-MAX_API_CALLS_PER_MIN = 50
-SWING_LOOKBACK = 3
-ZONE_SAVE_INTERVAL = 120
-
-# === RECONNECT HEARTBEAT ===
-RECONNECT_HEARTBEAT_INTERVAL = 60
-RECONNECT_HEARTBEAT_FAIL_THRESHOLD = 3
-
-KILLZONES = {
-    "asia":       {"start": 0,  "end": 7},
-    "london":     {"start": 7,  "end": 10},
-    "london_ext": {"start": 10, "end": 13},
-    "new_york":   {"start": 13, "end": 16},
-    "ny_pm":      {"start": 16, "end": 19},
-}
-
-ENTRY_KILLZONES = ["asia", "london", "london_ext", "new_york", "ny_pm"]
-ASIA_ENTRY_SYMBOLS = ["USDJPY", "GBPJPY", "XAUUSD"]
-NY_PM_SYMBOLS = ["XAUUSD", "USTEC", "US30"]
-
-SYMBOL_SPECS = {
-    "XAUUSD":  {"pip_size": 0.1,    "pip_value_per_lot": 10,    "max_spread_pips": 35,  "category": "metals",   "leverage": 20, "contract": 100,    "min_lot": 0.01, "lot_step": 0.01, "base_currency": "XAU", "quote_currency": "USD"},
-    "GBPJPY":  {"pip_size": 0.01,   "pip_value_per_lot": None,  "max_spread_pips": 30,  "category": "forex",    "leverage": 20, "contract": 100000, "min_lot": 0.01, "lot_step": 0.01, "base_currency": "GBP", "quote_currency": "JPY"},
-    "USDJPY":  {"pip_size": 0.01,   "pip_value_per_lot": None,  "max_spread_pips": 18,  "category": "forex",    "leverage": 30, "contract": 100000, "min_lot": 0.01, "lot_step": 0.01, "base_currency": "USD", "quote_currency": "JPY"},
-    "USTEC":   {"pip_size": 0.1,    "pip_value_per_lot": 1,     "max_spread_pips": 25,  "category": "indices",  "leverage": 20, "contract": 1,      "min_lot": 0.1,  "lot_step": 0.1,  "base_currency": "USD", "quote_currency": "USD"},
-    "US30":    {"pip_size": 0.1,    "pip_value_per_lot": 1,     "max_spread_pips": 35,  "category": "indices",  "leverage": 20, "contract": 1,      "min_lot": 0.1,  "lot_step": 0.1,  "base_currency": "USD", "quote_currency": "USD"},
-}
-
-SYMBOLS = ["XAUUSD", "USTEC", "GBPJPY"] + [s for s in SYMBOL_SPECS.keys() if s not in ["XAUUSD", "USTEC", "GBPJPY"]]
-
-METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
-ACCOUNT_ID = os.getenv("ACCOUNT_ID")
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT = os.getenv("TG_CHAT")
-
-CORRELATION_GROUPS = [
-    {"USTEC", "US30"},
-]
+log = setup_logging()
 
 
-LOT_LIMITS = {
-    "forex":   {"min": 0.01, "max": 5.0},
-    "metals":  {"min": 0.01, "max": 3.0},
-    "indices": {"min": 0.01, "max": 3.0},
-}
+# ═══════════════════════════════════════════════════════════════════
+#  DATABASE
+# ═══════════════════════════════════════════════════════════════════
 
-MAX_RECENT_SIGNALS = 500
-MAX_CONSECUTIVE_ERRORS = 20
-MAX_API_FAILS_BEFORE_RECONNECT = 7
-TG_MAX_PER_MINUTE = 20
-
-# ==================== SQLite PERSISTENCE ====================
-
-DB_PATH = os.getenv("DB_PATH", "/tmp/smc_bot_v4.db")
-
-class DatabaseConnection:
-    def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
-        self.conn = None
-
-    def __enter__(self):
-        self.conn = sqlite3.connect(self.db_path, timeout=10)
+class Database:
+    def __init__(self, path: str):
+        self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
-        return self.conn
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS scalp_trades (
+                id TEXT PRIMARY KEY,
+                direction TEXT,
+                entry REAL, sl REAL, tp REAL,
+                lots REAL, phase TEXT,
+                open_time TEXT, close_time TEXT,
+                pnl REAL DEFAULT 0.0,
+                session TEXT
+            );
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                date TEXT PRIMARY KEY,
+                trades INTEGER, wins INTEGER, losses INTEGER,
+                pnl REAL, max_drawdown REAL, avg_rr REAL
+            );
+        """)
+        self.conn.commit()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
-            if exc_type is None:
-                self.conn.commit()
-            self.conn.close()
-        return False
+    def save_trade(self, t: ScalpTrade, session: str = ""):
+        self.conn.execute("""
+            INSERT OR REPLACE INTO scalp_trades
+            (id, direction, entry, sl, tp, lots, phase, open_time, pnl, session)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (t.id, t.direction.value, t.entry, t.sl, t.tp,
+              t.lots, t.phase.value,
+              datetime.fromtimestamp(t.open_time, tz=timezone.utc).isoformat(),
+              t.pnl, session))
+        self.conn.commit()
 
+    def save_daily(self, date: str, trades: int, wins: int,
+                   losses: int, pnl: float, dd: float):
+        self.conn.execute("""
+            INSERT OR REPLACE INTO daily_stats
+            (date, trades, wins, losses, pnl, max_drawdown)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (date, trades, wins, losses, pnl, dd))
+        self.conn.commit()
 
-def init_database():
-    try:
-        _init_database_tables()
-    except sqlite3.DatabaseError as e:
-        log.warning(f"Database corrupt ({e}) — rebuilding...")
-        try:
-            backup_path = DB_PATH + f".corrupt.{int(time.time())}"
-            if os.path.exists(DB_PATH):
-                os.rename(DB_PATH, backup_path)
-                log.info(f"Corrupt DB backed up to {backup_path}")
-        except Exception as be:
-            log.warning(f"Backup failed: {be}")
-            if os.path.exists(DB_PATH):
-                os.remove(DB_PATH)
-        _init_database_tables()
-
-
-def _init_database_tables():
-    with DatabaseConnection() as conn:
-        c = conn.cursor()
-
-        c.execute("""CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            direction TEXT,
-            grade TEXT,
-            score REAL,
-            entry REAL,
-            stop_loss REAL,
-            tp1 REAL, tp2 REAL, tp3 REAL,
-            lot REAL,
-            rr REAL,
-            risk_pct REAL,
-            confirmation TEXT,
-            zone_type TEXT,
-            regime TEXT,
-            killzone TEXT,
-            confluence INTEGER DEFAULT 0,
-            ote_entry INTEGER DEFAULT 0,
-            reasons TEXT,
-            profit REAL DEFAULT 0,
-            closed INTEGER DEFAULT 0,
-            close_time TEXT,
-            mae REAL DEFAULT 0,
-            mfe REAL DEFAULT 0,
-            dry_run INTEGER DEFAULT 0
-        )""")
-
-        c.execute("""CREATE TABLE IF NOT EXISTS zones (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            type TEXT,
-            direction TEXT,
-            high REAL,
-            low REAL,
-            midpoint REAL,
-            created_at REAL,
-            status TEXT,
-            test_count INTEGER DEFAULT 0,
-            timeframe TEXT,
-            htf INTEGER DEFAULT 0
-        )""")
-
-        c.execute("""CREATE TABLE IF NOT EXISTS performance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            wins INTEGER DEFAULT 0,
-            losses INTEGER DEFAULT 0,
-            total_profit REAL DEFAULT 0,
-            profit_factor REAL DEFAULT 0,
-            peak_balance REAL DEFAULT 0,
-            max_drawdown REAL DEFAULT 0
-        )""")
-
-        c.execute("""CREATE TABLE IF NOT EXISTS state (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
-
-    log.info(f"Database geïnitialiseerd (WAL mode): {DB_PATH}")
+    def close(self):
+        self.conn.close()
 
 
-def db_execute(query: str, params: tuple = (), fetch: bool = False):
-    try:
-        with DatabaseConnection() as conn:
-            c = conn.cursor()
-            c.execute(query, params)
-            if fetch:
-                return c.fetchall()
-    except sqlite3.DatabaseError as e:
-        log.warning(f"DB error (possible corruption): {e}")
-        return [] if fetch else None
-    except Exception as e:
-        log.warning(f"DB error: {e}")
-        return [] if fetch else None
-    return None
+# ═══════════════════════════════════════════════════════════════════
+#  TELEGRAM
+# ═══════════════════════════════════════════════════════════════════
 
+class Telegram:
+    def __init__(self, state: BotState):
+        self.state = state
+        self.cfg = state.cfg
 
-def db_save_state(key: str, value):
-    db_execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
-               (key, json.dumps(value)))
-
-
-def db_load_state(key: str, default=None):
-    rows = db_execute("SELECT value FROM state WHERE key = ?", (key,), fetch=True)
-    if rows and rows[0][0]:
-        try:
-            return json.loads(rows[0][0])
-        except Exception:
-            pass
-    return default
-
-
-def db_save_trade(trade_data: dict):
-    db_execute("""INSERT INTO trades
-        (timestamp, symbol, direction, grade, score, entry, stop_loss,
-         tp1, tp2, tp3, lot, rr, risk_pct, confirmation, zone_type,
-         regime, killzone, confluence, ote_entry, reasons, dry_run)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (trade_data.get("time", ""), trade_data.get("symbol", ""),
-         trade_data.get("direction", ""), trade_data.get("grade", ""),
-         trade_data.get("score", 0), trade_data.get("entry", 0),
-         trade_data.get("sl", 0), trade_data.get("tp1", 0),
-         trade_data.get("tp2", 0), trade_data.get("tp3", 0),
-         trade_data.get("lot", 0), trade_data.get("rr", 0),
-         trade_data.get("risk_pct", 0), trade_data.get("confirmation", ""),
-         trade_data.get("zone_type", ""), trade_data.get("regime", ""),
-         trade_data.get("killzone", ""), 1 if trade_data.get("confluence") else 0,
-         1 if trade_data.get("ote_entry") else 0,
-         json.dumps(trade_data.get("reasons", [])),
-         1 if DRY_RUN else 0))
-
-
-def db_update_trade_result(symbol: str, profit: float, mae: float = 0, mfe: float = 0):
-    try:
-        with DatabaseConnection() as conn:
-            c = conn.cursor()
-            c.execute("""SELECT id FROM trades
-                         WHERE symbol = ? AND closed = 0
-                         ORDER BY id DESC LIMIT 1""", (symbol,))
-            row = c.fetchone()
-            if row:
-                trade_id = row[0]
-                c.execute("""UPDATE trades SET profit = ?, closed = 1, close_time = ?,
-                             mae = ?, mfe = ? WHERE id = ?""",
-                          (profit, datetime.now(timezone.utc).isoformat(), mae, mfe, trade_id))
-    except Exception as e:
-        log.warning(f"db_update_trade_result error: {e}")
-
-
-def db_get_profit_factor() -> float:
-    rows = db_execute(
-        "SELECT profit FROM trades WHERE closed = 1 AND dry_run = 0", fetch=True)
-    if not rows:
-        return 0
-    total_wins = sum(r[0] for r in rows if r[0] > 0)
-    total_losses = abs(sum(r[0] for r in rows if r[0] < 0))
-    if total_losses == 0:
-        return 99.0 if total_wins > 0 else 0
-    return round(total_wins / total_losses, 2)
-
-
-def db_get_mae_mfe_stats(symbol: str = None) -> dict:
-    query = "SELECT mae, mfe, profit FROM trades WHERE closed = 1 AND dry_run = 0"
-    params = ()
-    if symbol:
-        query += " AND symbol = ?"
-        params = (symbol,)
-    rows = db_execute(query, params, fetch=True)
-    if not rows or len(rows) < 5:
-        return {}
-    maes = [r[0] for r in rows]
-    mfes = [r[1] for r in rows]
-    return {
-        "avg_mae": round(np.mean(maes), 5),
-        "max_mae": round(max(maes), 5),
-        "avg_mfe": round(np.mean(mfes), 5),
-        "max_mfe": round(max(mfes), 5),
-        "count": len(rows),
-    }
-
-
-def db_save_zones_bulk(zones_dict: dict, htf: bool = False):
-    try:
-        with DatabaseConnection() as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM zones WHERE htf = ?", (1 if htf else 0,))
-            for symbol, zones in zones_dict.items():
-                for z in zones:
-                    if z.is_valid:
-                        c.execute("""INSERT INTO zones
-                            (symbol, type, direction, high, low, midpoint, created_at,
-                             status, test_count, timeframe, htf)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (symbol, z.type.value, z.direction.value, z.high, z.low,
-                             z.midpoint, z.created_at, z.status.value, z.test_count,
-                             z.timeframe, 1 if htf else 0))
-    except Exception as e:
-        log.warning(f"db_save_zones_bulk error: {e}")
-
-
-def db_load_zones() -> Tuple[dict, dict, int]:
-    zone_s = {}
-    htf_s = {}
-    now = time.time()
-    max_age = ZONE_MAX_AGE_HOURS * 3600
-    rows = db_execute("SELECT * FROM zones", fetch=True)
-    count = 0
-    for r in (rows or []):
-        _, symbol, ztype, direction, high, low, midpoint, created_at, status, test_count, tf, htf = r
-        if now - created_at > max_age:
-            continue
-        zone = Zone(
-            type=ZoneType(ztype), direction=Direction(direction),
-            high=high, low=low, midpoint=midpoint, created_at=created_at,
-            status=ZoneStatus(status), test_count=test_count,
-            symbol=symbol, timeframe=tf or "loaded",
-        )
-        store = htf_s if htf else zone_s
-        if symbol not in store:
-            store[symbol] = []
-        store[symbol].append(zone)
-        count += 1
-    return zone_s, htf_s, count
-
-
-# ==================== TELEGRAM (MET RATE LIMITING) ====================
-
-def tg(msg: str, state: 'BotState' = None):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-
-    # Rate limiting
-    now = time.time()
-    if state:
-        state._tg_timestamps = [t for t in state._tg_timestamps if now - t < 60]
-        if len(state._tg_timestamps) >= TG_MAX_PER_MINUTE:
-            log.debug("Telegram rate limit bereikt, bericht overgeslagen")
+    async def send(self, msg: str, silent: bool = False):
+        if not self.cfg.TELEGRAM_TOKEN or not self.cfg.TELEGRAM_CHAT_ID:
             return
-        state._tg_timestamps.append(now)
-
-    for attempt in range(3):
-        try:
-            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-            payload = json.dumps({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}).encode()
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=8 + attempt * 4)
-            if state:
-                state.tg_fail_count = 0
-                state.tg_last_success = time.time()
-            return
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-            else:
-                if state:
-                    state.tg_fail_count += 1
-                log.warning(f"Telegram FAILED 3x: {e}")
-
-
-# ==================== UNIFIED RATE LIMITED CALL ====================
-
-async def rate_limited_call(coro, state: 'BotState', timeout: int = 30, label: str = "API"):
-    """
-    Enkele wrapper voor alle API calls.
-    GEEN retries — coroutines kunnen niet opnieuw ge-await worden.
-    Increment fail counter op ELKE failure zodat reconnect altijd triggert.
-    """
-    try:
         now = time.time()
-        if now - state.api_call_reset_time > 60:
-            state.api_call_count = 0
-            state.api_call_reset_time = now
-        if state.api_call_count >= MAX_API_CALLS_PER_MIN:
-            wait = 60 - (now - state.api_call_reset_time)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            state.api_call_count = 0
-            state.api_call_reset_time = time.time()
+        wait = self.cfg.TELEGRAM_RATE_LIMIT - (now - self.state.last_tg_time)
+        if wait > 0:
+            await asyncio.sleep(wait)
 
-        state.api_call_count += 1
-        result = await asyncio.wait_for(coro, timeout=timeout)
-        state.consecutive_api_fails = 0
-        return result
-
-    except asyncio.TimeoutError:
-        state.consecutive_api_fails += 1
-        log.warning(f"{label} timeout (fails: {state.consecutive_api_fails})")
-        return None
-
-    except asyncio.CancelledError:
-        state.consecutive_api_fails += 1
-        log.warning(f"{label} CancelledError (fails: {state.consecutive_api_fails})")
-        return None
-
-    except Exception as e:
-        state.consecutive_api_fails += 1
-        log.warning(f"{label} error (fails: {state.consecutive_api_fails}): {e}")
-        return None
-
-
-def needs_reconnect(state: BotState) -> bool:
-    return state.consecutive_api_fails >= MAX_API_FAILS_BEFORE_RECONNECT
-
-
-# ==================== RECONNECT HEARTBEAT ====================
-
-async def reconnect_heartbeat(conn, state: BotState) -> bool:
-    """
-    Stille ping elke 60s om WebSocket disconnects te detecteren.
-    Returns False als reconnect nodig is.
-    """
-    now = time.time()
-    if now - state.last_reconnect_heartbeat < RECONNECT_HEARTBEAT_INTERVAL:
-        return True
-
-    state.last_reconnect_heartbeat = now
-    try:
-        info = await asyncio.wait_for(conn.get_account_information(), timeout=10)
-        if info and "balance" in info:
-            state.connection_healthy = True
-            return True
-    except Exception as e:
-        log.warning(f"Reconnect heartbeat failed: {e}")
-
-    state.connection_healthy = False
-    state.consecutive_api_fails += 1
-    return not needs_reconnect(state)
-
-
-# ==================== DYNAMIC PIP VALUE ====================
-
-async def get_dynamic_pip_value(conn, symbol: str, state: BotState) -> Optional[float]:
-    """
-    Dynamische pip_value berekening voor JPY pairs.
-    Returns None als geen actuele rate beschikbaar — trade wordt dan geskipt.
-    """
-    spec = SYMBOL_SPECS.get(symbol)
-    if not spec:
-        return None
-
-    if spec["pip_value_per_lot"] is not None:
-        return spec["pip_value_per_lot"]
-
-    # Check cache (5 min TTL)
-    now = time.time()
-    if symbol in state._pip_value_cache and now - state._pip_value_cache[symbol]["time"] < 300:
-        return state._pip_value_cache[symbol]["value"]
-
-    # Dynamisch berekenen voor JPY pairs
-    try:
-        price = await rate_limited_call(
-            conn.get_symbol_price(symbol), state, timeout=10, label=f"pip_val_{symbol}")
-        if price and price.get("bid", 0) > 0:
-            rate = price["bid"]
-            pip_value = (spec["pip_size"] / rate) * spec["contract"]
-            state._pip_value_cache[symbol] = {"value": pip_value, "time": now}
-            return pip_value
-    except Exception as e:
-        log.warning(f"Pip value calc error {symbol}: {e}")
-
-    # GEEN FALLBACK — return None zodat trade wordt geskipt
-    log.warning(f"Kan pip value niet berekenen voor {symbol} — trade wordt geskipt")
-    return None
-
-
-# ==================== CANDLE HELPER ====================
-
-TF_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
-
-async def get_candles(account, symbol: str, timeframe: str, count: int, state: BotState):
-    tf_min = TF_MINUTES.get(timeframe, 15)
-    start = datetime.now(timezone.utc) - timedelta(minutes=tf_min * count * 1.5)
-    try:
-        result = await rate_limited_call(
-            account.get_historical_candles(symbol, timeframe, start),
-            state, timeout=20, label=f"candles_{symbol}_{timeframe}"
-        )
-        return result
-    except Exception as e:
-        log.warning(f"get_candles {symbol} {timeframe}: {e}")
-        return None
-
-
-# ==================== HEARTBEAT ====================
-
-async def send_heartbeat(conn, state: BotState):
-    now = time.time()
-    if now - state.last_heartbeat < 600:
-        return
-    state.last_heartbeat = now
-    try:
-        info = await rate_limited_call(conn.get_account_information(), state, label="heartbeat")
-        if not info or "balance" not in info:
-            # Force reconnect — als heartbeat geen data kan halen is connectie dood
-            state.consecutive_api_fails = MAX_API_FAILS_BEFORE_RECONNECT
-            state.connection_healthy = False
-            tg(f"💓 <b>HEARTBEAT</b> (limited)\n⚠️ Account info niet beschikbaar — forcing reconnect\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC", state)
-            return
-        balance = info["balance"]
-        equity = info["equity"]
-        positions = await rate_limited_call(conn.get_positions(), state, label="hb_positions")
-        if positions is None:
-            positions = []
-    except Exception as e:
-        log.error(f"Heartbeat error: {e}")
-        state.consecutive_api_fails = MAX_API_FAILS_BEFORE_RECONNECT
-        state.connection_healthy = False
-        tg(f"💓 <b>HEARTBEAT</b> (limited)\n⚠️ Data ophalen mislukt — forcing reconnect: {str(e)[:60]}", state)
-        return
-
-    pl = equity - balance
-    pl_pct = (pl / balance) * 100 if balance > 0 else 0
-    kz = get_current_killzone()
-    daily_loss = ((state.daily_state["start_balance"] - balance) / state.daily_state["start_balance"] * 100) if state.daily_state["start_balance"] > 0 else 0
-    total_zones = sum(len([z for z in zones if z.is_valid]) for zones in state.zone_store.values())
-    total_htf_zones = sum(len([z for z in zones if z.is_valid]) for zones in state.htf_zone_store.values())
-    tg_status = "✅" if state.tg_fail_count == 0 else f"⚠️ {state.tg_fail_count} fails"
-    active_cooldowns = [s for s, cd in state.symbol_cooldowns.items() if cd.get("until", 0) > now]
-    pf = db_get_profit_factor()
-    wr = (state.performance['wins']/(state.performance['wins']+state.performance['losses'])*100) if (state.performance['wins']+state.performance['losses']) > 0 else 0
-    mode_str = "🧪 DRY RUN" if DRY_RUN else "🔴 LIVE"
-
-    # Symbol health status
-    sym_health = []
-    for s in SYMBOLS:
-        s_wr, s_total = state.get_symbol_winrate(s)
-        healthy = state.is_symbol_healthy(s)
-        status = "✅" if healthy else "⛔"
-        if s_total >= 5:
-            sym_health.append(f"{s}: {s_wr*100:.0f}%({s_total}t){status}")
-
-    sym_str = " | ".join(sym_health) if sym_health else "geen data"
-
-    # Drawdown check
-    dd_pct = 0
-    if state.performance["peak_balance"] > 0:
-        dd_pct = (state.performance["peak_balance"] - equity) / state.performance["peak_balance"] * 100
-
-    msg = f"""<b>💓 SMC v5.0 HEARTBEAT</b> {mode_str}
-
-💰 Balance: ${balance:,.2f}
-📊 Equity: ${equity:,.2f}
-📈 P&L: ${pl:,.2f} ({pl_pct:+.2f}%)
-📉 Drawdown: {dd_pct:.1f}% / {MAX_DRAWDOWN_HARD_STOP*100:.0f}%{'⚠️' if dd_pct > 5 else ''}
-🎯 Open trades: {len(positions)}/{MAX_TOTAL_TRADES}
-🗺️ Zones: {total_zones} (5M/15M) + {total_htf_zones} (1H)
-🕐 Killzone: {kz.upper() if kz else 'NONE'}
-📅 Daily loss: {daily_loss:.2f}% / {DAILY_LOSS_LIMIT*100:.1f}%
-📆 Weekly loss: {state.weekly_state['loss']*100:.2f}% / {WEEKLY_LOSS_LIMIT*100:.1f}%
-📊 Trades today: {state.daily_state['trades_today']}/{MAX_TRADES_PER_DAY}
-📈 Performance:
-W/L: {state.performance['wins']}/{state.performance['losses']}
-WR: {wr:.0f}% | PF: {pf:.2f}
-Streak: {state.performance['consecutive_wins']}W / {state.performance['consecutive_losses']}L
-Peak: ${state.performance['peak_balance']:,.2f}
-🏥 Symbol health: {sym_str}
-🧊 Cooldowns: {', '.join(active_cooldowns) if active_cooldowns else 'geen'}
-🔗 Connection: {'✅' if state.connection_healthy else '❌'}
-📡 Telegram: {tg_status}
-⚙️ Loop errors: {state.consecutive_errors}
-{'🛑 HARD STOP ACTIEF' if state.hard_stop else ''}
-⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"""
-    tg(msg, state)
-
-
-# ==================== KILLZONE & SESSION ====================
-
-def get_current_killzone() -> Optional[str]:
-    hour = datetime.now(timezone.utc).hour
-    for name, times in KILLZONES.items():
-        if times["start"] <= hour < times["end"]:
-            return name
-    return None
-
-
-def is_entry_allowed(symbol: str) -> Tuple[bool, Optional[str]]:
-    kz = get_current_killzone()
-    if not kz:
-        return False, None
-    if kz == "asia":
-        return (symbol in ASIA_ENTRY_SYMBOLS), kz
-    if kz == "ny_pm":
-        return (symbol in NY_PM_SYMBOLS), kz
-    if kz in ENTRY_KILLZONES:
-        return True, kz
-    return False, kz
-
-
-# ==================== SESSION HIGH/LOW TRACKING ====================
-
-def update_session_levels(state: BotState, symbol: str, high: float, low: float):
-    kz = get_current_killzone()
-    if not kz:
-        return
-    today = date.today()
-    if symbol not in state.session_levels:
-        state.session_levels[symbol] = {}
-    key = kz
-    if key not in state.session_levels[symbol] or state.session_levels[symbol][key].get("date") != today:
-        state.session_levels[symbol][key] = {"high": high, "low": low, "date": today}
-    else:
-        if high > state.session_levels[symbol][key]["high"]:
-            state.session_levels[symbol][key]["high"] = high
-        if low < state.session_levels[symbol][key]["low"]:
-            state.session_levels[symbol][key]["low"] = low
-
-
-def get_previous_session_levels(state: BotState, symbol: str) -> Optional[dict]:
-    kz = get_current_killzone()
-    if not kz or symbol not in state.session_levels:
-        return None
-    kz_order = ["asia", "london", "london_ext", "new_york", "ny_pm"]
-    try:
-        idx = kz_order.index(kz)
-        if idx > 0:
-            prev_kz = kz_order[idx - 1]
-            if prev_kz in state.session_levels[symbol]:
-                return state.session_levels[symbol][prev_kz]
-    except ValueError:
-        pass
-    return None
-
-
-# ==================== ASIA RANGE ====================
-
-async def update_asia_range(account, state: BotState):
-    today = date.today()
-    for symbol in SYMBOLS:
-        if symbol in state.asia_range_cache and state.asia_range_cache[symbol]["date"] == today:
-            continue
+        url = f"https://api.telegram.org/bot{self.cfg.TELEGRAM_TOKEN}/sendMessage"
         try:
-            candles = await get_candles(account, symbol, "15m", 60, state)
-            if not candles or len(candles) < 10:
-                continue
-            df = pd.DataFrame(candles)
-            if "time" not in df.columns:
-                continue
-
-            def parse_ts(t):
-                try:
-                    if isinstance(t, (int, float)):
-                        if t > 1e10:
-                            t = t / 1000
-                        return datetime.utcfromtimestamp(t)
-                    return pd.to_datetime(t, utc=True).replace(tzinfo=None)
-                except Exception:
-                    return None
-
-            df["dt"] = df["time"].apply(parse_ts)
-            df = df.dropna(subset=["dt"])
-            today_start = datetime.combine(today, datetime.min.time())
-            asia_end = today_start + timedelta(hours=7)
-            asia = df[(df["dt"] >= today_start) & (df["dt"] < asia_end)]
-            if len(asia) >= 4:
-                state.asia_range_cache[symbol] = {
-                    "high": float(asia["high"].max()),
-                    "low": float(asia["low"].min()),
-                    "mid": float((asia["high"].max() + asia["low"].min()) / 2),
-                    "date": today,
-                }
-                log.info(f"Asia range {symbol}: {state.asia_range_cache[symbol]['low']:.5f} - {state.asia_range_cache[symbol]['high']:.5f}")
+            async with aiohttp.ClientSession() as s:
+                async with s.post(url, json={
+                    "chat_id": self.cfg.TELEGRAM_CHAT_ID,
+                    "text": msg, "parse_mode": "HTML",
+                    "disable_notification": silent
+                }, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    self.state.last_tg_time = time.time()
         except Exception as e:
-            log.warning(f"Asia range error {symbol}: {e}")
+            log.warning(f"TG error: {e}")
+
+    async def scalp_opened(self, t: ScalpTrade, session: str, confluence: int):
+        e = "🟢" if t.direction == Direction.LONG else "🔴"
+        sl_dist = abs(t.entry - t.sl)
+        tp_dist = abs(t.tp - t.entry)
+        rr = tp_dist / sl_dist if sl_dist > 0 else 0
+        await self.send(
+            f"{e} <b>SCALP {t.direction.value.upper()}</b>\n"
+            f"Entry: ${t.entry:.2f}\n"
+            f"SL: ${t.sl:.2f} (${sl_dist:.2f})\n"
+            f"TP1: ${t.tp1:.2f} | TP2: ${t.tp:.2f}\n"
+            f"Lots: {t.lots} | RR: 1:{rr:.1f}\n"
+            f"Session: {session} | Score: {confluence}\n"
+            f"Trade #{self.state.daily_trades}/{self.cfg.MAX_DAILY_TRADES}"
+        )
+
+    async def scalp_partial(self, t: ScalpTrade):
+        await self.send(f"✂️ <b>50% CLOSED</b> @ ${t.tp1:.2f} → SL to BE", silent=True)
+
+    async def scalp_closed(self, t: ScalpTrade):
+        e = "✅" if t.pnl > 0 else "❌"
+        streak = f"🔥 {self.state.daily_wins}W" if t.pnl > 0 else f"💀 {self.state.consecutive_losses}L streak"
+        await self.send(
+            f"{e} <b>CLOSED</b> ${t.pnl:+.2f}\n"
+            f"Daily: ${self.state.daily_pnl:+.2f} | {streak}\n"
+            f"W/L: {self.state.daily_wins}/{self.state.daily_losses}"
+        )
+
+    async def daily_report(self):
+        wr = self.state.daily_wins / max(self.state.daily_trades, 1) * 100
+        await self.send(
+            f"📊 <b>DAILY REPORT</b>\n"
+            f"Trades: {self.state.daily_trades}\n"
+            f"Wins: {self.state.daily_wins} | Losses: {self.state.daily_losses}\n"
+            f"PnL: ${self.state.daily_pnl:+.2f}\n"
+            f"Win Rate: {wr:.0f}%\n"
+            f"Balance: ${self.state.balance:.2f}"
+        )
 
 
-async def update_previous_day_hl(account, state: BotState):
-    """Track previous day high/low — sterkste liquidity levels voor sweeps."""
-    today = date.today()
-    for symbol in SYMBOLS:
-        if symbol in state.pdhl_cache and state.pdhl_cache[symbol]["date"] == today:
-            continue
+# ═══════════════════════════════════════════════════════════════════
+#  SESSION MANAGER
+# ═══════════════════════════════════════════════════════════════════
+
+class SessionMgr:
+    def __init__(self, cfg: ScalpConfig):
+        self.cfg = cfg
+
+    def get(self, hour: int) -> Session:
+        if self.cfg.OVERLAP_START <= hour < self.cfg.OVERLAP_END:
+            return Session.NY_OVERLAP
+        if self.cfg.LONDON_START <= hour < self.cfg.LONDON_END:
+            return Session.LONDON
+        if self.cfg.NY_START <= hour < self.cfg.NY_END:
+            return Session.NEW_YORK
+        if self.cfg.ASIA_START <= hour < self.cfg.ASIA_END:
+            return Session.ASIA
+        return Session.OFF
+
+    def is_tradeable(self, hour: int) -> bool:
+        return self.get(hour) in (Session.LONDON, Session.NY_OVERLAP, Session.NEW_YORK)
+
+    def get_rr(self, session: Session, cfg: ScalpConfig) -> float:
+        if session == Session.NY_OVERLAP:
+            return cfg.OVERLAP_RR_RATIO
+        if session == Session.NEW_YORK:
+            return cfg.NY_RR_RATIO
+        if session == Session.LONDON:
+            return cfg.LONDON_RR_RATIO
+        return cfg.DEFAULT_RR_RATIO
+
+    def calc_asia_range(self, candles_5m: List[dict]) -> Tuple[float, float]:
+        asia = []
+        for c in candles_5m:
+            dt = self._parse_time(c)
+            if dt and self.cfg.ASIA_START <= dt.hour < self.cfg.ASIA_END:
+                asia.append(c)
+        if not asia:
+            return 0.0, 999999.0
+        return (
+            max(c.get("high", 0) for c in asia),
+            min(c.get("low", 999999) for c in asia)
+        )
+
+    def _parse_time(self, candle: dict) -> Optional[datetime]:
+        ts = candle.get("time", "")
+        if isinstance(ts, datetime):
+            return ts
         try:
-            candles = await get_candles(account, symbol, "1h", 48, state)
-            if not candles or len(candles) < 20:
-                continue
-            df = pd.DataFrame(candles)
-            if "time" not in df.columns:
-                continue
-
-            def parse_ts(t):
-                try:
-                    if isinstance(t, (int, float)):
-                        if t > 1e10:
-                            t = t / 1000
-                        return datetime.utcfromtimestamp(t)
-                    return pd.to_datetime(t, utc=True).replace(tzinfo=None)
-                except Exception:
-                    return None
-
-            df["dt"] = df["time"].apply(parse_ts)
-            df = df.dropna(subset=["dt"])
-            yesterday = today - timedelta(days=1)
-            yday_start = datetime.combine(yesterday, datetime.min.time())
-            yday_end = datetime.combine(today, datetime.min.time())
-            prev_day = df[(df["dt"] >= yday_start) & (df["dt"] < yday_end)]
-            if len(prev_day) >= 10:
-                state.pdhl_cache[symbol] = {
-                    "high": float(prev_day["high"].max()),
-                    "low": float(prev_day["low"].min()),
-                    "date": today,
-                }
-                log.info(f"PDH/PDL {symbol}: {state.pdhl_cache[symbol]['low']:.5f} - {state.pdhl_cache[symbol]['high']:.5f}")
-        except Exception as e:
-            log.warning(f"PDH/PDL error {symbol}: {e}")
+            return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
 
 
-# ==================== RISK MANAGEMENT ====================
+# ═══════════════════════════════════════════════════════════════════
+#  SCALP ANALYSIS ENGINE
+# ═══════════════════════════════════════════════════════════════════
 
-def reset_weekly_if_needed(state: BotState, balance: float):
-    """Alleen state reset — geen boolean return (geen side effects in check)"""
-    now = datetime.now(timezone.utc)
-    cw = now.isocalendar()[1]
-    if state.weekly_state["week"] != cw:
-        was_set = state.weekly_state["week"] is not None
-        state.weekly_state.update({"week": cw, "loss": 0, "limit_hit": False, "start_balance": balance})
-        if was_set:
-            tg("📊 <b>WEEKLY RESET</b>", state)
+class ScalpAnalyzer:
+    """Lightweight SMC + price action analysis for scalping."""
 
+    def __init__(self, cfg: ScalpConfig):
+        self.cfg = cfg
 
-def is_weekly_limit_ok(state: BotState) -> bool:
-    """Pure check — geen side effects"""
-    return not state.weekly_state["limit_hit"]
+    # ─── ATR ──────────────────────────────────────────────────────
+    def atr(self, candles: List[dict], period: int = 10) -> float:
+        if len(candles) < period + 1:
+            return 5.0
+        trs = []
+        for i in range(1, len(candles)):
+            h, l = candles[i].get("high", 0), candles[i].get("low", 0)
+            pc = candles[i - 1].get("close", 0)
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return sum(trs[-period:]) / period
 
+    # ─── EMA ──────────────────────────────────────────────────────
+    def ema(self, candles: List[dict], period: int) -> float:
+        if len(candles) < period:
+            return 0.0
+        closes = [c.get("close", 0) for c in candles]
+        multiplier = 2 / (period + 1)
+        ema_val = sum(closes[:period]) / period
+        for price in closes[period:]:
+            ema_val = (price - ema_val) * multiplier + ema_val
+        return ema_val
 
-def update_weekly_loss(state: BotState, balance: float):
-    if state.weekly_state["start_balance"] > 0:
-        loss = (state.weekly_state["start_balance"] - balance) / state.weekly_state["start_balance"]
-        if loss > state.weekly_state["loss"]:
-            state.weekly_state["loss"] = loss
-        if loss >= WEEKLY_LOSS_LIMIT:
-            state.weekly_state["limit_hit"] = True
-            tg(f"🚨 <b>WEEKLY LIMIT</b>: {loss*100:.1f}% >= {WEEKLY_LOSS_LIMIT*100:.0f}%", state)
+    # ─── Swing Detection (fast) ───────────────────────────────────
+    def swings(self, candles: List[dict]) -> Tuple[List[SwingPoint], List[SwingPoint]]:
+        highs, lows = [], []
+        lb = self.cfg.SWING_LOOKBACK
+        for i in range(lb, len(candles) - lb):
+            h = candles[i].get("high", 0)
+            l = candles[i].get("low", 0)
+            if all(h >= candles[j].get("high", 0) for j in range(i - lb, i + lb + 1) if j != i):
+                highs.append(SwingPoint(i, h, True))
+            if all(l <= candles[j].get("low", 999999) for j in range(i - lb, i + lb + 1) if j != i):
+                lows.append(SwingPoint(i, l, False))
+        return highs, lows
 
+    # ─── Order Blocks (1M) ───────────────────────────────────────
+    def order_blocks(self, candles: List[dict]) -> List[OrderBlock]:
+        obs = []
+        for i in range(2, len(candles)):
+            c = candles[i]
+            p = candles[i - 1]
+            co, cc = c.get("open", 0), c.get("close", 0)
+            po, pc = p.get("open", 0), p.get("close", 0)
+            ph, pl = p.get("high", 0), p.get("low", 0)
 
-def reset_daily_if_needed(state: BotState, balance: float):
-    """Alleen state reset"""
-    today = date.today()
-    if state.daily_state["date"] != today:
-        state.daily_state.update({"date": today, "start_balance": balance, "trades_today": 0})
-    if state.daily_state["start_balance"] == 0:
-        state.daily_state["start_balance"] = balance
+            # Bullish OB
+            if pc < po and cc > co and cc > ph:
+                obs.append(OrderBlock(po, pl, Direction.LONG, i))
+            # Bearish OB
+            if pc > po and cc < co and cc < pl:
+                obs.append(OrderBlock(ph, po, Direction.SHORT, i))
 
+        # Keep recent only
+        cutoff = len(candles) - self.cfg.OB_MAX_AGE_CANDLES
+        return [ob for ob in obs if ob.candle_index >= cutoff]
 
-def is_daily_limit_ok(state: BotState, balance: float) -> bool:
-    """Pure check"""
-    if state.daily_state["start_balance"] == 0:
-        return True
-    loss = (state.daily_state["start_balance"] - balance) / state.daily_state["start_balance"]
-    if loss >= DAILY_LOSS_LIMIT:
-        tg(f"🚨 <b>DAILY LIMIT</b>: {loss*100:.2f}% >= {DAILY_LOSS_LIMIT*100:.1f}%", state)
-        return False
-    return True
+    # ─── FVGs (1M) ────────────────────────────────────────────────
+    def fvgs(self, candles: List[dict], atr_val: float) -> List[FairValueGap]:
+        gaps = []
+        min_size = atr_val * self.cfg.FVG_MIN_SIZE_ATR
+        for i in range(2, len(candles)):
+            c1h = candles[i - 2].get("high", 0)
+            c3l = candles[i].get("low", 0)
+            c1l = candles[i - 2].get("low", 0)
+            c3h = candles[i].get("high", 0)
 
+            if c3l > c1h and (c3l - c1h) >= min_size:
+                gaps.append(FairValueGap(c3l, c1h, Direction.LONG))
+            if c1l > c3h and (c1l - c3h) >= min_size:
+                gaps.append(FairValueGap(c1l, c3h, Direction.SHORT))
+        return gaps[-10:]  # keep last 10
 
-def check_max_drawdown(state: BotState, equity: float) -> bool:
-    """
-    HARD STOP: als equity 10%+ onder peak zakt, stop de bot volledig.
-    Returns True als OK, False als hard stop nodig.
-    """
-    if state.performance["peak_balance"] <= 0:
-        return True
+    # ─── Liquidity Sweep ──────────────────────────────────────────
+    def liquidity_sweep(self, candles: List[dict],
+                        swing_highs: List[SwingPoint],
+                        swing_lows: List[SwingPoint]) -> Optional[Direction]:
+        if len(candles) < 2:
+            return None
+        last = candles[-1]
+        lh, ll, lc = last.get("high", 0), last.get("low", 0), last.get("close", 0)
 
-    drawdown = (state.performance["peak_balance"] - equity) / state.performance["peak_balance"]
-    if drawdown >= MAX_DRAWDOWN_HARD_STOP:
-        if not state.hard_stop:
-            state.hard_stop = True
-            tg(f"""🚨🚨🚨 <b>MAX DRAWDOWN HARD STOP</b> 🚨🚨🚨
-
-📉 Drawdown: {drawdown*100:.1f}% >= {MAX_DRAWDOWN_HARD_STOP*100:.0f}%
-💰 Peak: ${state.performance['peak_balance']:,.2f}
-📊 Equity: ${equity:,.2f}
-🛑 Bot stopt volledig met nieuwe trades
-⚠️ Open posities worden nog beheerd
-
-Handmatige review nodig!""", state)
-        return False
-    return True
-
-
-def check_cooldown(state: BotState, symbol: str) -> Tuple[bool, int]:
-    now = time.time()
-    if symbol in state.symbol_cooldowns:
-        cd = state.symbol_cooldowns[symbol]
-        if cd.get("until", 0) > now:
-            return False, int((cd["until"] - now) / 60)
-    return True, 0
-
-
-def register_trade_result(state: BotState, symbol: str, is_win: bool, profit: float = 0):
-    if symbol not in state.symbol_cooldowns:
-        state.symbol_cooldowns[symbol] = {"losses": 0, "until": 0}
-
-    is_gold = symbol == "XAUUSD"
-    cd_minutes = COOLDOWN_MINUTES
-
-    if is_win:
-        state.symbol_cooldowns[symbol]["losses"] = 0
-    else:
-        state.symbol_cooldowns[symbol]["losses"] += 1
-        if state.symbol_cooldowns[symbol]["losses"] >= COOLDOWN_AFTER_LOSSES:
-            state.symbol_cooldowns[symbol]["until"] = time.time() + cd_minutes * 60
-            tg(f"🧊 <b>COOLDOWN {symbol} {cd_minutes}min</b> na {state.symbol_cooldowns[symbol]['losses']} losses", state)
-
-    # Update performance
-    update_performance(state, is_win, profit)
-    state.update_symbol_stats(symbol, is_win)
-
-    # Symbol health check
-    wr, total = state.get_symbol_winrate(symbol)
-    if total >= SYMBOL_MIN_TRADES_FOR_EVAL and wr < SYMBOL_MIN_WINRATE:
-        tg(f"⛔ <b>SYMBOL GEPAUZEERD</b>: {symbol}\nWinrate: {wr*100:.0f}% na {total} trades < {SYMBOL_MIN_WINRATE*100:.0f}% minimum\n🔄 Evaluatie nodig!", state)
-
-    # Profit factor check
-    pf = db_get_profit_factor()
-    total_trades = state.performance["wins"] + state.performance["losses"]
-    if total_trades >= 20 and pf < 1.0:
-        tg(f"⚠️ <b>PROFIT FACTOR ALARM</b>: PF = {pf:.2f} na {total_trades} trades", state)
-
-
-def get_dynamic_risk(state: BotState, balance: float,
-                     symbol: str = "", df: pd.DataFrame = None) -> float:
-    risk = RISK_PER_TRADE  # 0.75% basis
-
-    # Drawdown protectie
-    if state.daily_state["start_balance"] > 0:
-        day_loss = (state.daily_state["start_balance"] - balance) / state.daily_state["start_balance"]
-        if day_loss >= 0.01:
-            risk *= 0.5
-        elif day_loss >= 0.005:
-            risk *= 0.7
-
-    if state.performance["peak_balance"] > 0 and balance > 0:
-        drawdown = (state.performance["peak_balance"] - balance) / state.performance["peak_balance"]
-        if drawdown >= 0.03:
-            risk *= 0.25
-        elif drawdown >= 0.015:
-            risk *= 0.5
-
-    # Streak modifier
-    if state.performance["consecutive_wins"] >= 4:
-        risk *= STREAK_MODIFIER["wins_4plus"]
-    elif state.performance["consecutive_wins"] >= 2:
-        risk *= STREAK_MODIFIER["wins_2_3"]
-    elif state.performance["consecutive_losses"] >= 3:
-        risk *= STREAK_MODIFIER["loss_3plus"]
-    elif state.performance["consecutive_losses"] >= 2:
-        risk *= STREAK_MODIFIER["loss_2"]
-    elif state.performance["consecutive_losses"] >= 1:
-        risk *= STREAK_MODIFIER["loss_1"]
-
-    # Volatility scaling
-    if df is not None and "atr" in df.columns:
-        current_atr = float(df["atr"].iloc[-1])
-        avg_atr = float(df["atr"].tail(50).mean())
-        if avg_atr > 0:
-            vol_ratio = current_atr / avg_atr
-            if vol_ratio > 1.5:
-                risk *= 0.6
-            elif vol_ratio > 1.2:
-                risk *= 0.8
-            elif vol_ratio < 0.7:
-                risk *= 1.1
-
-    # Per-symbol adjustment based on winrate
-    wr, total = state.get_symbol_winrate(symbol)
-    if total >= 10:
-        if wr < 0.45:
-            risk *= 0.7  # Reduceer risk voor zwakkere symbols
-        elif wr > 0.60:
-            risk *= 1.1  # Iets meer risk voor sterke symbols
-
-    return max(risk, 0.002)
-
-
-def update_performance(state: BotState, is_win: bool, profit: float = 0,
-                        grade: str = "", kz: str = ""):
-    if is_win:
-        state.performance["wins"] += 1
-        state.performance["consecutive_wins"] += 1
-        state.performance["consecutive_losses"] = 0
-        state.performance["total_profit"] += profit
-    else:
-        state.performance["losses"] += 1
-        state.performance["consecutive_losses"] += 1
-        state.performance["consecutive_wins"] = 0
-        state.performance["total_loss"] += abs(profit)
-
-    state.performance["recent_results"].append(is_win)
-    if len(state.performance["recent_results"]) > 20:
-        state.performance["recent_results"] = state.performance["recent_results"][-20:]
-
-    if grade:
-        if grade not in state.performance["grade_stats"]:
-            state.performance["grade_stats"][grade] = {"w": 0, "l": 0}
-        if is_win:
-            state.performance["grade_stats"][grade]["w"] += 1
-        else:
-            state.performance["grade_stats"][grade]["l"] += 1
-
-    if kz:
-        if kz not in state.performance["kz_stats"]:
-            state.performance["kz_stats"][kz] = {"w": 0, "l": 0}
-        if is_win:
-            state.performance["kz_stats"][kz]["w"] += 1
-        else:
-            state.performance["kz_stats"][kz]["l"] += 1
-
-    db_save_state("performance", state.performance)
-
-
-def update_peak_balance(state: BotState, balance: float):
-    if balance > state.performance["peak_balance"]:
-        state.performance["peak_balance"] = balance
-    if state.performance["session_start_balance"] == 0:
-        state.performance["session_start_balance"] = balance
-
-
-def check_correlation(symbol: str, positions: list) -> bool:
-    for group in CORRELATION_GROUPS:
-        if symbol in group:
-            others = group - {symbol}
-            for other in others:
-                if any(p["symbol"] == other for p in positions):
-                    return False
-    return True
-
-
-# ==================== SPREAD FILTER ====================
-
-async def check_spread(conn, symbol: str, state: BotState) -> Tuple[bool, float]:
-    try:
-        price = await rate_limited_call(conn.get_symbol_price(symbol), state, label=f"spread_{symbol}")
-        if not price:
-            return False, 0
-        spread = price["ask"] - price["bid"]
-        spec = SYMBOL_SPECS[symbol]
-        spread_pips = spread / spec["pip_size"]
-        max_spread = spec["max_spread_pips"]
-
-        if spread_pips > max_spread:
-            return False, spread
-        return True, spread
-    except Exception:
-        return False, 0
-
-
-# ==================== NEWS FILTER ====================
-
-async def news_filter(state: BotState) -> bool:
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        res = urllib.request.urlopen(req, timeout=5)
-        events = json.loads(res.read().decode())
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        for event in events:
-            if event.get("impact") != "High":
-                continue
-            try:
-                t = event["date"].split('+')[0].replace('Z', '')
-                et = datetime.strptime(t, "%Y-%m-%dT%H:%M:%S")
-                if abs((now - et).total_seconds()) <= 900:
-                    tg(f"📰 <b>NEWS BLOCK</b>: {event.get('title','?')}", state)
-                    return False
-            except Exception:
-                continue
-        return True
-    except Exception as e:
-        log.warning(f"News filter error (allowing trades): {e}")
-        return True
-
-
-# ==================== INDICATOREN ====================
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ema20"] = df["close"].ewm(span=20).mean()
-    df["ema50"] = df["close"].ewm(span=50).mean()
-    df["ema200"] = df["close"].ewm(span=200).mean()
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss_s = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss_s.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    exp1 = df["close"].ewm(span=12).mean()
-    exp2 = df["close"].ewm(span=26).mean()
-    df["macd"] = exp1 - exp2
-    df["macd_signal"] = df["macd"].ewm(span=9).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-    df["tr"] = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(abs(df["high"] - df["close"].shift()), abs(df["low"] - df["close"].shift()))
-    )
-    df["atr"] = df["tr"].rolling(14).mean()
-    df["body"] = abs(df["close"] - df["open"])
-    df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
-    df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
-    df["candle_range"] = df["high"] - df["low"]
-
-    if "tickVolume" in df.columns:
-        df["volume"] = df["tickVolume"]
-    elif "volume" not in df.columns:
-        df["volume"] = 0
-    df["avg_volume"] = df["volume"].rolling(20).mean()
-
-    return df
-
-
-# ==================== SWING POINT DETECTIE ====================
-
-def detect_swing_points(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> List[SwingPoint]:
-    swings = []
-    if len(df) < lookback * 2 + 1:
-        return swings
-    for i in range(lookback, len(df) - lookback):
-        is_high = all(
-            df["high"].iloc[i] > df["high"].iloc[i - j] and df["high"].iloc[i] > df["high"].iloc[i + j]
-            for j in range(1, lookback + 1)
-        )
-        if is_high:
-            ts = df["time"].iloc[i] if "time" in df.columns else i
-            swings.append(SwingPoint(
-                index=i, price=float(df["high"].iloc[i]),
-                type="high", timestamp=float(ts) if isinstance(ts, (int, float)) else i
-            ))
-        is_low = all(
-            df["low"].iloc[i] < df["low"].iloc[i - j] and df["low"].iloc[i] < df["low"].iloc[i + j]
-            for j in range(1, lookback + 1)
-        )
-        if is_low:
-            ts = df["time"].iloc[i] if "time" in df.columns else i
-            swings.append(SwingPoint(
-                index=i, price=float(df["low"].iloc[i]),
-                type="low", timestamp=float(ts) if isinstance(ts, (int, float)) else i
-            ))
-    return sorted(swings, key=lambda s: s.index)
-
-
-# ==================== MARKET STRUCTURE (BOS / CHoCH) ====================
-
-def analyze_structure(df: pd.DataFrame, swings: List[SwingPoint]) -> Optional[StructureBreak]:
-    if len(swings) < 4:
-        return None
-    highs = [s for s in swings if s.type == "high"]
-    lows = [s for s in swings if s.type == "low"]
-    if len(highs) < 2 or len(lows) < 2:
+        for sl in swing_lows[-3:]:
+            if ll < sl.price and lc > sl.price:
+                return Direction.LONG
+        for sh in swing_highs[-3:]:
+            if lh > sh.price and lc < sh.price:
+                return Direction.SHORT
         return None
 
-    current_price = float(df["close"].iloc[-1])
-    last_candle_high = float(df["high"].iloc[-1])
-    last_candle_low = float(df["low"].iloc[-1])
-    recent_highs = highs[-3:]
-    was_bullish = len(recent_highs) >= 2 and recent_highs[-1].price > recent_highs[-2].price
-    was_bearish = len(recent_highs) >= 2 and recent_highs[-1].price < recent_highs[-2].price
+    # ─── Momentum Candle ──────────────────────────────────────────
+    def is_momentum_candle(self, candle: dict, atr_val: float) -> Optional[Direction]:
+        o, c = candle.get("open", 0), candle.get("close", 0)
+        h, l = candle.get("high", 0), candle.get("low", 0)
+        body = abs(c - o)
+        total = h - l
+        if total <= 0:
+            return None
 
-    last_sh = highs[-1]
-    if last_candle_high > last_sh.price and current_price > last_sh.price:
-        stype = StructureType.CHOCH if was_bearish else StructureType.BOS
-        return StructureBreak(
-            type=stype, direction=Direction.BULL,
-            level=last_sh.price, index=last_sh.index, swing_broken=last_sh
-        )
-
-    last_sl = lows[-1]
-    if last_candle_low < last_sl.price and current_price < last_sl.price:
-        stype = StructureType.CHOCH if was_bullish else StructureType.BOS
-        return StructureBreak(
-            type=stype, direction=Direction.BEAR,
-            level=last_sl.price, index=last_sl.index, swing_broken=last_sl
-        )
-    return None
-
-
-# ==================== DISPLACEMENT DETECTIE ====================
-
-def detect_displacement(df: pd.DataFrame, sweep_candle_idx: int, direction: Direction) -> Optional[dict]:
-    """
-    Na een sweep, zoek displacement — sterke move in de sweep-richting.
-    
-    Verbeterd:
-    - Window van 5 candles (was 3)
-    - Cumulatieve displacement: 2-3 candles in dezelfde richting tellen ook
-    - Returnt de sterkste displacement gevonden
-    """
-    if sweep_candle_idx >= len(df) - 1:
+        if body / total >= self.cfg.ENGULF_BODY_RATIO and body >= atr_val * self.cfg.MOMENTUM_CANDLE_ATR:
+            return Direction.LONG if c > o else Direction.SHORT
         return None
-    
-    avg_body = float(df["body"].tail(20).mean())
-    if avg_body <= 0:
+
+    # ─── Exhaustion Candle (reversal signal) ──────────────────────
+    def is_exhaustion_candle(self, candle: dict) -> Optional[Direction]:
+        o, c = candle.get("open", 0), candle.get("close", 0)
+        h, l = candle.get("high", 0), candle.get("low", 0)
+        total = h - l
+        if total <= 0:
+            return None
+
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+
+        if upper_wick / total >= self.cfg.EXHAUSTION_WICK_RATIO:
+            return Direction.SHORT  # bearish exhaustion
+        if lower_wick / total >= self.cfg.EXHAUSTION_WICK_RATIO:
+            return Direction.LONG   # bullish exhaustion
         return None
-    
-    best_disp = None
-    
-    # Check individuele sterke candles (originele logica maar met groter window)
-    for i in range(sweep_candle_idx + 1, min(sweep_candle_idx + MAX_DISPLACEMENT_WINDOW + 1, len(df))):
-        c = df.iloc[i]
-        body = abs(c["close"] - c["open"])
-        
-        if direction == Direction.BEAR and c["close"] < c["open"] and body > avg_body * MIN_DISPLACEMENT_MULT:
-            ratio = body / avg_body
-            if not best_disp or ratio > best_disp["body_ratio"]:
-                best_disp = {"index": i, "body": body, "body_ratio": ratio, "candle": c}
-        elif direction == Direction.BULL and c["close"] > c["open"] and body > avg_body * MIN_DISPLACEMENT_MULT:
-            ratio = body / avg_body
-            if not best_disp or ratio > best_disp["body_ratio"]:
-                best_disp = {"index": i, "body": body, "body_ratio": ratio, "candle": c}
-    
-    # Cumulatieve check: 2-3 candles in dezelfde richting = ook displacement
-    if not best_disp:
-        cumulative_body = 0
-        last_disp_idx = None
-        for i in range(sweep_candle_idx + 1, min(sweep_candle_idx + 4, len(df))):
-            c = df.iloc[i]
-            if direction == Direction.BEAR and c["close"] < c["open"]:
-                cumulative_body += abs(c["close"] - c["open"])
-                last_disp_idx = i
-            elif direction == Direction.BULL and c["close"] > c["open"]:
-                cumulative_body += abs(c["close"] - c["open"])
-                last_disp_idx = i
+
+    # ─── Round Number ─────────────────────────────────────────────
+    def near_round_number(self, price: float) -> bool:
+        interval = self.cfg.ROUND_NUMBER_INTERVAL
+        nearest = round(price / interval) * interval
+        return abs(price - nearest) <= self.cfg.ROUND_NUMBER_ZONE
+
+    # ─── Asia Sweep ───────────────────────────────────────────────
+    def asia_sweep(self, price: float, asia_high: float,
+                   asia_low: float, candle: dict) -> Optional[Direction]:
+        if asia_high <= 0 or asia_low >= 999999:
+            return None
+        lh = candle.get("high", 0)
+        ll = candle.get("low", 0)
+        lc = candle.get("close", 0)
+
+        # Swept Asia low → bullish
+        if ll < asia_low and lc > asia_low:
+            return Direction.LONG
+        # Swept Asia high → bearish
+        if lh > asia_high and lc < asia_high:
+            return Direction.SHORT
+        return None
+
+    # ─── Bollinger Bands ──────────────────────────────────────────
+    def bollinger_bands(self, candles: List[dict], period: int = 20,
+                        std_dev: float = 2.0) -> Tuple[float, float, float]:
+        """Returns (upper, middle, lower) band values."""
+        if len(candles) < period:
+            return 0.0, 0.0, 0.0
+        closes = [c.get("close", 0) for c in candles[-period:]]
+        middle = sum(closes) / period
+        variance = sum((x - middle) ** 2 for x in closes) / period
+        std = variance ** 0.5
+        return middle + std_dev * std, middle, middle - std_dev * std
+
+    def bb_width(self, upper: float, lower: float, middle: float) -> float:
+        """Normalized BB width (0-1 range). Low = squeeze."""
+        if middle <= 0:
+            return 0.0
+        return (upper - lower) / middle
+
+    def bb_percent_b(self, price: float, upper: float, lower: float) -> float:
+        """Where price sits in BB (0 = lower, 1 = upper, >1 = above upper)."""
+        band_range = upper - lower
+        if band_range <= 0:
+            return 0.5
+        return (price - lower) / band_range
+
+    # ─── RSI ──────────────────────────────────────────────────────
+    def rsi(self, candles: List[dict], period: int = 7) -> float:
+        if len(candles) < period + 1:
+            return 50.0
+        closes = [c.get("close", 0) for c in candles]
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            gains.append(max(diff, 0))
+            losses.append(max(-diff, 0))
+
+        if len(gains) < period:
+            return 50.0
+
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+
+        # Wilder's smoothing for remaining
+        for i in range(len(gains) - period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    # ─── Stochastic RSI ──────────────────────────────────────────
+    def stoch_rsi(self, candles: List[dict], rsi_period: int = 7,
+                  stoch_period: int = 7, k_smooth: int = 3) -> float:
+        """Returns %K value of StochRSI (0-100)."""
+        if len(candles) < rsi_period + stoch_period + k_smooth:
+            return 50.0
+
+        # Calculate RSI series
+        closes = [c.get("close", 0) for c in candles]
+        rsi_values = []
+        for i in range(rsi_period + 1, len(closes) + 1):
+            subset_candles = [{"close": closes[j]} for j in range(i - rsi_period - 1, i)]
+            rsi_values.append(self.rsi(subset_candles, rsi_period))
+
+        if len(rsi_values) < stoch_period:
+            return 50.0
+
+        # Stochastic of RSI
+        recent_rsi = rsi_values[-stoch_period:]
+        rsi_high = max(recent_rsi)
+        rsi_low = min(recent_rsi)
+
+        if rsi_high == rsi_low:
+            return 50.0
+
+        raw_k = ((rsi_values[-1] - rsi_low) / (rsi_high - rsi_low)) * 100
+
+        # Simple smoothing for %K
+        if len(rsi_values) >= k_smooth:
+            k_values = []
+            for j in range(k_smooth):
+                idx = len(rsi_values) - k_smooth + j
+                window = rsi_values[max(0, idx - stoch_period + 1):idx + 1]
+                rh, rl = max(window), min(window)
+                if rh == rl:
+                    k_values.append(50.0)
+                else:
+                    k_values.append(((rsi_values[idx] - rl) / (rh - rl)) * 100)
+            return sum(k_values) / len(k_values)
+
+        return raw_k
+
+    # ─── Mean Reversion Signal ────────────────────────────────────
+    def mean_reversion(self, candles: List[dict], price: float,
+                       cfg: 'ScalpConfig') -> Optional[Tuple[Direction, int, str]]:
+        """
+        Returns (direction, score, reason) or None.
+        Combines Bollinger Bands + RSI + StochRSI.
+        """
+        if not cfg.USE_MEAN_REVERSION:
+            return None
+
+        upper, middle, lower = self.bollinger_bands(
+            candles, cfg.BB_PERIOD, cfg.BB_STD_DEV
+        )
+        if middle <= 0:
+            return None
+
+        rsi_val = self.rsi(candles, cfg.RSI_PERIOD)
+        stoch_val = self.stoch_rsi(candles, cfg.RSI_PERIOD,
+                                    cfg.STOCH_RSI_PERIOD, cfg.STOCH_RSI_K)
+        pct_b = self.bb_percent_b(price, upper, lower)
+
+        score = 0
+        reasons = []
+        direction = None
+
+        # ─── Oversold (Bullish mean reversion) ────────────────────
+        if pct_b <= 0.05:  # price at or below lower BB
+            score += 1
+            reasons.append("bb_lower_pierce")
+            direction = Direction.LONG
+        elif pct_b <= 0.15:  # price near lower BB
+            if cfg.MR_REQUIRE_BB_TOUCH:
+                pass  # not close enough
             else:
-                break  # Tegengestelde candle = stop cumulatie
-        
-        if cumulative_body > avg_body * MIN_DISPLACEMENT_MULT and last_disp_idx:
-            best_disp = {
-                "index": last_disp_idx,
-                "body": cumulative_body,
-                "body_ratio": cumulative_body / avg_body,
-                "candle": df.iloc[last_disp_idx],
-            }
-    
-    return best_disp
+                score += 1
+                reasons.append("bb_lower_near")
+                direction = Direction.LONG
 
+        if direction == Direction.LONG:
+            if rsi_val <= cfg.RSI_EXTREME_OVERSOLD:
+                score += 2
+                reasons.append(f"rsi_extreme_{rsi_val:.0f}")
+            elif rsi_val <= cfg.RSI_OVERSOLD:
+                score += 1
+                reasons.append(f"rsi_oversold_{rsi_val:.0f}")
+            else:
+                if cfg.MR_REQUIRE_RSI:
+                    return None  # RSI doesn't confirm
 
-def find_displacement_fvg(df: pd.DataFrame, disp_index: int, direction: Direction) -> Optional[Zone]:
-    """
-    Zoek een FVG gecreëerd door/rond de displacement.
-    
-    Verbeterd:
-    - Zoekt FVGs in een window rond de displacement (niet alleen exact die candle)
-    - Checkt ook of de FVG nog NIET gevuld is (prijs is er niet doorheen gegaan)
-    """
-    if disp_index < 2:
-        return None
-    
-    best_fvg = None
-    best_size = 0
-    
-    # Zoek FVGs in window rond displacement (2 candles ervoor tot 2 erna)
-    search_start = max(1, disp_index - 1)
-    search_end = min(len(df) - 1, disp_index + 2)
-    
-    for idx in range(search_start, search_end + 1):
-        if idx < 1 or idx >= len(df) - 1:
-            continue
-        
-        c_before = df.iloc[idx - 1]
-        c_mid = df.iloc[idx]
-        c_after = df.iloc[idx + 1]
-        
-        if direction == Direction.BEAR:
-            gap_high = float(c_before["low"])
-            gap_low = float(c_after["high"])
-            if gap_high > gap_low:
-                size = gap_high - gap_low
-                # Check of FVG niet al gevuld is door latere candles
-                filled = False
-                for j in range(idx + 2, len(df)):
-                    if float(df.iloc[j]["high"]) >= gap_high:
-                        filled = True
-                        break
-                if not filled and size > best_size:
-                    best_size = size
-                    best_fvg = Zone(
-                        type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
-                        high=gap_high, low=gap_low,
-                        midpoint=(gap_high + gap_low) / 2,
-                        created_at=time.time(), timeframe="5m_disp",
-                    )
-        
-        elif direction == Direction.BULL:
-            gap_low = float(c_before["high"])
-            gap_high = float(c_after["low"])
-            if gap_high > gap_low:
-                size = gap_high - gap_low
-                filled = False
-                for j in range(idx + 2, len(df)):
-                    if float(df.iloc[j]["low"]) <= gap_low:
-                        filled = True
-                        break
-                if not filled and size > best_size:
-                    best_size = size
-                    best_fvg = Zone(
-                        type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
-                        high=gap_high, low=gap_low,
-                        midpoint=(gap_high + gap_low) / 2,
-                        created_at=time.time(), timeframe="5m_disp",
-                    )
-    
-    return best_fvg
+            if stoch_val <= cfg.STOCH_RSI_OVERSOLD:
+                score += 1
+                reasons.append(f"stochrsi_{stoch_val:.0f}")
 
+        # ─── Overbought (Bearish mean reversion) ─────────────────
+        if pct_b >= 0.95:  # price at or above upper BB
+            score += 1
+            reasons.append("bb_upper_pierce")
+            direction = Direction.SHORT
+        elif pct_b >= 0.85:  # price near upper BB
+            if cfg.MR_REQUIRE_BB_TOUCH:
+                pass
+            else:
+                score += 1
+                reasons.append("bb_upper_near")
+                direction = Direction.SHORT
 
-def find_sweep_setup(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
-                     state: BotState, htf_direction: Direction) -> Optional[dict]:
-    """
-    Hoofd-strategie: SWEEP → DISPLACEMENT → FVG
-    
-    Verbeterd:
-    - Soepelere sweep close tolerance (mag OP het level sluiten, niet alleen erboven/eronder)
-    - Session high/low sweeps (previous killzone + asia range)
-    - 50 candles lookback (was 20)
-    - FVGs worden gecheckt op "niet gevuld" status
-    """
-    if len(df) < SWEEP_LOOKBACK_CANDLES:
-        return None
-    
-    highs = [s for s in swings if s.type == "high"]
-    lows = [s for s in swings if s.type == "low"]
-    current_price = float(df["close"].iloc[-1])
-    atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0
-    tolerance = atr * SWEEP_CLOSE_TOLERANCE if atr > 0 else 0
-    eq_tolerance = atr * 0.1 if atr > 0 else 0
-    
-    best_setup = None
-    scan_start = max(0, len(df) - SWEEP_LOOKBACK_CANDLES)
-    
-    # Verzamel alle liquidity levels om te checken
-    sweep_levels = []
-    
-    if htf_direction == Direction.BEAR:
-        # Sweep highs voor bearish setups
-        for sh in highs:
-            sweep_levels.append({"price": sh.price, "type": "swing_high", "index": sh.index})
-            # Check equal highs
-            for sh2 in highs:
-                if sh2 != sh and abs(sh2.price - sh.price) < eq_tolerance:
-                    sweep_levels.append({"price": max(sh.price, sh2.price), "type": "equal_highs", "index": max(sh.index, sh2.index)})
-        # Session levels
-        if symbol in state.session_levels:
-            for kz_name, levels in state.session_levels[symbol].items():
-                if "high" in levels:
-                    sweep_levels.append({"price": levels["high"], "type": f"session_{kz_name}_high", "index": 0})
-        # Asia range
-        if symbol in state.asia_range_cache:
-            ar = state.asia_range_cache[symbol]
-            sweep_levels.append({"price": ar["high"], "type": "asia_high", "index": 0})
-        # Previous day high (sterkste liquidity level)
-        if symbol in state.pdhl_cache:
-            pdhl = state.pdhl_cache[symbol]
-            sweep_levels.append({"price": pdhl["high"], "type": "prev_day_high", "index": 0})
-    
-    elif htf_direction == Direction.BULL:
-        for sl_pt in lows:
-            sweep_levels.append({"price": sl_pt.price, "type": "swing_low", "index": sl_pt.index})
-            for sl2 in lows:
-                if sl2 != sl_pt and abs(sl2.price - sl_pt.price) < eq_tolerance:
-                    sweep_levels.append({"price": min(sl_pt.price, sl2.price), "type": "equal_lows", "index": max(sl_pt.index, sl2.index)})
-        if symbol in state.session_levels:
-            for kz_name, levels in state.session_levels[symbol].items():
-                if "low" in levels:
-                    sweep_levels.append({"price": levels["low"], "type": f"session_{kz_name}_low", "index": 0})
-        if symbol in state.asia_range_cache:
-            ar = state.asia_range_cache[symbol]
-            sweep_levels.append({"price": ar["low"], "type": "asia_low", "index": 0})
-        # Previous day low (sterkste liquidity level)
-        if symbol in state.pdhl_cache:
-            pdhl = state.pdhl_cache[symbol]
-            sweep_levels.append({"price": pdhl["low"], "type": "prev_day_low", "index": 0})
-    
-    # Deduplicate levels die te dicht bij elkaar liggen
-    unique_levels = []
-    for lvl in sweep_levels:
-        if not any(abs(lvl["price"] - u["price"]) < eq_tolerance * 0.5 for u in unique_levels):
-            unique_levels.append(lvl)
-    
-    # Scan candles voor sweeps
-    for i in range(scan_start, len(df)):
-        c = df.iloc[i]
-        
-        for lvl in unique_levels:
-            level_price = lvl["price"]
-            level_type = lvl["type"]
-            level_idx = lvl["index"]
-            
-            # Swing level moet vóór de sweep candle zijn
-            if level_idx >= i and level_idx > 0:
-                continue
-            
-            swept = False
-            
-            if htf_direction == Direction.BEAR:
-                # Bearish sweep: wick boven level, close op of onder level
-                if float(c["high"]) > level_price and float(c["close"]) <= level_price + tolerance:
-                    swept = True
-            elif htf_direction == Direction.BULL:
-                # Bullish sweep: wick onder level, close op of boven level
-                if float(c["low"]) < level_price and float(c["close"]) >= level_price - tolerance:
-                    swept = True
-            
-            if not swept:
-                continue
-            
-            # Sweep gevonden — check displacement
-            disp = detect_displacement(df, i, htf_direction)
-            if not disp:
-                continue
-            
-            # Zoek FVG
-            fvg = find_displacement_fvg(df, disp["index"], htf_direction)
-            if not fvg:
-                continue
-            
-            # Check of prijs bij FVG is (retest)
-            entry_buffer = (fvg.high - fvg.low) * FVG_ENTRY_BUFFER_PCT
-            if current_price >= fvg.low - entry_buffer and current_price <= fvg.high + entry_buffer:
-                quality = disp["body_ratio"]
-                if not best_setup or quality > best_setup["quality"]:
-                    best_setup = {
-                        "direction": htf_direction,
-                        "sweep_level": level_price,
-                        "sweep_type": level_type,
-                        "sweep_index": i,
-                        "displacement": disp,
-                        "fvg": fvg,
-                        "quality": quality,
-                    }
-    
-    return best_setup
+        if direction == Direction.SHORT:
+            if rsi_val >= cfg.RSI_EXTREME_OVERBOUGHT:
+                score += 2
+                reasons.append(f"rsi_extreme_{rsi_val:.0f}")
+            elif rsi_val >= cfg.RSI_OVERBOUGHT:
+                score += 1
+                reasons.append(f"rsi_overbought_{rsi_val:.0f}")
+            else:
+                if cfg.MR_REQUIRE_RSI:
+                    return None
 
+            if stoch_val >= cfg.STOCH_RSI_OVERBOUGHT:
+                score += 1
+                reasons.append(f"stochrsi_{stoch_val:.0f}")
 
-
-# ==================== HTF BIAS (1H) — STRUCTUUR-ONLY ====================
-
-async def get_htf_direction(account, symbol: str, state: BotState) -> Optional[Direction]:
-    """
-    HTF bias op basis van 1H market structure.
-    Alleen: wat is de laatste structuur break op 1H?
-    """
-    try:
-        candles = await get_candles(account, symbol, "1h", 150, state)
-        if not candles or len(candles) < 50:
-            return None
-        df = pd.DataFrame(candles)
-        df = calculate_indicators(df)
-        
-        swings_1h = detect_swing_points(df, lookback=4)
-        structure_1h = analyze_structure(df, swings_1h)
-        
-        # Structuur bepaalt richting
-        if structure_1h:
-            return structure_1h.direction
-        
-        # Fallback: hogere highs/lows = bull, lagere highs/lows = bear
-        highs = [s for s in swings_1h if s.type == "high"]
-        lows = [s for s in swings_1h if s.type == "low"]
-        if len(highs) >= 2 and len(lows) >= 2:
-            if highs[-1].price > highs[-2].price and lows[-1].price > lows[-2].price:
-                return Direction.BULL
-            if highs[-1].price < highs[-2].price and lows[-1].price < lows[-2].price:
-                return Direction.BEAR
-        
-        return None
-    except Exception as e:
-        log.warning(f"HTF bias error {symbol}: {e}")
-        return None
-
-
-# ==================== LOT SIZE ====================
-
-def calculate_lot_size(balance: float, sl_distance: float, symbol: str,
-                       risk_pct: float, pip_value: float) -> Tuple[float, dict]:
-    if sl_distance <= 0:
-        return 0, {"error": "sl_distance <= 0"}
-    spec = SYMBOL_SPECS.get(symbol)
-    if not spec:
-        return 0, {"error": "unknown symbol"}
-
-    sl_pips = sl_distance / spec["pip_size"]
-    risk_amount = balance * risk_pct
-    denom = sl_pips * pip_value
-    if denom <= 0:
-        return 0, {"error": "denom <= 0"}
-
-    raw_lot = risk_amount / denom
-    limits = LOT_LIMITS.get(spec["category"], {"min": 0.01, "max": 3.0})
-    min_lot = spec.get("min_lot", 0.01)
-    lot_step = spec.get("lot_step", 0.01)
-
-    lot = math.floor(raw_lot / lot_step) * lot_step
-    lot = round(lot, 2)
-    lot = max(min_lot, min(lot, limits["max"]))
-
-    if raw_lot < min_lot * 0.5:
-        return 0, {"error": f"lot te klein: {raw_lot:.4f} < min {min_lot}"}
-
-    details = {
-        "risk_amount": round(risk_amount, 2),
-        "sl_pips": round(sl_pips, 1),
-        "raw_lot": round(raw_lot, 4),
-        "final_lot": lot,
-        "pip_value_used": round(pip_value, 4),
-        "capped": raw_lot > limits["max"],
-        "floored": raw_lot < min_lot,
-        "category": spec["category"],
-    }
-    return lot, details
-
-
-# ==================== SL / TP BEREKENING ====================
-
-def calculate_sweep_trade_levels(direction: Direction, entry: float, sweep_level: float,
-                                  df: pd.DataFrame, symbol: str = "", spread: float = 0):
-    """
-    SL achter het sweep level (waar liquidity gepakt werd).
-    Dit is logischer dan ATR-based SL — als prijs voorbij sweep gaat, was de setup verkeerd.
-    """
-    atr = float(df["atr"].iloc[-1])
-    buffer = atr * 0.3  # Buffer achter sweep level
-
-    spec = SYMBOL_SPECS.get(symbol, {})
-    category = spec.get("category", "forex")
-    pip_size = spec.get("pip_size", 0.0001)
-    min_sl_pips = MIN_SL_PIPS.get(category, 15)
-    min_sl_dist = min_sl_pips * pip_size
-    max_sl_distance = atr * 3.0
-
-    is_gold = symbol == "XAUUSD"
-    tp1_mult = GOLD_TP1_MULT if is_gold else TP1_MULT
-    tp2_mult = GOLD_TP2_MULT if is_gold else TP2_MULT
-    tp3_mult = GOLD_TP3_MULT if is_gold else TP3_MULT
-
-    effective_entry = entry + spread if direction == Direction.BULL else entry - spread
-
-    if direction == Direction.BULL:
-        # SL onder het sweep level (de low die gesweept werd)
-        sl = sweep_level - buffer
-        sl_dist = effective_entry - sl
-        if sl_dist < min_sl_dist:
-            sl_dist = min_sl_dist
-            sl = effective_entry - sl_dist
-        if sl_dist > max_sl_distance:
-            sl = effective_entry - max_sl_distance
-            sl_dist = max_sl_distance
-        tp1 = entry + sl_dist * tp1_mult
-        tp2 = entry + sl_dist * tp2_mult
-        tp3 = entry + sl_dist * tp3_mult
-    else:
-        # SL boven het sweep level (de high die gesweept werd)
-        sl = sweep_level + buffer
-        sl_dist = sl - effective_entry
-        if sl_dist < min_sl_dist:
-            sl_dist = min_sl_dist
-            sl = effective_entry + sl_dist
-        if sl_dist > max_sl_distance:
-            sl = effective_entry + max_sl_distance
-            sl_dist = max_sl_distance
-        tp1 = entry - sl_dist * tp1_mult
-        tp2 = entry - sl_dist * tp2_mult
-        tp3 = entry - sl_dist * tp3_mult
-
-    return sl, tp1, tp2, tp3, sl_dist
-
-
-# ==================== POSITION MANAGEMENT (MET TRADE PHASES) ====================
-
-async def manage_positions(conn, positions: list, state: BotState):
-    """
-    33/33/33 partial close met expliciete TradePhase state machine.
-    Voorkomt gemiste partials en dubbele closes.
-    """
-    now = datetime.now(timezone.utc)
-
-    # Cleanup phases van gesloten posities
-    active_pids = {pos["id"] for pos in positions}
-    state.cleanup_trade_phases(active_pids)
-
-    # Vrijdag auto-close
-    if now.weekday() == 4 and now.hour >= 21 and now.minute >= 30:
-        for pos in positions:
-            try:
-                symbol = pos["symbol"]
-                pid = pos["id"]
-                profit = pos.get("profit", 0) + pos.get("swap", 0) + pos.get("commission", 0)
-                if not DRY_RUN:
-                    await asyncio.wait_for(conn.close_position(pid), timeout=10)
-                state.set_trade_phase(pid, TradePhase.CLOSED)
-                emoji = "💰" if profit >= 0 else "💔"
-                tg(f"🕐 <b>FRIDAY CLOSE</b>: {symbol} {emoji} {'+'if profit>=0 else ''}{profit:.2f}", state)
-            except Exception as e:
-                log.warning(f"Friday close error {pos.get('symbol','?')}: {e}")
-        return
-
-    for pos in positions:
-        try:
-            symbol = pos["symbol"]
-            open_p = pos["openPrice"]
-            cur_p = pos.get("currentPrice", 0)
-            vol = pos["volume"]
-            ptype = pos["type"]
-            pid = pos["id"]
-            sl = pos.get("stopLoss", 0)
-            tp = pos.get("takeProfit", 0)
-            spec = SYMBOL_SPECS.get(symbol)
-            if cur_p <= 0 or vol <= 0 or not spec:
-                continue
-            is_buy = "BUY" in ptype
-            profit_dist = (cur_p - open_p) if is_buy else (open_p - cur_p)
-            sl_dist = abs(open_p - sl) if sl else 0
-            if sl_dist <= 0:
-                continue
-
-            min_lot = spec.get("min_lot", 0.01)
-            lot_step = spec.get("lot_step", 0.01)
-
-            # Huidige phase
-            phase = state.get_trade_phase(pid)
-
-            # === MAE/MFE TRACKING ===
-            adverse = -profit_dist if profit_dist < 0 else 0
-            favorable = profit_dist if profit_dist > 0 else 0
-            mae_key = f"mae_{pid}"
-            mfe_key = f"mfe_{pid}"
-            current_mae = float(db_load_state(mae_key, 0) or 0)
-            current_mfe = float(db_load_state(mfe_key, 0) or 0)
-            if adverse > current_mae:
-                db_save_state(mae_key, adverse)
-            if favorable > current_mfe:
-                db_save_state(mfe_key, favorable)
-
-            # === FASE 1: PARTIAL 33% bij TP1 (2.0R) — alleen als phase == OPEN ===
-            if phase == TradePhase.OPEN and profit_dist >= sl_dist * 2.0:
-                partial = math.floor((vol * 0.33) / lot_step) * lot_step
-                partial = round(partial, 2)
-                remaining = round(vol - partial, 2)
-
-                if partial >= min_lot and remaining >= min_lot:
-                    try:
-                        if not DRY_RUN:
-                            await asyncio.wait_for(conn.close_position_partially(pid, partial), timeout=10)
-                            be_buf = sl_dist * 0.1
-                            new_sl = (open_p + be_buf) if is_buy else (open_p - be_buf)
-                            await asyncio.wait_for(conn.modify_position(pid, stop_loss=new_sl, take_profit=tp), timeout=10)
-                        state.set_trade_phase(pid, TradePhase.TP1_HIT)
-                        tg(f"✅ <b>TP1 HIT</b>: {symbol}\n💰 33% gesloten ({partial} lots)\n🛡️ SL → breakeven\n📊 Runner: {remaining} lots", state)
-                    except Exception as e:
-                        log.warning(f"Partial TP1 error {symbol}: {e}")
-
-            # === FASE 2: PARTIAL 33% bij TP2 (3.0R) — alleen als phase == TP1_HIT ===
-            elif phase == TradePhase.TP1_HIT and profit_dist >= sl_dist * 3.0:
-                partial2 = math.floor((vol * 0.5) / lot_step) * lot_step
-                partial2 = round(partial2, 2)
-                remaining2 = round(vol - partial2, 2)
-
-                if partial2 >= min_lot and remaining2 >= min_lot:
-                    try:
-                        tp1_level = (open_p + sl_dist * 2.0) if is_buy else (open_p - sl_dist * 2.0)
-                        if not DRY_RUN:
-                            await asyncio.wait_for(conn.close_position_partially(pid, partial2), timeout=10)
-                            await asyncio.wait_for(conn.modify_position(pid, stop_loss=round(tp1_level, 5), take_profit=tp), timeout=10)
-                        state.set_trade_phase(pid, TradePhase.TP2_HIT)
-                        tg(f"✅ <b>TP2 HIT</b>: {symbol}\n💰 33% gesloten ({partial2} lots)\n🛡️ SL → TP1 level\n📊 Runner: {remaining2} lots naar TP3", state)
-                    except Exception as e:
-                        log.warning(f"Partial TP2 error {symbol}: {e}")
-
-            # === FASE 3: TRAILING SL bij 4.0R+ — alleen als phase >= TP2_HIT ===
-            if phase in (TradePhase.TP2_HIT, TradePhase.TRAILING) and profit_dist >= sl_dist * 4.0:
-                trail_dist = sl_dist * 1.5
-                if is_buy:
-                    new_sl = cur_p - trail_dist
-                    if sl and new_sl > sl + spec["pip_size"]:
-                        try:
-                            if not DRY_RUN:
-                                await asyncio.wait_for(conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp), timeout=10)
-                            if phase != TradePhase.TRAILING:
-                                state.set_trade_phase(pid, TradePhase.TRAILING)
-                        except Exception:
-                            pass
-                else:
-                    new_sl = cur_p + trail_dist
-                    if sl and new_sl < sl - spec["pip_size"]:
-                        try:
-                            if not DRY_RUN:
-                                await asyncio.wait_for(conn.modify_position(pid, stop_loss=round(new_sl, 5), take_profit=tp), timeout=10)
-                            if phase != TradePhase.TRAILING:
-                                state.set_trade_phase(pid, TradePhase.TRAILING)
-                        except Exception:
-                            pass
-        except Exception as e:
-            log.warning(f"Position management error: {e}")
-
-
-# ==================== CLOSED TRADE TRACKING ====================
-
-async def check_closed_trades(conn, state: BotState):
-    try:
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        history = await rate_limited_call(conn.get_deals_by_time_range(start, now), state, label="deals")
-        if not history:
-            return
-
-        # MetaAPI kan deals als list of als ander object teruggeven
-        deals = history
-        if isinstance(history, dict):
-            deals = history.get("deals", [])
-        try:
-            deals = list(deals)  # Force to list voor slicing
-        except Exception:
-            log.warning(f"Deals niet itereerbaar: {type(history)}")
-            return
-
-        for deal in deals[-5:]:
-            profit = deal.get("profit", 0)
-            did = deal.get("id", "")
-            dk = f"deal_{did}"
-            if dk in state.recent_signals:
-                continue
-            if profit != 0:
-                state.recent_signals[dk] = time.time()
-                symbol = deal.get("symbol", "UNKNOWN")
-
-                journal_match = None
-                for j in reversed(state.trade_journal):
-                    if j.get("symbol") == symbol:
-                        journal_match = j
-                        break
-
-                kz = get_current_killzone() or "unknown"
-                grade = journal_match.get("grade", "") if journal_match else ""
-
-                register_trade_result(state, symbol, profit > 0, profit)
-
-                # MAE/MFE opslaan bij close
-                pid = deal.get("positionId", "")
-                mae = float(db_load_state(f"mae_{pid}", 0) or 0)
-                mfe = float(db_load_state(f"mfe_{pid}", 0) or 0)
-                db_update_trade_result(symbol, profit, mae, mfe)
-
-                # Mark phase als closed
-                if pid:
-                    state.set_trade_phase(pid, TradePhase.CLOSED)
-
-                emoji = "💰" if profit > 0 else "💔"
-                pf = db_get_profit_factor()
-                wr, total = state.get_symbol_winrate(symbol)
-                tg(f"{emoji} <b>TRADE {'WON' if profit>0 else 'LOST'}</b>: {symbol} {'+'if profit>0 else ''}{profit:.2f}\n📊 PF: {pf:.2f} | {symbol} WR: {wr*100:.0f}% ({total}t)", state)
-    except Exception as e:
-        log.warning(f"Closed trades error: {e}")
-
-
-# ==================== CANDLE CLOSE CHECK ====================
-
-def is_candle_just_closed(tf_min: int = 5) -> bool:
-    """FIX: Window van 15s naar 55s — heartbeat + API calls voor de scan kosten 10-30s"""
-    now = datetime.now(timezone.utc)
-    return now.minute % tf_min == 0 and now.second < 55
-
-
-# ==================== BOUNDED SIGNAL CLEANUP ====================
-
-def cleanup_recent_signals(state: BotState):
-    now = time.time()
-    expired = [k for k, v in state.recent_signals.items() if now - v > 7200]
-    for k in expired:
-        del state.recent_signals[k]
-    if len(state.recent_signals) > MAX_RECENT_SIGNALS:
-        sorted_keys = sorted(state.recent_signals, key=state.recent_signals.get)
-        for k in sorted_keys[:len(state.recent_signals) - MAX_RECENT_SIGNALS]:
-            del state.recent_signals[k]
-
-
-# ==================== HOOFDSTRATEGIE: SWEEP → DISPLACEMENT → FVG ====================
-
-async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
-                                  balance: float, state: BotState) -> Optional[TradeSetup]:
-    """
-    Sweep → Displacement → FVG strategie.
-    
-    1. Haal 1H richting op (structuur-based)
-    2. Haal 5M data op, zoek swings
-    3. Zoek sweep: prijs neemt swing high/low uit, sluit er weer voorbij
-    4. Check displacement: sterke candle na de sweep
-    5. Check FVG: gat gecreëerd door displacement
-    6. Entry als prijs bij FVG is
-    7. SL achter sweep level
-    
-    Dat is het. Geen regime, geen grading, geen confirmatie functies.
-    """
-    try:
-        # === STAP 1: HTF RICHTING (1H structuur) ===
-        htf_direction = await get_htf_direction(account, symbol, state)
-        if not htf_direction:
-            log.debug(f"  {symbol}: geen 1H richting — skip")
+        if direction is None or score < 2:
             return None
 
-        # === STAP 2: 5M DATA + SWINGS ===
-        candles_5m = await get_candles(account, symbol, "5m", 100, state)
-        if not candles_5m or len(candles_5m) < 50:
-            return None
-        df_5m = pd.DataFrame(candles_5m)
-        df_5m = calculate_indicators(df_5m)
-        swings_5m = detect_swing_points(df_5m)
+        reason_str = "MR:" + "+".join(reasons)
+        return direction, score, reason_str
 
-        # Track session levels voor sweep detectie
-        update_session_levels(state, symbol, float(df_5m["high"].iloc[-1]), float(df_5m["low"].iloc[-1]))
 
-        if len(swings_5m) < 4:
-            log.debug(f"  {symbol}: te weinig swings ({len(swings_5m)})")
-            return None
+# ═══════════════════════════════════════════════════════════════════
+#  SIGNAL GENERATOR
+# ═══════════════════════════════════════════════════════════════════
 
-        # === STAP 3-5: ZOEK SWEEP → DISPLACEMENT → FVG ===
-        # Eerst 5M scan
-        setup_data = find_sweep_setup(df_5m, symbol, swings_5m, state, htf_direction)
-        sl_df = df_5m  # Track welke df voor SL berekening
+class ScalpSignal:
+    def __init__(self, state: BotState, analyzer: ScalpAnalyzer, session_mgr: SessionMgr):
+        self.state = state
+        self.az = analyzer
+        self.sm = session_mgr
+        self.cfg = state.cfg
 
-        # Als geen 5M setup, probeer 15M (sterkere setups, minder frequent)
-        if not setup_data:
-            candles_15m = await get_candles(account, symbol, "15m", 80, state)
-            if candles_15m and len(candles_15m) >= 30:
-                df_15m = pd.DataFrame(candles_15m)
-                df_15m = calculate_indicators(df_15m)
-                swings_15m = detect_swing_points(df_15m)
-                if len(swings_15m) >= 4:
-                    setup_data = find_sweep_setup(df_15m, symbol, swings_15m, state, htf_direction)
-                    if setup_data:
-                        setup_data["fvg"].timeframe = "15m_disp"
-                        sl_df = df_15m  # 15M ATR voor SL berekening
-                        log.info(f"  📊 {symbol}: 15M sweep setup gevonden")
-        if not setup_data:
-            log.debug(f"  {symbol}: geen sweep→displacement→FVG setup")
+    def evaluate(self, price: float, spread: float) -> Optional[Tuple[Direction, float, float, float, int, str]]:
+        """
+        Returns: (direction, sl, tp1, tp, confluence_score, reason) or None.
+        """
+        now = datetime.now(timezone.utc)
+        hour = now.hour
+
+        # ─── Gate 1: Session ─────────────────────────────────────
+        if not self.sm.is_tradeable(hour):
             return None
 
-        direction = setup_data["direction"]
-        fvg = setup_data["fvg"]
-        sweep_level = setup_data["sweep_level"]
-        sweep_type = setup_data["sweep_type"]
-        disp = setup_data["displacement"]
-
-        # === FVG MINIMUM SIZE FILTER ===
-        spec = SYMBOL_SPECS.get(symbol, {})
-        min_fvg_size = spec.get("pip_size", 0.0001) * 5  # Min 5 pips breed
-        fvg_size = fvg.high - fvg.low
-        if fvg_size < min_fvg_size:
-            log.debug(f"  {symbol}: FVG te klein ({fvg_size:.5f} < {min_fvg_size:.5f})")
+        # ─── Gate 2: Spread ──────────────────────────────────────
+        if self.cfg.SPREAD_CHECK_ENABLED and spread > self.cfg.MAX_SPREAD_POINTS:
             return None
 
-        # === SPREAD CHECK ===
-        spread_ok, spread = await check_spread(conn, symbol, state)
-        if not spread_ok:
-            log.info(f"  ❌ {symbol}: spread te hoog")
+        # ─── Gate 3: Daily limits ────────────────────────────────
+        if self.state.daily_trades >= self.cfg.MAX_DAILY_TRADES:
+            return None
+        if len(self.state.active_trades) >= self.cfg.MAX_CONCURRENT_TRADES:
             return None
 
-        # === ENTRY PRIJS ===
-        price_data = await rate_limited_call(
-            conn.get_symbol_price(symbol), state, label=f"price_{symbol}")
-        if not price_data:
+        # ─── Gate 4: Daily loss ──────────────────────────────────
+        if self.state.start_balance > 0:
+            max_loss = self.state.start_balance * (self.cfg.MAX_DAILY_LOSS_PERCENT / 100)
+            if self.state.daily_pnl <= -max_loss:
+                return None
+
+        # ─── Gate 5: Drawdown ────────────────────────────────────
+        if self.state.start_balance > 0 and self.state.balance > 0:
+            dd = (self.state.start_balance - self.state.balance) / self.state.start_balance * 100
+            if dd >= self.cfg.MAX_TOTAL_DRAWDOWN_PERCENT:
+                return None
+
+        # ─── Gate 6: Consecutive losses ──────────────────────────
+        if self.state.consecutive_losses >= self.cfg.MAX_CONSECUTIVE_LOSSES:
+            cooldown = self.cfg.LOSS_COOLDOWN_SECONDS * 2  # double cooldown
+            if time.time() - self.state.last_loss_time < cooldown:
+                return None
+            self.state.consecutive_losses = 0  # reset after cooldown
+
+        # ─── Gate 7: Trade cooldown ──────────────────────────────
+        if time.time() - self.state.last_trade_time < self.cfg.TRADE_COOLDOWN_SECONDS:
             return None
-        entry = price_data["ask"] if direction == Direction.BULL else price_data["bid"]
-        actual_spread = price_data["ask"] - price_data["bid"]
 
-        # === SL/TP BEREKENING — SL achter sweep level, ATR van juiste timeframe ===
-        sl, tp1, tp2, tp3, sl_dist = calculate_sweep_trade_levels(
-            direction, entry, sweep_level, sl_df, symbol, actual_spread)
-
-        effective_entry = entry + actual_spread if direction == Direction.BULL else entry - actual_spread
-        rr_tp1 = abs((tp1 - effective_entry) / abs(effective_entry - sl)) if sl_dist > 0 else 0
-        rr_full = abs((tp3 - effective_entry) / abs(effective_entry - sl)) if sl_dist > 0 else 0
-
-        if rr_tp1 < MIN_RR:
-            log.info(f"  ❌ {symbol}: RR(TP1) {rr_tp1:.1f} < min {MIN_RR}")
+        # ─── Gate 8: Loss cooldown ───────────────────────────────
+        if time.time() - self.state.last_loss_time < self.cfg.LOSS_COOLDOWN_SECONDS:
             return None
 
-        # === SETUP GEVONDEN ===
-        reasons = [
-            f"SWEEP({sweep_type})",
-            f"DISP({disp['body_ratio']:.1f}x)",
-            f"FVG({fvg.timeframe})",
-            f"HTF({htf_direction.value})",
-        ]
+        # ─── Data check ──────────────────────────────────────────
+        if not self.state.candles_1m or not self.state.candles_5m:
+            return None
 
-        log.info(f"  ✅ {symbol}: SWEEP SETUP — {direction.value.upper()} RR(TP1) 1:{rr_tp1:.1f} / RR(TP3) 1:{rr_full:.1f} | {' | '.join(reasons)}")
+        # ─── Compute indicators ──────────────────────────────────
+        atr_1m = self.az.atr(self.state.candles_1m, self.cfg.ATR_PERIOD)
+        atr_5m = self.az.atr(self.state.candles_5m, self.cfg.ATR_PERIOD)
 
-        return TradeSetup(
-            symbol=symbol, direction=direction, entry=entry,
-            stop_loss=sl, tp1=tp1, tp2=tp2, tp3=tp3, zone=fvg,
-            rr=rr_tp1, sweep_level=sweep_level, sweep_type=sweep_type,
-            displacement_body=disp["body"], htf_direction=htf_direction,
-            reasons=reasons,
-        )
-    except Exception as e:
-        log.error(f"Analyse error {symbol}: {e}")
-        return None
+        ema_f = self.az.ema(self.state.candles_5m, self.cfg.EMA_FAST)
+        ema_s = self.az.ema(self.state.candles_5m, self.cfg.EMA_SLOW)
+        self.state.ema_fast = ema_f
+        self.state.ema_slow = ema_s
 
+        # 5M trend from EMA
+        if self.cfg.USE_EMA_FILTER and ema_f > 0 and ema_s > 0:
+            self.state.trend_5m = Direction.LONG if ema_f > ema_s else Direction.SHORT
 
-# ==================== TRADE EXECUTIE ====================
+        # Swings on 1M
+        highs_1m, lows_1m = self.az.swings(self.state.candles_1m)
 
-async def execute_trade(conn, setup: TradeSetup, balance: float, state: BotState,
-                        df_5m: pd.DataFrame = None) -> bool:
-    risk_pct = get_dynamic_risk(state, balance, symbol=setup.symbol, df=df_5m)
-    sl_dist = abs(setup.entry - setup.stop_loss)
+        # OBs and FVGs on 1M
+        obs_1m = self.az.order_blocks(self.state.candles_1m)
+        fvgs_1m = self.az.fvgs(self.state.candles_1m, atr_1m)
 
-    # Dynamische pip value — GEEN FALLBACK, skip als niet beschikbaar
-    pip_value = await get_dynamic_pip_value(conn, setup.symbol, state)
-    if pip_value is None:
-        log.warning(f"Skip trade {setup.symbol}: geen actuele pip value beschikbaar")
-        return False
+        last_candle = self.state.candles_1m[-1]
 
-    lot, lot_details = calculate_lot_size(balance, sl_dist, setup.symbol, risk_pct, pip_value)
+        # ─── Build confluence ────────────────────────────────────
+        confluence = 0
+        reasons = []
+        direction_votes: Dict[Direction, int] = {Direction.LONG: 0, Direction.SHORT: 0}
 
-    if lot < SYMBOL_SPECS.get(setup.symbol, {}).get("min_lot", 0.01):
-        return False
+        # 1. EMA trend alignment
+        if self.state.trend_5m:
+            direction_votes[self.state.trend_5m] += 1
+            reasons.append(f"ema_{self.state.trend_5m.value}")
 
-    # Margin check
-    try:
-        info = await rate_limited_call(conn.get_account_information(), state, label="margin_check")
-        if info:
-            free_margin = info.get("freeMargin", balance)
-            spec = SYMBOL_SPECS.get(setup.symbol, {})
-            leverage = spec.get("leverage", 20)
-            margin_needed = (lot * spec.get("contract", 100000) * setup.entry) / leverage
-            max_margin_use = free_margin * 0.80
+        # 2. Liquidity sweep on 1M
+        sweep = self.az.liquidity_sweep(self.state.candles_1m, highs_1m, lows_1m)
+        if sweep:
+            direction_votes[sweep] += 2
+            reasons.append("liq_sweep")
 
-            if margin_needed > max_margin_use and margin_needed > 0:
-                reduction = max_margin_use / margin_needed
-                old_lot = lot
-                min_lot = spec.get("min_lot", 0.01)
-                lot_step = spec.get("lot_step", 0.01)
-                lot = math.floor((lot * reduction) / lot_step) * lot_step
-                lot = round(max(min_lot, lot), 2)
-                lot_details["margin_reduced"] = True
-                lot_details["original_lot"] = old_lot
-
-                final_margin = (lot * spec.get("contract", 100000) * setup.entry) / leverage
-                if final_margin > free_margin * 0.90:
-                    tg(f"⚠️ <b>MARGIN SKIP</b>: {setup.symbol}\nMargin: €{final_margin:.0f} | Free: €{free_margin:.0f}", state)
-                    return False
-    except Exception as e:
-        log.warning(f"Margin check error: {e}")
-        spec = SYMBOL_SPECS.get(setup.symbol, {})
-        lot = spec.get("min_lot", 0.01)
-
-    update_peak_balance(state, balance)
-
-    kz = get_current_killzone()
-
-    # === DRY RUN MODE ===
-    if DRY_RUN:
-        state.daily_state["trades_today"] += 1
-        r = " | ".join(setup.reasons)
-        de = "🟢" if setup.direction == Direction.BULL else "🔴"
-        wr, total = state.get_symbol_winrate(setup.symbol)
-
-        tg(f"""<b>🧪 DRY RUN — SWEEP SETUP</b>
-
-📌 {setup.symbol} | {setup.direction.value.upper()}
-🕐 KZ: {kz.upper() if kz else '?'}
-🎯 Sweep: {setup.sweep_type} @ {setup.sweep_level:.5f}
-💰 Entry: {setup.entry:.5f}
-🛑 SL: {setup.stop_loss:.5f}
-🎯 TP1: {setup.tp1:.5f} | TP2: {setup.tp2:.5f} | TP3: {setup.tp3:.5f}
-📊 RR: 1:{setup.rr:.1f} | Lots: {lot}
-💵 Risk: {risk_pct*100:.2f}% (${lot_details['risk_amount']})
-📏 SL: {lot_details['sl_pips']:.1f} pips | PipVal: {lot_details['pip_value_used']:.2f}
-🗺️ FVG: {setup.zone.timeframe}
-🏥 {setup.symbol} WR: {wr*100:.0f}% ({total}t)
-📋 {r}""", state)
-
-        trade_data = {
-            "time": datetime.now(timezone.utc).isoformat(),
-            "symbol": setup.symbol, "direction": setup.direction.value,
-            "grade": "SWEEP", "score": setup.displacement_body,
-            "entry": setup.entry, "sl": setup.stop_loss,
-            "tp1": setup.tp1, "tp2": setup.tp2, "tp3": setup.tp3,
-            "lot": lot, "rr": setup.rr, "risk_pct": risk_pct,
-            "confirmation": setup.sweep_type, "zone_type": setup.zone.type.value,
-            "regime": "sweep", "killzone": kz,
-            "confluence": False, "ote_entry": False,
-            "reasons": setup.reasons,
-        }
-        db_save_trade(trade_data)
-        state.trade_journal.append(trade_data)
-        return True
-
-    # === LIVE EXECUTIE MET SLIPPAGE BESCHERMING ===
-    try:
-        spec = SYMBOL_SPECS.get(setup.symbol, {})
-        category = spec.get("category", "forex")
-        max_slippage = MAX_SLIPPAGE_PIPS.get(category, 5) * spec.get("pip_size", 0.0001)
-
-        price_before = await rate_limited_call(conn.get_symbol_price(setup.symbol), state, label=f"exec_price_{setup.symbol}")
-        if not price_before:
-            return False
-
-        current_entry = price_before["ask"] if setup.direction == Direction.BULL else price_before["bid"]
-        slippage = abs(current_entry - setup.entry)
-
-        if slippage > max_slippage:
-            tg(f"⚠️ <b>SLIPPAGE SKIP</b>: {setup.symbol}\nSlippage: {slippage/spec['pip_size']:.1f} pips > max {MAX_SLIPPAGE_PIPS[category]}", state)
-            return False
-
-        if setup.direction == Direction.BULL:
-            result = await asyncio.wait_for(
-                conn.create_market_buy_order(setup.symbol, lot, setup.stop_loss, setup.tp3),
-                timeout=15
+        # 3. Asia range sweep (during London)
+        session = self.sm.get(hour)
+        if session == Session.LONDON:
+            asia_sweep = self.az.asia_sweep(
+                price, self.state.asia_high, self.state.asia_low, last_candle
             )
-        else:
-            result = await asyncio.wait_for(
-                conn.create_market_sell_order(setup.symbol, lot, setup.stop_loss, setup.tp3),
-                timeout=15
-            )
+            if asia_sweep:
+                direction_votes[asia_sweep] += 2
+                reasons.append("asia_sweep")
 
-        # FIX: ERR_NO_ERROR is SUCCESS — niet als error behandelen
-        order_success = False
-        if result:
-            string_code = result.get("stringCode", "")
-            if string_code == "ERR_NO_ERROR" or "orderId" in str(result):
-                order_success = True
-                state.consecutive_api_fails = 0
-
-        if not order_success:
-            # Verify via positions als result onduidelijk
-            await asyncio.sleep(1)
-            positions = await rate_limited_call(conn.get_positions(), state, label="verify_order")
-            if positions:
-                found = any(p.get("symbol") == setup.symbol for p in positions)
-                if found:
-                    order_success = True
-                    state.consecutive_api_fails = 0
-
-        if not order_success:
-            tg(f"❌ <b>ORDER NOT CONFIRMED</b>: {setup.symbol}\nResult: {str(result)[:100]}", state)
-            return False
-
-    except Exception as e:
-        tg(f"❌ <b>ORDER FAIL</b>: {setup.symbol} — {e}", state)
-        state.consecutive_api_fails += 1
-        return False
-
-    state.daily_state["trades_today"] += 1
-
-    trade_data = {
-        "time": datetime.now(timezone.utc).isoformat(),
-        "symbol": setup.symbol, "direction": setup.direction.value,
-        "grade": "SWEEP", "score": setup.displacement_body,
-        "entry": setup.entry, "sl": setup.stop_loss,
-        "tp1": setup.tp1, "tp2": setup.tp2, "tp3": setup.tp3,
-        "lot": lot, "rr": setup.rr, "risk_pct": risk_pct,
-        "confirmation": setup.sweep_type, "zone_type": setup.zone.type.value,
-        "regime": "sweep", "killzone": kz,
-        "confluence": False, "ote_entry": False,
-        "reasons": setup.reasons,
-    }
-    db_save_trade(trade_data)
-    state.trade_journal.append(trade_data)
-
-    r = " | ".join(setup.reasons)
-    de = "🟢" if setup.direction == Direction.BULL else "🔴"
-    cap_warn = " ⚠️CAP" if lot_details.get("capped") else ""
-    margin_warn = " ⚠️MARGIN" if lot_details.get("margin_reduced") else ""
-    pf = db_get_profit_factor()
-    sym_wr, sym_total = state.get_symbol_winrate(setup.symbol)
-
-    tg(f"""<b>{de} TRADE OPENED — SWEEP SETUP</b>
-
-📌 {setup.symbol} | {setup.direction.value.upper()}
-🕐 KZ: {kz.upper() if kz else '?'}
-🎯 Sweep: {setup.sweep_type} @ {setup.sweep_level:.5f}
-💰 Entry: {setup.entry:.5f}
-🛑 SL: {setup.stop_loss:.5f}
-🎯 TP1: {setup.tp1:.5f} (33%)
-🎯 TP2: {setup.tp2:.5f} (33%)
-🎯 TP3: {setup.tp3:.5f} (runner 33%)
-📊 RR: 1:{setup.rr:.1f} | Lots: {lot}{cap_warn}{margin_warn}
-💵 Risk: {risk_pct*100:.2f}% (${lot_details['risk_amount']})
-📏 SL: {lot_details['sl_pips']:.1f} pips | PipVal: {lot_details['pip_value_used']:.2f}
-🗺️ FVG: {setup.zone.timeframe}
-📈 Streak: {state.performance['consecutive_wins']}W / {state.performance['consecutive_losses']}L
-🎯 PF: {pf:.2f} | {setup.symbol} WR: {sym_wr*100:.0f}% ({sym_total}t)
-📋 {r}
-💰 Balance: ${balance:,.2f}""", state)
-
-    return True
-
-
-# ==================== DIAGNOSTIEK ====================
-
-async def run_diagnostics(conn, account, state: BotState):
-    log.info("=" * 60)
-    log.info("DIAGNOSTICS — SMC Bot v5.0 SWEEP STRATEGY")
-    log.info(f"MODE: {'DRY RUN' if DRY_RUN else 'LIVE'}")
-    log.info("=" * 60)
-    try:
-        info = await conn.get_account_information()
-        log.info(f"Balance: ${info['balance']} | Equity: ${info['equity']}")
-    except Exception as e:
-        log.error(f"Account error: {e}")
-    now = datetime.now(timezone.utc)
-    kz = get_current_killzone()
-    log.info(f"Time: {now.strftime('%H:%M:%S')} UTC | Killzone: {kz or 'NONE'}")
-    log.info(f"Symbols: {len(SYMBOLS)} | Entry KZs: {', '.join(ENTRY_KILLZONES)}")
-    log.info(f"Risk: {f'{RISK_PER_TRADE*100:.2f}%'} | Daily: {DAILY_LOSS_LIMIT*100}% | Weekly: {WEEKLY_LOSS_LIMIT*100}%")
-    log.info(f"Max DD hard stop: {MAX_DRAWDOWN_HARD_STOP*100}%")
-    log.info(f"Max trades: {MAX_TOTAL_TRADES} total | {MAX_TRADES_PER_DAY}/day | {MAX_TRADES_PER_ASSET}/asset")
-    log.info(f"Min RR: {MIN_RR} | Strategy: Sweep→Displacement→FVG")
-    log.info(f"Symbol min WR: {SYMBOL_MIN_WINRATE*100}% after {SYMBOL_MIN_TRADES_FOR_EVAL} trades")
-
-    mae_mfe = db_get_mae_mfe_stats()
-    if mae_mfe:
-        log.info(f"MAE/MFE: avg_mae={mae_mfe['avg_mae']:.5f} | avg_mfe={mae_mfe['avg_mfe']:.5f} ({mae_mfe['count']} trades)")
-
-    pf = db_get_profit_factor()
-    log.info(f"Profit Factor: {pf:.2f}")
-
-    for s in SYMBOLS:
-        try:
-            candles = await get_candles(account, s, "5m", 20, state)
-            status = f"OK {len(candles)}c" if candles and len(candles) >= 10 else "FAIL"
-            p = await rate_limited_call(conn.get_symbol_price(s), state, label=f"diag_{s}")
-            spread = p["ask"] - p["bid"]
-            spec = SYMBOL_SPECS[s]
-            spread_pips = spread / spec["pip_size"]
-            allowed, _ = is_entry_allowed(s)
-            pv = await get_dynamic_pip_value(conn, s, state)
-            pv_str = f"pip_val: {pv:.2f}" if pv else "pip_val: N/A"
-            healthy = state.is_symbol_healthy(s)
-            wr, total = state.get_symbol_winrate(s)
-            health_str = f"{'✅' if healthy else '⛔'} WR:{wr*100:.0f}%({total}t)"
-            log.info(f"  {s:10} | {status} | spread: {spread_pips:.1f} pips | {pv_str} | entry: {'YES' if allowed else 'NO'} | {health_str}")
-        except Exception as e:
-            log.info(f"  {s:10} | ERROR {e}")
-    log.info("=" * 60)
-
-
-# ==================== HOOFDLOOP ====================
-
-async def run(state: BotState):
-
-    # Graceful shutdown handler
-    def handle_shutdown(signum, frame):
-        log.info(f"Shutdown signal {signum} ontvangen — graceful shutdown...")
-        state.shutdown_requested = True
-
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
-
-    try:
-        log.info("Connecting to MetaAPI...")
-        api = MetaApi(METAAPI_TOKEN)
-        account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-
-        conn = None
-        redeployed = False  # Track of we al redeployed hebben
-        for attempt in range(5):
-            try:
-                log.info(f"Connection poging {attempt + 1}/5...")
-                state.watchdog_last_loop = time.time()  # Watchdog: we leven nog
-                account_info = account.state
-                log.info(f"Account state: {account_info}")
-
-                if account_info != "DEPLOYED":
-                    log.info("Account niet deployed, deploying...")
-                    try:
-                        await account.deploy()
-                    except Exception as e:
-                        log.warning(f"Deploy fout (kan normaal zijn): {e}")
-                    await asyncio.sleep(10)
-
-                try:
-                    await asyncio.wait_for(account.wait_connected(), timeout=60)
-                    log.info("Account connected!")
-                except asyncio.TimeoutError:
-                    log.warning(f"Account connect timeout poging {attempt + 1}")
-                    # Alleen 1x redeploy — niet op elke poging
-                    if attempt == 3 and not redeployed:
-                        log.info("Forcing undeploy + redeploy (eenmalig)...")
-                        redeployed = True
-                        try:
-                            await account.undeploy()
-                            await asyncio.sleep(15)
-                            await account.deploy()
-                            await asyncio.sleep(30)  # Was 10 — geef server tijd
-                        except Exception as e:
-                            log.warning(f"Redeploy fout: {e}")
-                    await asyncio.sleep(15)  # Was 10
-                    continue
-
-                conn = account.get_rpc_connection()
-                await conn.connect()
-                log.info("Synchroniseren...")
-                try:
-                    await asyncio.wait_for(conn.wait_synchronized(), timeout=90)
-                    log.info("Gesynchroniseerd!")
-                    break
-                except asyncio.TimeoutError:
-                    log.warning(f"Sync timeout poging {attempt + 1}")
-                    try:
-                        await conn.close()
-                    except Exception:
-                        pass
-                    conn = None
-                    await asyncio.sleep(15)
-                    continue
-            except Exception as e:
-                log.error(f"Connection poging {attempt + 1} mislukt: {e}")
-                if conn:
-                    try:
-                        await conn.close()
-                    except Exception:
-                        pass
-                    conn = None
-                await asyncio.sleep(15)
-
-        if not conn:
-            tg("❌ <b>FATAL: Kon niet verbinden na 5 pogingen</b>", state)
-            raise Exception("Connection failed after 5 attempts")
-
-        # Verification — rate limit aware, niet fataal
-        verified = False
-        for verify_attempt in range(3):
-            try:
-                test_info = await asyncio.wait_for(conn.get_account_information(), timeout=15)
-                log.info(f"Connection verified: ${test_info['balance']} balance")
-                verified = True
+        # 4. Order block
+        for ob in obs_1m:
+            if ob.mitigated:
+                continue
+            if ob.direction == Direction.LONG and ob.low <= price <= ob.high:
+                direction_votes[Direction.LONG] += 1
+                reasons.append("bull_ob")
                 break
-            except Exception as e:
-                err_str = str(e)
-                if "TooManyRequests" in err_str or "rate" in err_str.lower() or "cpu credits" in err_str.lower():
-                    # Rate limited — wacht de aanbevolen tijd
-                    wait_mins = 4 * (verify_attempt + 1)  # 4, 8, 12 min
-                    log.warning(f"Rate limited bij verificatie — wacht {wait_mins} min...")
-                    tg(f"⏳ <b>RATE LIMITED</b> — wacht {wait_mins} min voor retry...", state)
-                    for _ in range(wait_mins * 2):  # 30s stukken
-                        state.watchdog_last_loop = time.time()
-                        await asyncio.sleep(30)
-                else:
-                    log.warning(f"Verificatie poging {verify_attempt+1} mislukt: {e}")
-                    await asyncio.sleep(5)
+            elif ob.direction == Direction.SHORT and ob.low <= price <= ob.high:
+                direction_votes[Direction.SHORT] += 1
+                reasons.append("bear_ob")
+                break
 
-        if not verified:
-            log.warning("Verificatie mislukt na 3 pogingen — ga toch door (connectie kan nog werken)")
-            tg("⚠️ <b>Verificatie mislukt</b> — bot draait door, eerste heartbeat zal status tonen", state)
+        # 5. FVG
+        for fvg in fvgs_1m:
+            if fvg.filled:
+                continue
+            if fvg.direction == Direction.LONG and fvg.low <= price <= fvg.high:
+                direction_votes[Direction.LONG] += 1
+                reasons.append("fvg")
+                break
+            elif fvg.direction == Direction.SHORT and fvg.low <= price <= fvg.high:
+                direction_votes[Direction.SHORT] += 1
+                reasons.append("fvg")
+                break
 
-        await asyncio.sleep(2)
+        # 6. Momentum candle
+        momentum = self.az.is_momentum_candle(last_candle, atr_1m)
+        if momentum:
+            direction_votes[momentum] += 1
+            reasons.append("momentum")
 
-        state.watchdog_last_loop = time.time()
+        # 7. Exhaustion candle (reversal)
+        exhaustion = self.az.is_exhaustion_candle(last_candle)
+        if exhaustion:
+            direction_votes[exhaustion] += 1
+            reasons.append("exhaustion")
+
+        # 8. Round number reaction
+        if self.az.near_round_number(price):
+            # round number adds to confluence but doesn't set direction
+            confluence += 1
+            reasons.append("round_num")
+
+        # 9. Mean Reversion (Bollinger + RSI + StochRSI)
+        mr_signal = self.az.mean_reversion(self.state.candles_1m, price, self.cfg)
+        if mr_signal:
+            mr_dir, mr_score, mr_reason = mr_signal
+            direction_votes[mr_dir] += self.cfg.MR_CONFLUENCE_SCORE
+            reasons.append(mr_reason)
+
+        # ─── Determine direction ─────────────────────────────────
+        long_score = direction_votes[Direction.LONG]
+        short_score = direction_votes[Direction.SHORT]
+
+        if long_score > short_score and long_score >= 1:
+            direction = Direction.LONG
+            confluence += long_score
+        elif short_score > long_score and short_score >= 1:
+            direction = Direction.SHORT
+            confluence += short_score
+        else:
+            return None  # no clear direction
+
+        # ─── EMA filter: trade must align with 5M trend ──────────
+        # Exception: mean reversion signals can go counter-trend
+        if self.cfg.USE_EMA_FILTER and self.state.trend_5m:
+            if direction != self.state.trend_5m:
+                # Allow if strong mean reversion signal is present
+                if not (mr_signal and mr_signal[1] >= 3):
+                    return None
+
+        # ─── Minimum confluence ───────────────────────────────────
+        if confluence < self.cfg.MIN_CONFLUENCE:
+            return None
+
+        # ─── Calculate SL/TP ──────────────────────────────────────
+        sl_dist = max(atr_1m * self.cfg.ATR_SL_MULTIPLIER, self.cfg.MIN_SL_POINTS)
+        sl_dist = min(sl_dist, self.cfg.MAX_SL_POINTS)
+
+        rr = self.sm.get_rr(session, self.cfg)
+        tp_dist = sl_dist * rr
+        tp1_dist = sl_dist * self.cfg.TP1_RR_RATIO
+
+        if direction == Direction.LONG:
+            sl = price - sl_dist
+            tp = price + tp_dist
+            tp1 = price + tp1_dist
+        else:
+            sl = price + sl_dist
+            tp = price - tp_dist
+            tp1 = price - tp1_dist
+
+        reason_str = " | ".join(reasons)
+        log.info(f"⚡ SIGNAL: {direction.value.upper()} | Score: {confluence} | {reason_str}")
+
+        return direction, sl, tp1, tp, confluence, reason_str
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  POSITION MANAGER
+# ═══════════════════════════════════════════════════════════════════
+
+class PositionMgr:
+    def __init__(self, state: BotState, conn, db: Database, tg: Telegram):
+        self.state = state
+        self.conn = conn
+        self.db = db
+        self.tg = tg
+        self.cfg = state.cfg
+
+    def calc_lots(self, sl_dist: float) -> float:
+        risk = self.state.balance * (self.cfg.RISK_PERCENT / 100)
+        per_lot = 100.0  # $1 move = $100 per lot on XAUUSD
+        if sl_dist <= 0:
+            return 0.01
+        lots = risk / (sl_dist * per_lot)
+        return max(0.01, min(round(lots, 2), 0.5))  # cap at 0.5 for scalping
+
+    async def open_scalp(self, direction: Direction, price: float,
+                         sl: float, tp1: float, tp: float,
+                         confluence: int, reason: str):
+        sl_dist = abs(price - sl)
+        lots = self.calc_lots(sl_dist)
+        session = self.state.session.value
 
         try:
-            init_info = await conn.get_account_information()
-            state.performance["session_start_balance"] = init_info["balance"]
-            state.performance["peak_balance"] = init_info["balance"]
+            if direction == Direction.LONG:
+                result = await self.conn.create_market_buy_order(
+                    self.cfg.SYMBOL, lots, sl, tp,
+                    options={"comment": f"Scalp|{reason[:15]}"}
+                )
+            else:
+                result = await self.conn.create_market_sell_order(
+                    self.cfg.SYMBOL, lots, sl, tp,
+                    options={"comment": f"Scalp|{reason[:15]}"}
+                )
+
+            oid = result.get("orderId", result.get("positionId", f"s_{int(time.time())}"))
+
+            trade = ScalpTrade(
+                id=oid, direction=direction,
+                entry=price, sl=sl, tp=tp, tp1=tp1,
+                lots=lots
+            )
+
+            self.state.active_trades[oid] = trade
+            self.state.daily_trades += 1
+            self.state.last_trade_time = time.time()
+            self.db.save_trade(trade, session)
+
+            log.info(f"SCALP OPENED: {direction.value} {lots}L @ ${price:.2f} | SL ${sl:.2f} | TP ${tp:.2f}")
+            await self.tg.scalp_opened(trade, session, confluence)
+
+        except Exception as e:
+            log.error(f"Open error: {e}")
+
+    async def manage_partials(self, price: float):
+        for tid, t in list(self.state.active_trades.items()):
+            if t.phase != TradePhase.OPEN:
+                continue
+
+            hit = (
+                (t.direction == Direction.LONG and price >= t.tp1) or
+                (t.direction == Direction.SHORT and price <= t.tp1)
+            )
+            if not hit:
+                continue
+
+            close_lots = round(t.lots * self.cfg.PARTIAL_PERCENT, 2)
+            if close_lots < 0.01:
+                continue
+
+            try:
+                # Close 50%
+                if t.direction == Direction.LONG:
+                    await self.conn.create_market_sell_order(
+                        self.cfg.SYMBOL, close_lots,
+                        options={"comment": "Scalp|partial"}
+                    )
+                else:
+                    await self.conn.create_market_buy_order(
+                        self.cfg.SYMBOL, close_lots,
+                        options={"comment": "Scalp|partial"}
+                    )
+
+                t.phase = TradePhase.TP1_HIT
+                log.info(f"TP1 HIT: {close_lots}L closed, SL → BE")
+
+                # Move SL to breakeven
+                if self.cfg.MOVE_SL_TO_BE:
+                    await self.conn.modify_position(tid, stop_loss=t.entry, take_profit=t.tp)
+                    t.sl = t.entry
+
+                self.db.save_trade(t)
+                await self.tg.scalp_partial(t)
+
+            except Exception as e:
+                log.error(f"Partial error: {e}")
+
+    async def sync_positions(self):
+        try:
+            positions = await self.conn.get_positions()
+            open_ids = {p.get("id") for p in positions if p.get("symbol") == self.cfg.SYMBOL}
+
+            for tid, t in list(self.state.active_trades.items()):
+                if tid not in open_ids and t.phase != TradePhase.CLOSED:
+                    t.phase = TradePhase.CLOSED
+
+                    try:
+                        history = await self.conn.get_deals_by_position(tid)
+                        if history:
+                            t.pnl = sum(d.get("profit", 0) for d in history)
+                    except Exception:
+                        pass
+
+                    # Update state
+                    self.state.daily_pnl += t.pnl
+                    if t.pnl > 0:
+                        self.state.daily_wins += 1
+                        self.state.consecutive_losses = 0
+                    else:
+                        self.state.daily_losses += 1
+                        self.state.consecutive_losses += 1
+                        self.state.last_loss_time = time.time()
+
+                    self.db.save_trade(t)
+                    del self.state.active_trades[tid]
+
+                    log.info(f"CLOSED: {tid} | PnL: ${t.pnl:+.2f} | Daily: ${self.state.daily_pnl:+.2f}")
+                    await self.tg.scalp_closed(t)
+
+        except Exception as e:
+            log.error(f"Sync error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN BOT
+# ═══════════════════════════════════════════════════════════════════
+
+class GoldScalper:
+    def __init__(self):
+        self.cfg = ScalpConfig()
+        self.state = BotState(self.cfg)
+        self.az = ScalpAnalyzer(self.cfg)
+        self.sm = SessionMgr(self.cfg)
+        self.db = Database(self.cfg.DB_PATH)
+        self.tg = Telegram(self.state)
+        self.sig = ScalpSignal(self.state, self.az, self.sm)
+        self.pos: Optional[PositionMgr] = None
+        self.api = None
+        self.account = None
+        self.conn = None
+
+    async def connect(self):
+        log.info("Connecting to MetaAPI...")
+        if not self.cfg.META_API_TOKEN or not self.cfg.ACCOUNT_ID:
+            log.error("Set META_API_TOKEN and META_API_ACCOUNT_ID!")
+            sys.exit(1)
+
+        self.api = MetaApi(self.cfg.META_API_TOKEN)
+        self.account = await self.api.metatrader_account_api.get_account(self.cfg.ACCOUNT_ID)
+
+        if self.account.state != "DEPLOYED":
+            await self.account.deploy()
+
+        await self.account.wait_connected()
+        self.conn = self.account.get_rpc_connection()
+        await self.conn.connect()
+        await self.conn.wait_synchronized()
+
+        info = await self.conn.get_account_information()
+        self.state.start_balance = info.get("balance", 0)
+        self.state.balance = self.state.start_balance
+        self.state.trade_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        self.pos = PositionMgr(self.state, self.conn, self.db, self.tg)
+
+        log.info(f"Connected! Balance: ${self.state.start_balance:.2f}")
+        await self.tg.send(
+            f"🤖 <b>Gold Scalper Started</b>\n"
+            f"Balance: ${self.state.start_balance:.2f}\n"
+            f"Mode: Scalping 1M/5M\n"
+            f"Max trades/day: {self.cfg.MAX_DAILY_TRADES}\n"
+            f"Risk: {self.cfg.RISK_PERCENT}%"
+        )
+
+    async def fetch_data(self):
+        try:
+            self.state.candles_5m = await self.conn.get_candle(
+                self.cfg.SYMBOL, self.cfg.TF_STRUCTURE, self.cfg.CANDLE_LOOKBACK_5M
+            )
+            self.state.candles_1m = await self.conn.get_candle(
+                self.cfg.SYMBOL, self.cfg.TF_ENTRY, self.cfg.CANDLE_LOOKBACK_1M
+            )
+            ah, al = self.sm.calc_asia_range(self.state.candles_5m)
+            if ah > 0:
+                self.state.asia_high = ah
+                self.state.asia_low = al
+        except Exception as e:
+            log.error(f"Data fetch error: {e}")
+
+    async def get_price_and_spread(self) -> Tuple[float, float]:
+        try:
+            tick = await self.conn.get_symbol_price(self.cfg.SYMBOL)
+            bid = tick.get("bid", 0.0)
+            ask = tick.get("ask", 0.0)
+            spread = ask - bid if ask > 0 and bid > 0 else 0.0
+            return bid, spread
+        except Exception as e:
+            log.error(f"Price error: {e}")
+            return 0.0, 999.0
+
+    async def daily_reset(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self.state.trade_date:
+            # Send daily report before reset
+            if self.state.daily_trades > 0:
+                await self.tg.daily_report()
+
+            self.db.save_daily(
+                self.state.trade_date,
+                self.state.daily_trades, self.state.daily_wins,
+                self.state.daily_losses, self.state.daily_pnl, 0.0
+            )
+
+            self.state.daily_trades = 0
+            self.state.daily_pnl = 0.0
+            self.state.daily_wins = 0
+            self.state.daily_losses = 0
+            self.state.consecutive_losses = 0
+            self.state.trade_date = today
+
+            info = await self.conn.get_account_information()
+            self.state.start_balance = info.get("balance", 0)
+            self.state.balance = self.state.start_balance
+            log.info(f"Daily reset. New balance: ${self.state.balance:.2f}")
+
+    async def cycle(self):
+        self.state.heartbeat = time.time()
+
+        await self.daily_reset()
+        await self.fetch_data()
+
+        price, spread = await self.get_price_and_spread()
+        if price <= 0:
+            return
+
+        # Update balance
+        try:
+            info = await self.conn.get_account_information()
+            self.state.balance = info.get("balance", self.state.balance)
+            self.state.equity = info.get("equity", self.state.equity)
         except Exception:
             pass
 
-        # Laad state uit database
-        saved_perf = db_load_state("performance")
-        if saved_perf:
-            state.performance.update(saved_perf)
-            # Ensure symbol_stats exists (backward compat)
-            if "symbol_stats" not in state.performance:
-                state.performance["symbol_stats"] = {}
-            log.info(f"Performance geladen: {state.performance['wins']}W / {state.performance['losses']}L")
+        # Update session
+        hour = datetime.now(timezone.utc).hour
+        self.state.session = self.sm.get(hour)
 
-        saved_cooldowns = db_load_state("cooldowns")
-        if saved_cooldowns:
-            state.symbol_cooldowns.update(saved_cooldowns)
+        # Sync closed trades
+        await self.pos.sync_positions()
 
-        # Laad trade phases
-        saved_phases = db_load_state("trade_phases")
-        if saved_phases:
-            state.trade_phases = {k: TradePhase(v) for k, v in saved_phases.items()}
+        # Manage partials
+        await self.pos.manage_partials(price)
 
-        # Laad zones
-        loaded_zones, loaded_htf, zone_count = db_load_zones()
-        state.zone_store.update(loaded_zones)
-        state.htf_zone_store.update(loaded_htf)
+        # Check for new signal
+        signal = self.sig.evaluate(price, spread)
+        if signal:
+            direction, sl, tp1, tp, confluence, reason = signal
+            await self.pos.open_scalp(direction, price, sl, tp1, tp, confluence, reason)
 
-        state.consecutive_api_fails = 0
-        await run_diagnostics(conn, account, state)
-
-        mode_str = "🧪 DRY RUN" if DRY_RUN else "🔴 LIVE"
-
-        tg(f"""🚀 <b>SMC BOT v5.0 — SWEEP STRATEGY</b> {mode_str}
-
-📊 {len(SYMBOLS)} symbols | Max: {MAX_TOTAL_TRADES} open / {MAX_TRADES_PER_DAY} per dag
-💵 Risk: {RISK_PER_TRADE*100:.2f}% | Daily: {DAILY_LOSS_LIMIT*100}% | Weekly: {WEEKLY_LOSS_LIMIT*100}%
-📉 Max DD hard stop: {MAX_DRAWDOWN_HARD_STOP*100}%
-🗺️ Zones geladen: {zone_count}
-📊 PF: {db_get_profit_factor():.2f}
-⚡ <b>Strategie: Sweep → Displacement → FVG</b>
-• 1H structuur bepaalt richting
-• 5M sweep detectie (equal highs/lows, swing points)
-• Displacement confirmatie (1.5x avg body)
-• FVG entry bij retest
-• SL achter sweep level
-• Min RR: {MIN_RR}
-• 33/33/33 partial close system""", state)
-
-        while not state.shutdown_requested:
+    async def run(self):
+        log.info(f"Main loop started (cycle: {self.cfg.MAIN_LOOP_SECONDS}s)")
+        while self.state.running:
             try:
-                state.watchdog_last_loop = time.time()
-
-                # Weekend check — ICMarkets gesloten vr 22:00 - zo 22:00 UTC
-                now_utc = datetime.now(timezone.utc)
-                is_weekend = (now_utc.weekday() == 5) or \
-                             (now_utc.weekday() == 4 and now_utc.hour >= 22) or \
-                             (now_utc.weekday() == 6 and now_utc.hour < 22)
-                if is_weekend:
-                    if now_utc.minute == 0 and now_utc.second < 15:
-                        log.info("Weekend — market gesloten, wacht...")
-                    await asyncio.sleep(60)
-                    continue
-
-                await send_heartbeat(conn, state)
-
-                # Reconnect heartbeat — detecteert stille disconnects
-                if not await reconnect_heartbeat(conn, state):
-                    log.warning("Reconnect heartbeat failed — reconnecting...")
-
-                if needs_reconnect(state):
-                    log.warning(f"API failed {state.consecutive_api_fails}x — reconnecting...")
-                    tg("⚠️ <b>CONNECTION ISSUE</b> — auto-recovering...", state)
-                    reconnected = False
-
-                    for attempt in range(3):
-                        try:
-                            state.watchdog_last_loop = time.time()
-                            log.info(f"Soft reconnect {attempt + 1}/3...")
-                            try:
-                                await conn.close()
-                            except Exception:
-                                pass
-                            await asyncio.sleep(5 * (attempt + 1))
-                            conn = account.get_rpc_connection()
-                            await conn.connect()
-                            await asyncio.wait_for(conn.wait_synchronized(), timeout=30)
-                            test = await asyncio.wait_for(conn.get_account_information(), timeout=10)
-                            if test and "balance" in test:
-                                state.consecutive_api_fails = 0
-                                state.connection_healthy = True
-                                reconnected = True
-                                tg("✅ <b>RECOVERED</b>", state)
-                                break
-                        except Exception as e:
-                            err_str = str(e)
-                            if "TooManyRequests" in err_str or "cpu credits" in err_str.lower():
-                                log.warning(f"Rate limited tijdens reconnect — wacht 5 min...")
-                                tg("⏳ <b>RATE LIMITED</b> — wacht 5 min...", state)
-                                for _ in range(10):
-                                    state.watchdog_last_loop = time.time()
-                                    await asyncio.sleep(30)
-                                break  # Stop reconnect pogingen, probeer opnieuw na wacht
-                            log.warning(f"Soft reconnect {attempt + 1}/3: {e}")
-
-                    if not reconnected:
-                        log.info("Soft reconnect failed — wacht 2 min...")
-                        state.consecutive_api_fails = 0
-                        state.watchdog_last_loop = time.time()  # Watchdog: we leven nog
-                        await asyncio.sleep(120)
-                        try:
-                            conn = account.get_rpc_connection()
-                            await conn.connect()
-                            await asyncio.wait_for(conn.wait_synchronized(), timeout=60)
-                            test = await asyncio.wait_for(conn.get_account_information(), timeout=10)
-                            if test and "balance" in test:
-                                state.consecutive_api_fails = 0
-                                reconnected = True
-                                tg("✅ <b>RECOVERED</b> na 2 min", state)
-                        except Exception as e:
-                            err_str = str(e)
-                            if "TooManyRequests" in err_str or "cpu credits" in err_str.lower():
-                                log.warning("Rate limited bij 2-min retry — skip naar full restart")
-                                tg("⏳ <b>RATE LIMITED</b> — full restart met wacht...", state)
-                            else:
-                                log.warning(f"2-min retry failed: {e}")
-
-                    if not reconnected:
-                        log.info("Trying undeploy/redeploy...")
-                        state.watchdog_last_loop = time.time()  # Watchdog: we leven nog
-                        try:
-                            await account.undeploy()
-                            await asyncio.sleep(15)
-                            await account.deploy()
-                            await asyncio.sleep(30)
-                            conn = account.get_rpc_connection()
-                            await conn.connect()
-                            await asyncio.wait_for(conn.wait_synchronized(), timeout=90)
-                            test = await asyncio.wait_for(conn.get_account_information(), timeout=10)
-                            if test and "balance" in test:
-                                state.consecutive_api_fails = 0
-                                reconnected = True
-                                tg("✅ <b>RECOVERED via REDEPLOY</b>", state)
-                        except Exception as e:
-                            err_str = str(e)
-                            if "TooManyRequests" in err_str or "cpu credits" in err_str.lower():
-                                log.warning("Rate limited bij redeploy — skip naar full restart")
-                            else:
-                                log.error(f"Redeploy failed: {e}")
-
-                    if not reconnected:
-                        # ALLE reconnect pogingen gefaald — SDK instance is corrupt
-                        # asyncio.run() in dezelfde process hergebruikt SDK singleton state
-                        # ENIGE fix: kill process, laat Railway/Docker opnieuw starten
-                        tg("🔄 <b>PROCESS RESTART</b> — alle reconnects gefaald, process wordt gekilld voor schone herstart...", state)
-                        log.error("All reconnect attempts failed — flushing DB and killing process")
-
-                        # Flush database zodat niets verloren gaat
-                        try:
-                            db_save_state("performance", state.performance)
-                            db_save_state("cooldowns", state.symbol_cooldowns)
-                            db_save_zones_bulk(state.zone_store, htf=False)
-                            db_save_zones_bulk(state.htf_zone_store, htf=True)
-                            log.info("DB flushed successfully before exit")
-                        except Exception as flush_err:
-                            log.error(f"DB flush failed: {flush_err}")
-
-                        # Cleanup connectie
-                        try:
-                            await conn.close()
-                        except Exception:
-                            pass
-
-                        # Wacht 30s zodat Railway niet te snel herstart (rate limit bescherming)
-                        log.info("Wacht 30s voor process exit...")
-                        await asyncio.sleep(30)
-
-                        # HARD EXIT — Railway herstart container met verse process + SDK
-                        os._exit(1)
-
-                kz = get_current_killzone()
-
-                if kz == "asia":
-                    await update_asia_range(account, state)
-
-                # Update PDH/PDL eenmalig per dag (bij start eerste killzone)
-                if kz and kz in ENTRY_KILLZONES:
-                    await update_previous_day_hl(account, state)
-
-                if kz not in ENTRY_KILLZONES:
-                    try:
-                        positions = await rate_limited_call(conn.get_positions(), state, label="pos_offkz")
-                        if positions:
-                            await manage_positions(conn, positions, state)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(30)
-                    continue
-
-                info = await rate_limited_call(conn.get_account_information(), state, label="account_info")
-                if not info or "balance" not in info:
-                    log.warning("Kon account info niet ophalen, skip cyclus")
-                    await asyncio.sleep(10)
-                    continue
-
-                balance = info["balance"]
-                equity = info["equity"]
-                positions = await rate_limited_call(conn.get_positions(), state, label="positions")
-                if positions is None:
-                    positions = []
-
-                update_peak_balance(state, equity)
-                update_weekly_loss(state, balance)
-                await check_closed_trades(conn, state)
-
-                if positions:
-                    await manage_positions(conn, positions, state)
-
-                # === MAX DRAWDOWN HARD STOP ===
-                if not check_max_drawdown(state, equity):
-                    # Beheer nog wel open posities, maar open geen nieuwe
-                    await asyncio.sleep(60)
-                    continue
-
-                reset_weekly_if_needed(state, balance)
-                if not is_weekly_limit_ok(state):
-                    await asyncio.sleep(60)
-                    continue
-
-                reset_daily_if_needed(state, balance)
-                if not is_daily_limit_ok(state, balance):
-                    await asyncio.sleep(60)
-                    continue
-
-                # Profit factor check
-                total_trades = state.performance["wins"] + state.performance["losses"]
-                if total_trades >= 30:
-                    pf = db_get_profit_factor()
-                    if pf < 0.7:
-                        log.warning(f"Profit factor {pf:.2f} < 0.7 — trades gepauzeerd 5 min")
-                        await asyncio.sleep(300)
-                        continue
-                    elif pf < 1.0:
-                        log.info(f"Profit factor {pf:.2f} < 1.0 — caution")
-
-                if not is_candle_just_closed(5):
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-
-                if not await news_filter(state):
-                    await asyncio.sleep(60)
-                    continue
-
-                if len(positions) >= MAX_TOTAL_TRADES:
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-
-                if state.daily_state["trades_today"] >= MAX_TRADES_PER_DAY:
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-
-                for symbol in SYMBOLS:
-                    if state.shutdown_requested:
-                        break
-
-                    state.watchdog_last_loop = time.time()
-                    try:
-                        allowed, _ = is_entry_allowed(symbol)
-                        if not allowed:
-                            continue
-
-                        # Per-symbol health check
-                        if not state.is_symbol_healthy(symbol):
-                            continue
-
-                        if sum(1 for p in positions if p["symbol"] == symbol) >= MAX_TRADES_PER_ASSET:
-                            continue
-
-                        if not check_correlation(symbol, positions):
-                            continue
-
-                        cd_ok, cd_remaining = check_cooldown(state, symbol)
-                        if not cd_ok:
-                            continue
-
-                        # Max 1 trade per symbol per killzone per dag
-                        kz_now = get_current_killzone() or "none"
-                        kz_dir_key = f"{symbol}_{kz_now}_{date.today()}"
-                        if kz_dir_key in state.recent_signals:
-                            continue
-
-                        setup = await analyze_and_find_setup(account, conn, symbol, positions, balance, state)
-                        if not setup:
-                            continue
-
-                        # Haal 5M data op voor volatility sizing
-                        candles_5m = await get_candles(account, symbol, "5m", 60, state)
-                        df_5m_exec = None
-                        if candles_5m and len(candles_5m) > 20:
-                            df_5m_exec = pd.DataFrame(candles_5m)
-                            df_5m_exec = calculate_indicators(df_5m_exec)
-
-                        success = await execute_trade(conn, setup, balance, state, df_5m_exec)
-                        if success:
-                            state.recent_signals[kz_dir_key] = time.time()
-                    except Exception as e:
-                        log.warning(f"Symbol {symbol} error (skipping): {e}")
-                    await asyncio.sleep(0.5)
-
-                # Scan summary
-                total_zones = sum(len([z for z in zl if z.is_valid]) for zl in state.zone_store.values())
-                total_htf = sum(len([z for z in zl if z.is_valid]) for zl in state.htf_zone_store.values())
-                log.info(f"📊 Scan klaar | Zones: {total_zones} (LTF) + {total_htf} (HTF) | KZ: {get_current_killzone() or 'NONE'}")
-
-                cleanup_recent_signals(state)
-                db_save_state("cooldowns", state.symbol_cooldowns)
-
-                state.consecutive_errors = 0  # Reset alleen na succesvolle loop
-                await asyncio.sleep(CHECK_INTERVAL)
-
-            except asyncio.CancelledError as e:
-                state.consecutive_errors += 1
-                log.warning(f"CancelledError #{state.consecutive_errors}: {e}")
-                if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    tg(f"🚨 <b>TOO MANY DISCONNECTS</b> — force restart", state)
-                    raise Exception("Too many CancelledErrors")
-                await asyncio.sleep(15)
+                await self.cycle()
             except Exception as e:
-                state.consecutive_errors += 1
-                err_str = str(e)
+                log.error(f"Cycle error: {e}", exc_info=True)
+                await self.tg.send(f"⚠️ Error: {str(e)[:100]}")
+            await asyncio.sleep(self.cfg.MAIN_LOOP_SECONDS)
 
-                log.error(f"Loop error #{state.consecutive_errors}: {e}")
-                if state.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    tg(f"🚨 <b>{MAX_CONSECUTIVE_ERRORS} CONSECUTIVE ERRORS</b> — force restart\n{err_str[:60]}", state)
-                    raise Exception(f"Too many consecutive errors: {state.consecutive_errors}")
-                if state.consecutive_errors % 5 == 0:
-                    tg(f"⚠️ <b>{state.consecutive_errors} LOOP ERRORS</b>\n{err_str[:80]}", state)
-                await asyncio.sleep(10 if "timed out" in err_str.lower() else 5)
-
-        # Graceful shutdown
-        log.info("Graceful shutdown compleet")
-        # Flush database
-        db_save_state("performance", state.performance)
-        db_save_state("cooldowns", state.symbol_cooldowns)
-        db_save_zones_bulk(state.zone_store, htf=False)
-        db_save_zones_bulk(state.htf_zone_store, htf=True)
-        tg("🛑 <b>BOT GRACEFUL SHUTDOWN</b>", state)
-
-    except asyncio.CancelledError as e:
-        log.critical(f"FATAL CancelledError: {e}")
-        tg(f"❌ <b>FATAL DISCONNECT</b> — herstarting...", state)
-        raise Exception(f"CancelledError: {e}")
-    except Exception as e:
-        log.critical(f"FATAL: {e}")
-        tg(f"❌ <b>FATAL</b>: {str(e)[:100]}", state)
-        raise e
+    async def start(self):
+        try:
+            await self.connect()
+            await self.run()
+        except KeyboardInterrupt:
+            log.info("Shutting down...")
+        except Exception as e:
+            log.error(f"Fatal: {e}", exc_info=True)
+            await self.tg.send(f"🛑 FATAL: {str(e)[:200]}")
+        finally:
+            self.db.close()
+            if self.conn:
+                try:
+                    await self.conn.close()
+                except Exception:
+                    pass
+            log.info("Bot stopped.")
 
 
-# ==================== WATCHDOG (GRACEFUL) ====================
+# ═══════════════════════════════════════════════════════════════════
+#  WATCHDOG
+# ═══════════════════════════════════════════════════════════════════
 
-def watchdog_thread(state: BotState):
-    watchdog_max_silence = 600
-    while not state.shutdown_requested:
-        time.sleep(60)
-        silence = time.time() - state.watchdog_last_loop
-        if silence > watchdog_max_silence:
-            log.critical(f"WATCHDOG: Loop silent for {silence:.0f}s — requesting shutdown...")
-            tg(f"🐕 <b>WATCHDOG TRIGGERED</b>\nLoop niet actief voor {silence:.0f}s\nGraceful restart...", state)
-            state.shutdown_requested = True
-            # Geef 10s voor graceful shutdown, daarna force
-            time.sleep(10)
-            if not state.shutdown_requested:
-                continue
-            log.critical("Watchdog: graceful shutdown timeout — force exit")
+async def watchdog(state: BotState):
+    while state.running:
+        await asyncio.sleep(30)
+        if time.time() - state.heartbeat > state.cfg.WATCHDOG_TIMEOUT:
+            log.critical("Watchdog timeout — restarting!")
             os._exit(1)
 
 
-# ==================== START ====================
+# ═══════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════
+
+async def main():
+    bot = GoldScalper()
+    wd = asyncio.create_task(watchdog(bot.state))
+
+    def shutdown(sig, frame):
+        log.info(f"Signal {sig}, stopping...")
+        bot.state.running = False
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    await bot.start()
+    wd.cancel()
+
 
 if __name__ == "__main__":
-    import threading
-
-    log.info("=" * 50)
-    log.info("PROFESSIONAL SMC BOT v5.0 — SWEEP STRATEGY")
-    log.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
-    log.info("TradePhase SM | Symbol Health | Max DD Stop")
-    log.info("Reconnect HB | BotState | Graceful Shutdown")
-    log.info(f"Risk: {f'{RISK_PER_TRADE*100:.2f}%'} | Max trades: {MAX_TOTAL_TRADES}")
-    log.info("=" * 50)
-
-    init_database()
-
-    # Maak een tijdelijke state voor watchdog (wordt in run() overschreven)
-    _boot_state = BotState()
-
-    wd = threading.Thread(target=watchdog_thread, args=(_boot_state,), daemon=True)
-    wd.start()
-    log.info("🐕 Watchdog thread gestart")
-
-    restart_count = 0
-    while True:
-        try:
-            restart_count += 1
-            if restart_count > 1:
-                tg(f"🔄 <b>AUTO RESTART #{restart_count}</b>", _boot_state)
-            asyncio.run(run(_boot_state))
-            # Als run() normaal eindigt (graceful shutdown), stop
-            if _boot_state.shutdown_requested:
-                log.info("Graceful shutdown — geen restart")
-                break
-        except KeyboardInterrupt:
-            tg("🛑 <b>BOT GESTOPT</b>", _boot_state)
-            log.info("Stopped by user")
-            break
-        except Exception as e:
-            err_str = str(e)
-            is_rate_limited = "rate" in err_str.lower() or "cpu credits" in err_str.lower() or "TooManyRequests" in err_str
-
-            if is_rate_limited:
-                wait = 300  # 5 min voor rate limits
-                tg(f"⏳ <b>RATE LIMITED</b> — wacht {wait//60} min...", _boot_state)
-                log.warning(f"Rate limited — wacht {wait}s voor restart")
-            else:
-                tg(f"💥 <b>CRASH #{restart_count}</b>: {err_str[:80]}\n🔄 Restart...", _boot_state)
-                log.error(f"Crash #{restart_count}: {e}")
-                wait = min(15 * restart_count, 120)
-
-            # Reset connection state voor verse start (behoud performance data)
-            _boot_state.consecutive_api_fails = 0
-            _boot_state.consecutive_errors = 0
-            _boot_state.connection_healthy = True
-            _boot_state.shutdown_requested = False
-            _boot_state.last_reconnect_heartbeat = 0
-            _boot_state.watchdog_last_loop = time.time()
-            log.info(f"Restart in {wait}s...")
-            # Sleep in stukken zodat watchdog niet triggert
-            for _ in range(wait // 30 + 1):
-                _boot_state.watchdog_last_loop = time.time()
-                time.sleep(min(30, wait))
-                wait = max(0, wait - 30)
+    asyncio.run(main())
