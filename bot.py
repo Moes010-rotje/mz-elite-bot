@@ -281,16 +281,18 @@ STREAK_MODIFIER = {
     "loss_3plus": 0.4,
 }
 
-MIN_RR = 2.5                   # Was 2.0 — hogere RR voor sweep setups
+MIN_RR = 2.0                   # Was 2.5 — met sweep edge is 2.0 prima
 MAX_TRADES_PER_ASSET = 1
 MAX_TOTAL_TRADES = 3
 MAX_TRADES_PER_DAY = 4
 
 # === SWEEP STRATEGIE CONFIG ===
 MIN_DISPLACEMENT_MULT = 1.5    # Displacement body moet 1.5x avg body zijn
-SWEEP_LOOKBACK_CANDLES = 20    # Hoeveel candles terug zoeken naar sweeps
-FVG_MAX_AGE_CANDLES = 10       # FVG max 10 candles oud
-FVG_ENTRY_BUFFER_PCT = 0.15    # 15% buffer rond FVG voor entry
+SWEEP_LOOKBACK_CANDLES = 50    # Was 20 — sweep kan uren geleden zijn, FVG retest later
+FVG_MAX_AGE_CANDLES = 30       # Was 10 — FVGs blijven lang geldig
+FVG_ENTRY_BUFFER_PCT = 0.25    # Was 0.15 — ruimere buffer voor entry
+SWEEP_CLOSE_TOLERANCE = 0.05   # Sweep mag sluiten BINNEN 5% ATR van het level
+MAX_DISPLACEMENT_WINDOW = 5    # Was 3 — displacement kan 5 candles duren
 
 # === TP MULTIPLIERS ===
 TP1_MULT = 2.0                 # 33% sluiten op 2R
@@ -1335,99 +1337,128 @@ def analyze_structure(df: pd.DataFrame, swings: List[SwingPoint]) -> Optional[St
 
 def detect_displacement(df: pd.DataFrame, sweep_candle_idx: int, direction: Direction) -> Optional[dict]:
     """
-    Na een sweep, zoek een sterke candle die in de sweep-richting beweegt.
-    De displacement BEVESTIGT dat de sweep echt was (niet een breakout).
+    Na een sweep, zoek displacement — sterke move in de sweep-richting.
     
-    Returns dict met displacement info of None.
+    Verbeterd:
+    - Window van 5 candles (was 3)
+    - Cumulatieve displacement: 2-3 candles in dezelfde richting tellen ook
+    - Returnt de sterkste displacement gevonden
     """
     if sweep_candle_idx >= len(df) - 1:
-        return None  # Sweep is de laatste candle, nog geen displacement mogelijk
+        return None
     
     avg_body = float(df["body"].tail(20).mean())
     if avg_body <= 0:
         return None
     
-    # Check de candles NA de sweep (max 3 candles window)
-    for i in range(sweep_candle_idx + 1, min(sweep_candle_idx + 4, len(df))):
+    best_disp = None
+    
+    # Check individuele sterke candles (originele logica maar met groter window)
+    for i in range(sweep_candle_idx + 1, min(sweep_candle_idx + MAX_DISPLACEMENT_WINDOW + 1, len(df))):
         c = df.iloc[i]
         body = abs(c["close"] - c["open"])
         
-        if direction == Direction.BEAR:
-            # Na een high sweep → verwacht sterke bearish candle
-            if c["close"] < c["open"] and body > avg_body * MIN_DISPLACEMENT_MULT:
-                return {
-                    "index": i,
-                    "body": body,
-                    "body_ratio": body / avg_body,
-                    "candle": c,
-                }
-        elif direction == Direction.BULL:
-            # Na een low sweep → verwacht sterke bullish candle
-            if c["close"] > c["open"] and body > avg_body * MIN_DISPLACEMENT_MULT:
-                return {
-                    "index": i,
-                    "body": body,
-                    "body_ratio": body / avg_body,
-                    "candle": c,
-                }
+        if direction == Direction.BEAR and c["close"] < c["open"] and body > avg_body * MIN_DISPLACEMENT_MULT:
+            ratio = body / avg_body
+            if not best_disp or ratio > best_disp["body_ratio"]:
+                best_disp = {"index": i, "body": body, "body_ratio": ratio, "candle": c}
+        elif direction == Direction.BULL and c["close"] > c["open"] and body > avg_body * MIN_DISPLACEMENT_MULT:
+            ratio = body / avg_body
+            if not best_disp or ratio > best_disp["body_ratio"]:
+                best_disp = {"index": i, "body": body, "body_ratio": ratio, "candle": c}
     
-    return None
+    # Cumulatieve check: 2-3 candles in dezelfde richting = ook displacement
+    if not best_disp:
+        cumulative_body = 0
+        last_disp_idx = None
+        for i in range(sweep_candle_idx + 1, min(sweep_candle_idx + 4, len(df))):
+            c = df.iloc[i]
+            if direction == Direction.BEAR and c["close"] < c["open"]:
+                cumulative_body += abs(c["close"] - c["open"])
+                last_disp_idx = i
+            elif direction == Direction.BULL and c["close"] > c["open"]:
+                cumulative_body += abs(c["close"] - c["open"])
+                last_disp_idx = i
+            else:
+                break  # Tegengestelde candle = stop cumulatie
+        
+        if cumulative_body > avg_body * MIN_DISPLACEMENT_MULT and last_disp_idx:
+            best_disp = {
+                "index": last_disp_idx,
+                "body": cumulative_body,
+                "body_ratio": cumulative_body / avg_body,
+                "candle": df.iloc[last_disp_idx],
+            }
+    
+    return best_disp
 
 
 def find_displacement_fvg(df: pd.DataFrame, disp_index: int, direction: Direction) -> Optional[Zone]:
     """
-    Zoek een FVG gecreëerd door de displacement candle.
-    De FVG is het gat tussen candle vóór displacement en candle ná displacement.
+    Zoek een FVG gecreëerd door/rond de displacement.
+    
+    Verbeterd:
+    - Zoekt FVGs in een window rond de displacement (niet alleen exact die candle)
+    - Checkt ook of de FVG nog NIET gevuld is (prijs is er niet doorheen gegaan)
     """
-    if disp_index < 1 or disp_index >= len(df) - 1:
+    if disp_index < 2:
         return None
     
-    c_before = df.iloc[disp_index - 1]
-    c_disp = df.iloc[disp_index]
-    c_after = df.iloc[disp_index + 1] if disp_index + 1 < len(df) else None
+    best_fvg = None
+    best_size = 0
     
-    if c_after is None:
-        # Displacement is de laatste candle — FVG is het gat tot de candle ervoor
+    # Zoek FVGs in window rond displacement (2 candles ervoor tot 2 erna)
+    search_start = max(1, disp_index - 1)
+    search_end = min(len(df) - 1, disp_index + 2)
+    
+    for idx in range(search_start, search_end + 1):
+        if idx < 1 or idx >= len(df) - 1:
+            continue
+        
+        c_before = df.iloc[idx - 1]
+        c_mid = df.iloc[idx]
+        c_after = df.iloc[idx + 1]
+        
         if direction == Direction.BEAR:
             gap_high = float(c_before["low"])
-            gap_low = float(c_disp["high"]) if c_disp["high"] < c_before["low"] else None
-            if gap_low is not None and gap_high > gap_low:
-                return Zone(
-                    type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
-                    high=gap_high, low=gap_low,
-                    midpoint=(gap_high + gap_low) / 2,
-                    created_at=time.time(), timeframe="5m_disp",
-                )
+            gap_low = float(c_after["high"])
+            if gap_high > gap_low:
+                size = gap_high - gap_low
+                # Check of FVG niet al gevuld is door latere candles
+                filled = False
+                for j in range(idx + 2, len(df)):
+                    if float(df.iloc[j]["high"]) >= gap_high:
+                        filled = True
+                        break
+                if not filled and size > best_size:
+                    best_size = size
+                    best_fvg = Zone(
+                        type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
+                        high=gap_high, low=gap_low,
+                        midpoint=(gap_high + gap_low) / 2,
+                        created_at=time.time(), timeframe="5m_disp",
+                    )
+        
         elif direction == Direction.BULL:
             gap_low = float(c_before["high"])
-            gap_high = float(c_disp["low"]) if c_disp["low"] > c_before["high"] else None
-            if gap_high is not None and gap_high > gap_low:
-                return Zone(
-                    type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
-                    high=gap_high, low=gap_low,
-                    midpoint=(gap_high + gap_low) / 2,
-                    created_at=time.time(), timeframe="5m_disp",
-                )
-        return None
+            gap_high = float(c_after["low"])
+            if gap_high > gap_low:
+                size = gap_high - gap_low
+                filled = False
+                for j in range(idx + 2, len(df)):
+                    if float(df.iloc[j]["low"]) <= gap_low:
+                        filled = True
+                        break
+                if not filled and size > best_size:
+                    best_size = size
+                    best_fvg = Zone(
+                        type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
+                        high=gap_high, low=gap_low,
+                        midpoint=(gap_high + gap_low) / 2,
+                        created_at=time.time(), timeframe="5m_disp",
+                    )
     
-    # Standaard 3-candle FVG
-    if direction == Direction.BEAR:
-        if float(c_after["high"]) < float(c_before["low"]):
-            return Zone(
-                type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BEAR,
-                high=float(c_before["low"]), low=float(c_after["high"]),
-                midpoint=float((c_before["low"] + c_after["high"]) / 2),
-                created_at=time.time(), timeframe="5m_disp",
-            )
-    elif direction == Direction.BULL:
-        if float(c_after["low"]) > float(c_before["high"]):
-            return Zone(
-                type=ZoneType.FAIR_VALUE_GAP, direction=Direction.BULL,
-                high=float(c_after["low"]), low=float(c_before["high"]),
-                midpoint=float((c_after["low"] + c_before["high"]) / 2),
-                created_at=time.time(), timeframe="5m_disp",
-            )
-    return None
+    return best_fvg
 
 
 def find_sweep_setup(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
@@ -1435,12 +1466,11 @@ def find_sweep_setup(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
     """
     Hoofd-strategie: SWEEP → DISPLACEMENT → FVG
     
-    1. Zoek een recente sweep (prijs neemt swing high/low uit, sluit er weer voorbij)
-    2. Check of er displacement na de sweep is (sterke candle)
-    3. Check of de displacement een FVG heeft gecreëerd
-    4. Check of huidige prijs bij de FVG is
-    
-    Returns dict met alle setup info, of None.
+    Verbeterd:
+    - Soepelere sweep close tolerance (mag OP het level sluiten, niet alleen erboven/eronder)
+    - Session high/low sweeps (previous killzone + asia range)
+    - 50 candles lookback (was 20)
+    - FVGs worden gecheckt op "niet gevuld" status
     """
     if len(df) < SWEEP_LOOKBACK_CANDLES:
         return None
@@ -1449,88 +1479,104 @@ def find_sweep_setup(df: pd.DataFrame, symbol: str, swings: List[SwingPoint],
     lows = [s for s in swings if s.type == "low"]
     current_price = float(df["close"].iloc[-1])
     atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0
-    tolerance = atr * 0.1 if atr > 0 else 0
+    tolerance = atr * SWEEP_CLOSE_TOLERANCE if atr > 0 else 0
+    eq_tolerance = atr * 0.1 if atr > 0 else 0
     
     best_setup = None
-    
-    # Scan recente candles voor sweeps
     scan_start = max(0, len(df) - SWEEP_LOOKBACK_CANDLES)
     
+    # Verzamel alle liquidity levels om te checken
+    sweep_levels = []
+    
+    if htf_direction == Direction.BEAR:
+        # Sweep highs voor bearish setups
+        for sh in highs:
+            sweep_levels.append({"price": sh.price, "type": "swing_high", "index": sh.index})
+            # Check equal highs
+            for sh2 in highs:
+                if sh2 != sh and abs(sh2.price - sh.price) < eq_tolerance:
+                    sweep_levels.append({"price": max(sh.price, sh2.price), "type": "equal_highs", "index": max(sh.index, sh2.index)})
+        # Session levels
+        if symbol in state.session_levels:
+            for kz_name, levels in state.session_levels[symbol].items():
+                if "high" in levels:
+                    sweep_levels.append({"price": levels["high"], "type": f"session_{kz_name}_high", "index": 0})
+        # Asia range
+        if symbol in state.asia_range_cache:
+            ar = state.asia_range_cache[symbol]
+            sweep_levels.append({"price": ar["high"], "type": "asia_high", "index": 0})
+    
+    elif htf_direction == Direction.BULL:
+        for sl_pt in lows:
+            sweep_levels.append({"price": sl_pt.price, "type": "swing_low", "index": sl_pt.index})
+            for sl2 in lows:
+                if sl2 != sl_pt and abs(sl2.price - sl_pt.price) < eq_tolerance:
+                    sweep_levels.append({"price": min(sl_pt.price, sl2.price), "type": "equal_lows", "index": max(sl_pt.index, sl2.index)})
+        if symbol in state.session_levels:
+            for kz_name, levels in state.session_levels[symbol].items():
+                if "low" in levels:
+                    sweep_levels.append({"price": levels["low"], "type": f"session_{kz_name}_low", "index": 0})
+        if symbol in state.asia_range_cache:
+            ar = state.asia_range_cache[symbol]
+            sweep_levels.append({"price": ar["low"], "type": "asia_low", "index": 0})
+    
+    # Deduplicate levels die te dicht bij elkaar liggen
+    unique_levels = []
+    for lvl in sweep_levels:
+        if not any(abs(lvl["price"] - u["price"]) < eq_tolerance * 0.5 for u in unique_levels):
+            unique_levels.append(lvl)
+    
+    # Scan candles voor sweeps
     for i in range(scan_start, len(df)):
         c = df.iloc[i]
         
-        # === BEARISH SWEEP: prijs breekt boven swing high, sluit eronder ===
-        if htf_direction == Direction.BEAR:
-            for sh in highs:
-                if sh.index >= i:
-                    continue  # Swing moet vóór de sweep-candle zijn
-                if float(c["high"]) > sh.price and float(c["close"]) < sh.price:
-                    # Sweep gevonden! Check displacement
-                    disp = detect_displacement(df, i, Direction.BEAR)
-                    if not disp:
-                        continue
-                    
-                    # Zoek FVG van displacement
-                    fvg = find_displacement_fvg(df, disp["index"], Direction.BEAR)
-                    if not fvg:
-                        continue
-                    
-                    # Check of prijs bij FVG is (retest)
-                    entry_buffer = (fvg.high - fvg.low) * FVG_ENTRY_BUFFER_PCT
-                    if current_price >= fvg.low - entry_buffer and current_price <= fvg.high + entry_buffer:
-                        # Bepaal sweep type
-                        sweep_type = "swing_high"
-                        # Check equal highs
-                        for sh2 in highs:
-                            if sh2 != sh and abs(sh2.price - sh.price) < tolerance:
-                                sweep_type = "equal_highs"
-                                break
-                        
-                        quality = disp["body_ratio"]  # Hoe sterker displacement, hoe beter
-                        if not best_setup or quality > best_setup["quality"]:
-                            best_setup = {
-                                "direction": Direction.BEAR,
-                                "sweep_level": sh.price,
-                                "sweep_type": sweep_type,
-                                "sweep_index": i,
-                                "displacement": disp,
-                                "fvg": fvg,
-                                "quality": quality,
-                            }
-        
-        # === BULLISH SWEEP: prijs breekt onder swing low, sluit erboven ===
-        if htf_direction == Direction.BULL:
-            for sl_point in lows:
-                if sl_point.index >= i:
-                    continue
-                if float(c["low"]) < sl_point.price and float(c["close"]) > sl_point.price:
-                    disp = detect_displacement(df, i, Direction.BULL)
-                    if not disp:
-                        continue
-                    
-                    fvg = find_displacement_fvg(df, disp["index"], Direction.BULL)
-                    if not fvg:
-                        continue
-                    
-                    entry_buffer = (fvg.high - fvg.low) * FVG_ENTRY_BUFFER_PCT
-                    if current_price >= fvg.low - entry_buffer and current_price <= fvg.high + entry_buffer:
-                        sweep_type = "swing_low"
-                        for sl2 in lows:
-                            if sl2 != sl_point and abs(sl2.price - sl_point.price) < tolerance:
-                                sweep_type = "equal_lows"
-                                break
-                        
-                        quality = disp["body_ratio"]
-                        if not best_setup or quality > best_setup["quality"]:
-                            best_setup = {
-                                "direction": Direction.BULL,
-                                "sweep_level": sl_point.price,
-                                "sweep_type": sweep_type,
-                                "sweep_index": i,
-                                "displacement": disp,
-                                "fvg": fvg,
-                                "quality": quality,
-                            }
+        for lvl in unique_levels:
+            level_price = lvl["price"]
+            level_type = lvl["type"]
+            level_idx = lvl["index"]
+            
+            # Swing level moet vóór de sweep candle zijn
+            if level_idx >= i and level_idx > 0:
+                continue
+            
+            swept = False
+            
+            if htf_direction == Direction.BEAR:
+                # Bearish sweep: wick boven level, close op of onder level
+                if float(c["high"]) > level_price and float(c["close"]) <= level_price + tolerance:
+                    swept = True
+            elif htf_direction == Direction.BULL:
+                # Bullish sweep: wick onder level, close op of boven level
+                if float(c["low"]) < level_price and float(c["close"]) >= level_price - tolerance:
+                    swept = True
+            
+            if not swept:
+                continue
+            
+            # Sweep gevonden — check displacement
+            disp = detect_displacement(df, i, htf_direction)
+            if not disp:
+                continue
+            
+            # Zoek FVG
+            fvg = find_displacement_fvg(df, disp["index"], htf_direction)
+            if not fvg:
+                continue
+            
+            # Check of prijs bij FVG is (retest)
+            entry_buffer = (fvg.high - fvg.low) * FVG_ENTRY_BUFFER_PCT
+            if current_price >= fvg.low - entry_buffer and current_price <= fvg.high + entry_buffer:
+                quality = disp["body_ratio"]
+                if not best_setup or quality > best_setup["quality"]:
+                    best_setup = {
+                        "direction": htf_direction,
+                        "sweep_level": level_price,
+                        "sweep_type": level_type,
+                        "sweep_index": i,
+                        "displacement": disp,
+                        "fvg": fvg,
+                        "quality": quality,
+                    }
     
     return best_setup
 
@@ -2091,12 +2137,29 @@ async def analyze_and_find_setup(account, conn, symbol: str, positions: list,
         df_5m = calculate_indicators(df_5m)
         swings_5m = detect_swing_points(df_5m)
 
+        # Track session levels voor sweep detectie
+        update_session_levels(state, symbol, float(df_5m["high"].iloc[-1]), float(df_5m["low"].iloc[-1]))
+
         if len(swings_5m) < 4:
             log.debug(f"  {symbol}: te weinig swings ({len(swings_5m)})")
             return None
 
         # === STAP 3-5: ZOEK SWEEP → DISPLACEMENT → FVG ===
+        # Eerst 5M scan
         setup_data = find_sweep_setup(df_5m, symbol, swings_5m, state, htf_direction)
+
+        # Als geen 5M setup, probeer 15M (sterkere setups, minder frequent)
+        if not setup_data:
+            candles_15m = await get_candles(account, symbol, "15m", 80, state)
+            if candles_15m and len(candles_15m) >= 30:
+                df_15m = pd.DataFrame(candles_15m)
+                df_15m = calculate_indicators(df_15m)
+                swings_15m = detect_swing_points(df_15m)
+                if len(swings_15m) >= 4:
+                    setup_data = find_sweep_setup(df_15m, symbol, swings_15m, state, htf_direction)
+                    if setup_data:
+                        setup_data["fvg"].timeframe = "15m_disp"
+                        log.info(f"  📊 {symbol}: 15M sweep setup gevonden")
         if not setup_data:
             log.debug(f"  {symbol}: geen sweep→displacement→FVG setup")
             return None
