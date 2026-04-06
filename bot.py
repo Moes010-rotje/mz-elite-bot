@@ -1190,16 +1190,38 @@ class GoldScalper:
 
     async def fetch_data(self):
         try:
-            self.state.candles_5m = await self.conn.get_candle(
-                self.cfg.SYMBOL, self.cfg.TF_STRUCTURE, self.cfg.CANDLE_LOOKBACK_5M
+            now = datetime.now(timezone.utc)
+            start_5m = now - timedelta(minutes=5 * self.cfg.CANDLE_LOOKBACK_5M * 2)
+            start_1m = now - timedelta(minutes=1 * self.cfg.CANDLE_LOOKBACK_1M * 2)
+
+            candles_5m = await asyncio.wait_for(
+                self.account.get_historical_candles(
+                    self.cfg.SYMBOL, self.cfg.TF_STRUCTURE, start_5m
+                ), timeout=20
             )
-            self.state.candles_1m = await self.conn.get_candle(
-                self.cfg.SYMBOL, self.cfg.TF_ENTRY, self.cfg.CANDLE_LOOKBACK_1M
+            if candles_5m and len(candles_5m) >= 10:
+                self.state.candles_5m = candles_5m
+            else:
+                log.warning(f"5M candles insufficient: {len(candles_5m) if candles_5m else 0}")
+
+            candles_1m = await asyncio.wait_for(
+                self.account.get_historical_candles(
+                    self.cfg.SYMBOL, self.cfg.TF_ENTRY, start_1m
+                ), timeout=20
             )
+            if candles_1m and len(candles_1m) >= 10:
+                self.state.candles_1m = candles_1m
+            else:
+                log.warning(f"1M candles insufficient: {len(candles_1m) if candles_1m else 0}")
+
             ah, al = self.sm.calc_asia_range(self.state.candles_5m)
             if ah > 0:
                 self.state.asia_high = ah
                 self.state.asia_low = al
+
+            log.info(f"Data: 5M={len(self.state.candles_5m)}c | 1M={len(self.state.candles_1m)}c | Session={self.state.session.value}")
+        except asyncio.TimeoutError:
+            log.warning("Candle fetch timeout")
         except Exception as e:
             log.error(f"Data fetch error: {e}")
 
@@ -1247,6 +1269,7 @@ class GoldScalper:
 
         price, spread = await self.get_price_and_spread()
         if price <= 0:
+            log.warning("Price <= 0, skipping cycle")
             return
 
         # Update balance
@@ -1266,6 +1289,20 @@ class GoldScalper:
 
         # Manage partials
         await self.pos.manage_partials(price)
+
+        # Log status every 60 cycles (~10 min)
+        if not hasattr(self, '_cycle_count'):
+            self._cycle_count = 0
+        self._cycle_count += 1
+        if self._cycle_count % 60 == 0:
+            tradeable = self.sm.is_tradeable(hour)
+            log.info(
+                f"STATUS: ${price:.2f} | Spread: ${spread:.2f} | "
+                f"Session: {self.state.session.value} | Tradeable: {tradeable} | "
+                f"5M: {len(self.state.candles_5m)}c | 1M: {len(self.state.candles_1m)}c | "
+                f"Trades: {self.state.daily_trades}/{self.cfg.MAX_DAILY_TRADES} | "
+                f"EMA: {self.state.ema_fast:.2f}/{self.state.ema_slow:.2f}"
+            )
 
         # Check for new signal
         signal = self.sig.evaluate(price, spread)
