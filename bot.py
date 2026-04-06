@@ -54,12 +54,12 @@ class ScalpConfig:
     """Configuration tuned for XAUUSD scalping."""
 
     # ─── MetaAPI ──────────────────────────────────────────────────
-    META_API_TOKEN: str = os.getenv("META_API_TOKEN", "")
-    ACCOUNT_ID: str = os.getenv("META_API_ACCOUNT_ID", "")
+    META_API_TOKEN: str = os.getenv("METAAPI_TOKEN", "")
+    ACCOUNT_ID: str = os.getenv("ACCOUNT_ID", "")
 
     # ─── Telegram ─────────────────────────────────────────────────
-    TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_TOKEN: str = os.getenv("TG_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TG_CHAT", "")
     TELEGRAM_RATE_LIMIT: float = 1.5
 
     # ─── Symbol ───────────────────────────────────────────────────
@@ -1158,7 +1158,7 @@ class GoldScalper:
     async def connect(self):
         log.info("Connecting to MetaAPI...")
         if not self.cfg.META_API_TOKEN or not self.cfg.ACCOUNT_ID:
-            log.error("Set META_API_TOKEN and META_API_ACCOUNT_ID!")
+            log.error("Set METAAPI_TOKEN and ACCOUNT_ID!")
             sys.exit(1)
 
         self.api = MetaApi(self.cfg.META_API_TOKEN)
