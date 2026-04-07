@@ -152,9 +152,12 @@ class ScalpConfig:
     # ─── Confluence ───────────────────────────────────────────────
     MIN_CONFLUENCE: int = 3            # lower threshold = more trades
 
+    # ─── Heartbeat ──────────────────────────────────────────────
+    HEARTBEAT_INTERVAL: int = 600      # every 10 minutes (same as v4.0)
+
     # ─── Cycle Timing ─────────────────────────────────────────────
     MAIN_LOOP_SECONDS: int = 10        # fast 10-second cycle
-    WATCHDOG_TIMEOUT: int = 180
+    WATCHDOG_TIMEOUT: int = 600          # 10 min (was 180, too aggressive)
 
     # ─── Cooldown ─────────────────────────────────────────────────
     TRADE_COOLDOWN_SECONDS: int = 120  # 2 min between trades
@@ -262,6 +265,7 @@ class BotState:
 
         # Telegram
         self.last_tg_time: float = 0.0
+        self.last_heartbeat_time: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -400,6 +404,56 @@ class Telegram:
             f"Win Rate: {wr:.0f}%\n"
             f"Balance: ${self.state.balance:.2f}"
         )
+
+    async def heartbeat(self, price: float, spread: float, positions: int):
+        now = time.time()
+        if now - self.state.last_heartbeat_time < self.state.cfg.HEARTBEAT_INTERVAL:
+            return
+        self.state.last_heartbeat_time = now
+
+        s = self.state
+        session = s.session.value.upper()
+        tradeable = "✅" if s.session in (Session.LONDON, Session.NY_OVERLAP, Session.NEW_YORK) else "❌"
+        wr = s.daily_wins / max(s.daily_trades, 1) * 100
+        streak = f"{s.consecutive_losses}L" if s.consecutive_losses > 0 else f"0L"
+        candles_ok = "✅" if len(s.candles_1m) > 10 and len(s.candles_5m) > 10 else "⚠️"
+
+        # Daily P&L
+        pl = s.equity - s.start_balance if s.start_balance > 0 else 0
+        pl_pct = (pl / s.start_balance * 100) if s.start_balance > 0 else 0
+
+        # Drawdown
+        dd = 0.0
+        if s.start_balance > 0 and s.balance < s.start_balance:
+            dd = (s.start_balance - s.balance) / s.start_balance * 100
+
+        utc_time = datetime.now(timezone.utc).strftime('%H:%M:%S')
+
+        msg = (
+            f"💓 <b>GOLD SCALPER HEARTBEAT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Balance: ${s.balance:,.2f}\n"
+            f"📊 Equity: ${s.equity:,.2f}\n"
+            f"📈 P&L: ${pl:+,.2f} ({pl_pct:+.2f}%)\n"
+            f"📉 Drawdown: {dd:.2f}%\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🥇 XAUUSD: ${price:.2f}\n"
+            f"📏 Spread: ${spread:.2f}\n"
+            f"🕐 Session: {session} {tradeable}\n"
+            f"🎯 Open trades: {positions}/{s.cfg.MAX_CONCURRENT_TRADES}\n"
+            f"📅 Trades today: {s.daily_trades}/{s.cfg.MAX_DAILY_TRADES}\n"
+            f"💵 Daily PnL: ${s.daily_pnl:+.2f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 W/L: {s.daily_wins}/{s.daily_losses}\n"
+            f"🎯 Win Rate: {wr:.0f}%\n"
+            f"🔥 Streak: {s.consecutive_losses}L consecutive\n"
+            f"📊 EMA 9/21: {s.ema_fast:.2f} / {s.ema_slow:.2f}\n"
+            f"📡 Data: {candles_ok} 5M:{len(s.candles_5m)}c | 1M:{len(s.candles_1m)}c\n"
+            f"🌏 Asia: ${s.asia_high:.2f} / ${s.asia_low:.2f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ {utc_time} UTC"
+        )
+        await self.send(msg, silent=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1075,17 +1129,11 @@ class PositionMgr:
                 continue
 
             try:
-                # Close 50%
-                if t.direction == Direction.LONG:
-                    await self.conn.create_market_sell_order(
-                        self.cfg.SYMBOL, close_lots,
-                        options={"comment": "Scalp|partial"}
-                    )
-                else:
-                    await self.conn.create_market_buy_order(
-                        self.cfg.SYMBOL, close_lots,
-                        options={"comment": "Scalp|partial"}
-                    )
+                # Close 50% of position (same method as v4.0 bot)
+                await asyncio.wait_for(
+                    self.conn.close_position_partially(tid, close_lots),
+                    timeout=10
+                )
 
                 t.phase = TradePhase.TP1_HIT
                 log.info(f"TP1 HIT: {close_lots}L closed, SL → BE")
@@ -1110,12 +1158,34 @@ class PositionMgr:
                 if tid not in open_ids and t.phase != TradePhase.CLOSED:
                     t.phase = TradePhase.CLOSED
 
+                    # Calculate PnL from price difference
                     try:
-                        history = await self.conn.get_deals_by_position(tid)
-                        if history:
-                            t.pnl = sum(d.get("profit", 0) for d in history)
+                        tick = await self.conn.get_symbol_price(self.cfg.SYMBOL)
+                        close_price = tick.get("bid", 0) if t.direction == Direction.LONG else tick.get("ask", 0)
+                        if close_price > 0:
+                            if t.direction == Direction.LONG:
+                                t.pnl = (close_price - t.entry) * t.lots * 100  # 100 oz per lot
+                            else:
+                                t.pnl = (t.entry - close_price) * t.lots * 100
                     except Exception:
                         pass
+
+                    # Fallback: try deals history
+                    if t.pnl == 0:
+                        try:
+                            now = datetime.now(timezone.utc).replace(tzinfo=None)
+                            start = now - timedelta(hours=1)
+                            history = await asyncio.wait_for(
+                                self.conn.get_deals_by_time_range(start, now),
+                                timeout=10
+                            )
+                            if history:
+                                for deal in history:
+                                    if deal.get("positionId") == tid and deal.get("profit", 0) != 0:
+                                        t.pnl = deal.get("profit", 0) + deal.get("swap", 0) + deal.get("commission", 0)
+                                        break
+                        except Exception:
+                            pass
 
                     # Update state
                     self.state.daily_pnl += t.pnl
@@ -1289,6 +1359,10 @@ class GoldScalper:
 
         # Manage partials
         await self.pos.manage_partials(price)
+
+        # Heartbeat to Telegram
+        open_count = len(self.state.active_trades)
+        await self.tg.heartbeat(price, spread, open_count)
 
         # Log status every 60 cycles (~10 min)
         if not hasattr(self, '_cycle_count'):
