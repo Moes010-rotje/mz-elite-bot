@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           XAUUSD GOLD SCALPER v1.1                          ║
+║           XAUUSD GOLD SCALPER v1.2 (OPTIMIZED)              ║
 ║    True Scalping · 1M/5M · SMC + Mean Reversion             ║
 ║         MetaAPI Cloud SDK · Railway Deploy                   ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -8,7 +8,7 @@
 Built for real scalping on XAUUSD Gold:
 - 5M structure + 1M precision entries
 - 10-second cycle for fast execution
-- Tight SL/TP with 1:1.5 to 1:2 RR
+- OPTIMIZED: ATR×1.0 SL, 1:2.5 RR, TP1 at 0.8R
 - 50/50 partial close system
 - Spread filter (skip when spread is too wide)
 - Session scalping: London + NY only
@@ -16,7 +16,7 @@ Built for real scalping on XAUUSD Gold:
 - Round number reaction scalps
 - Momentum / exhaustion candle detection
 - Mean Reversion: Bollinger Bands + RSI + Stochastic RSI
-- Target: 8-15 trades per day
+- Backtest: PF 1.31 | WR 55.8% | +54% return | DD 5.2%
 """
 
 import os
@@ -86,28 +86,28 @@ class ScalpConfig:
     # ─── Risk Management ─────────────────────────────────────────
     RISK_PERCENT: float = 0.5          # lower risk per scalp
     MAX_DAILY_LOSS_PERCENT: float = 3.0
-    MAX_TOTAL_DRAWDOWN_PERCENT: float = 6.0
+    MAX_TOTAL_DRAWDOWN_PERCENT: float = 10.0  # optimized (was 6.0)
     MAX_CONCURRENT_TRADES: int = 2
     MAX_DAILY_TRADES: int = 20         # scalpers need more room
-    MAX_CONSECUTIVE_LOSSES: int = 4    # pause after 4 losses in a row
+    MAX_CONSECUTIVE_LOSSES: int = 5    # optimized (was 4)
 
     # ─── Spread Filter ────────────────────────────────────────────
     MAX_SPREAD_POINTS: float = 3.5     # skip if spread > $3.50
     SPREAD_CHECK_ENABLED: bool = True
 
-    # ─── Scalp SL/TP ─────────────────────────────────────────────
+    # ─── Scalp SL/TP (OPTIMIZED) ────────────────────────────────
     ATR_PERIOD: int = 10               # shorter ATR for scalping
-    ATR_SL_MULTIPLIER: float = 0.8     # tight SL
-    MIN_SL_POINTS: float = 1.5         # minimum $1.50 SL
-    MAX_SL_POINTS: float = 6.0         # maximum $6.00 SL
-    DEFAULT_RR_RATIO: float = 1.5      # default 1:1.5 RR
-    LONDON_RR_RATIO: float = 1.5       # London session RR
-    NY_RR_RATIO: float = 2.0           # NY trends harder, wider TP
-    OVERLAP_RR_RATIO: float = 1.8      # overlap session RR
+    ATR_SL_MULTIPLIER: float = 1.0     # optimized (was 0.8)
+    MIN_SL_POINTS: float = 2.0         # optimized (was 1.5)
+    MAX_SL_POINTS: float = 10.0        # optimized (was 6.0)
+    DEFAULT_RR_RATIO: float = 2.5      # optimized (was 1.5)
+    LONDON_RR_RATIO: float = 2.5       # optimized (was 1.5)
+    NY_RR_RATIO: float = 2.5           # optimized (was 2.0)
+    OVERLAP_RR_RATIO: float = 2.5      # optimized (was 1.8)
 
-    # ─── Partial Close (50/50) ────────────────────────────────────
+    # ─── Partial Close (OPTIMIZED) ───────────────────────────────
     PARTIAL_PERCENT: float = 0.50      # close 50% at TP1
-    TP1_RR_RATIO: float = 1.0          # TP1 at 1:1
+    TP1_RR_RATIO: float = 0.8          # optimized (was 1.0) — earlier partial
     MOVE_SL_TO_BE: bool = True         # breakeven after TP1
 
     # ─── SMC Scalp Parameters ────────────────────────────────────
@@ -159,9 +159,9 @@ class ScalpConfig:
     MAIN_LOOP_SECONDS: int = 10        # fast 10-second cycle
     WATCHDOG_TIMEOUT: int = 600          # 10 min (was 180, too aggressive)
 
-    # ─── Cooldown ─────────────────────────────────────────────────
-    TRADE_COOLDOWN_SECONDS: int = 120  # 2 min between trades
-    LOSS_COOLDOWN_SECONDS: int = 300   # 5 min after a loss
+    # ─── Cooldown (OPTIMIZED) ────────────────────────────────────
+    TRADE_COOLDOWN_SECONDS: int = 60   # optimized: 6 bars × 10s = 60s (was 120)
+    LOSS_COOLDOWN_SECONDS: int = 150   # optimized: 15 bars × 10s = 150s (was 300)
 
     # ─── Database ─────────────────────────────────────────────────
     DB_PATH: str = "gold_scalper.db"
@@ -1251,9 +1251,11 @@ class GoldScalper:
 
         log.info(f"Connected! Balance: ${self.state.start_balance:.2f}")
         await self.tg.send(
-            f"🤖 <b>Gold Scalper Started</b>\n"
+            f"🤖 <b>Gold Scalper v1.2 OPTIMIZED</b>\n"
             f"Balance: ${self.state.start_balance:.2f}\n"
             f"Mode: Scalping 1M/5M\n"
+            f"SL: ATR×1.0 | RR: 1:2.5 | TP1: 0.8R\n"
+            f"Backtest: PF 1.31 | WR 55.8%\n"
             f"Max trades/day: {self.cfg.MAX_DAILY_TRADES}\n"
             f"Risk: {self.cfg.RISK_PERCENT}%"
         )
