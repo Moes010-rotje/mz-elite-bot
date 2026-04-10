@@ -1,17 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           XAUUSD GOLD SCALPER v1.4 (SIGNAL AUDIT)           ║
-║    True Scalping · 1M/5M · SMC + Mean Reversion             ║
-║         MetaAPI Cloud SDK · Railway Deploy                   ║
+║           XAUUSD GOLD SCALPER v1.5 (73% WR)                ║
+║    ATR×2.5 | RR 1:2.0 | TP1 0.4R | 67% partial             ║
+║    Backtest: WR 73.7% | PF 1.46 | DD 2.4% | +72%           ║
 ╚══════════════════════════════════════════════════════════════╝
-
-Built for real scalping on XAUUSD Gold:
-- v4 Signal Audit: 5 harmful signals removed
-- ATR×2.0 SL, 1:2.0 RR, TP1 at 0.6R
-- 8 proven signals: EMA, Sweep, OB, FVG, Momentum, MR, RSI Div, Double
-- Removed: Round Number, Wick, VWAP, Exhaustion, Session Levels
-- Backtest: WR 63.2% | PF 1.31 | +117% return | DD 3.3%
-- 549 trades in 60 days | 50/50 partial close
 """
 
 import os
@@ -92,7 +84,7 @@ class ScalpConfig:
 
     # ─── Scalp SL/TP (v4 SIGNAL AUDIT OPTIMIZED) ────────────────
     ATR_PERIOD: int = 10               # shorter ATR for scalping
-    ATR_SL_MULTIPLIER: float = 2.0     # v4: was 1.0, now 2.0 (ruimer = minder SL hits)
+    ATR_SL_MULTIPLIER: float = 2.5     # v1.5 (73.7% WR winner)
     MIN_SL_POINTS: float = 2.0         # optimized
     MAX_SL_POINTS: float = 10.0        # optimized
     DEFAULT_RR_RATIO: float = 2.0      # v4: was 2.5, now 2.0 (meer TP hits = hogere WR)
@@ -101,8 +93,8 @@ class ScalpConfig:
     OVERLAP_RR_RATIO: float = 2.0      # v4 optimized
 
     # ─── Partial Close (v4 OPTIMIZED) ────────────────────────────
-    PARTIAL_PERCENT: float = 0.50      # close 50% at TP1
-    TP1_RR_RATIO: float = 0.6          # v4: was 0.8, now 0.6 (sneller partial = meer wins)
+    PARTIAL_PERCENT: float = 0.67      # v5: was 0.50, now 67% (meer winst pakken)
+    TP1_RR_RATIO: float = 0.4          # v5: was 0.6, now 0.4 (sneller partial = hogere WR)
     MOVE_SL_TO_BE: bool = True         # breakeven after TP1
 
     # ─── SMC Scalp Parameters ────────────────────────────────────
@@ -155,8 +147,8 @@ class ScalpConfig:
     WATCHDOG_TIMEOUT: int = 600          # 10 min (was 180, too aggressive)
 
     # ─── Cooldown (v4 SIGNAL AUDIT OPTIMIZED) ───────────────────
-    TRADE_COOLDOWN_SECONDS: int = 30   # v4: was 45, now 30s (CD 3 bars)
-    LOSS_COOLDOWN_SECONDS: int = 50    # v4: was 90, now 50s (CD 5 bars)
+    TRADE_COOLDOWN_SECONDS: int = 50   # v1.5
+    LOSS_COOLDOWN_SECONDS: int = 120   # v1.5
 
     # ─── Database ─────────────────────────────────────────────────
     DB_PATH: str = "gold_scalper.db"
@@ -1425,13 +1417,11 @@ class GoldScalper:
 
         log.info(f"Connected! Balance: ${self.state.start_balance:.2f}")
         await self.tg.send(
-            f"🤖 <b>Gold Scalper v1.4 SIGNAL AUDIT</b>\n"
+            f"🤖 <b>Gold Scalper v1.5 — 73% WR</b>\n"
             f"Balance: ${self.state.start_balance:.2f}\n"
-            f"SL: ATR×2.0 | RR: 1:2.0 | TP1: 0.6R\n"
-            f"Signals: EMA|Sweep|OB|FVG|Mom|MR|RSI|Dbl\n"
-            f"Removed: RN|Wick|VWAP|Exh|Session\n"
-            f"Backtest: WR 63.2% | PF 1.31 | DD 3.3%\n"
-            f"Max concurrent: {self.cfg.MAX_CONCURRENT_TRADES}\n"
+            f"SL: ATR×2.5 | RR: 1:2.0 | TP1: 0.4R\n"
+            f"Partial: 67% | PF: 1.46 | DD: 2.4%\n"
+            f"Max trades/day: {self.cfg.MAX_DAILY_TRADES}\n"
             f"Risk: {self.cfg.RISK_PERCENT}%"
         )
 
