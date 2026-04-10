@@ -83,7 +83,7 @@ class ScalpConfig:
     MAX_DAILY_LOSS_PERCENT: float = 3.0
     MAX_TOTAL_DRAWDOWN_PERCENT: float = 10.0  # optimized (was 6.0)
     MAX_CONCURRENT_TRADES: int = 3     # v1.3: was 2, now 3
-    MAX_DAILY_TRADES: int = 25         # v1.3: was 20, now 25
+    MAX_DAILY_TRADES: int = 30         # v1.4: was 25, now 30
     MAX_CONSECUTIVE_LOSSES: int = 5    # optimized (was 4)
 
     # ─── Spread Filter ────────────────────────────────────────────
