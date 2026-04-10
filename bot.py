@@ -1,22 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           XAUUSD GOLD SCALPER v1.2 (OPTIMIZED)              ║
+║           XAUUSD GOLD SCALPER v1.4 (SIGNAL AUDIT)           ║
 ║    True Scalping · 1M/5M · SMC + Mean Reversion             ║
 ║         MetaAPI Cloud SDK · Railway Deploy                   ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Built for real scalping on XAUUSD Gold:
-- 5M structure + 1M precision entries
-- 10-second cycle for fast execution
-- OPTIMIZED: ATR×1.0 SL, 1:2.5 RR, TP1 at 0.8R
-- 50/50 partial close system
-- Spread filter (skip when spread is too wide)
-- Session scalping: London + NY only
-- Asia range sweep entries
-- Round number reaction scalps
-- Momentum / exhaustion candle detection
-- Mean Reversion: Bollinger Bands + RSI + Stochastic RSI
-- Backtest: PF 1.31 | WR 55.8% | +54% return | DD 5.2%
+- v4 Signal Audit: 5 harmful signals removed
+- ATR×2.0 SL, 1:2.0 RR, TP1 at 0.6R
+- 8 proven signals: EMA, Sweep, OB, FVG, Momentum, MR, RSI Div, Double
+- Removed: Round Number, Wick, VWAP, Exhaustion, Session Levels
+- Backtest: WR 63.2% | PF 1.31 | +117% return | DD 3.3%
+- 549 trades in 60 days | 50/50 partial close
 """
 
 import os
@@ -83,31 +78,31 @@ class ScalpConfig:
     OVERLAP_START: int = 12
     OVERLAP_END: int = 15
 
-    # ─── Risk Management ─────────────────────────────────────────
+    # ─── Risk Management (v1.3 MORE TRADES) ─────────────────────
     RISK_PERCENT: float = 0.5          # lower risk per scalp
     MAX_DAILY_LOSS_PERCENT: float = 3.0
     MAX_TOTAL_DRAWDOWN_PERCENT: float = 10.0  # optimized (was 6.0)
-    MAX_CONCURRENT_TRADES: int = 2
-    MAX_DAILY_TRADES: int = 20         # scalpers need more room
+    MAX_CONCURRENT_TRADES: int = 3     # v1.3: was 2, now 3
+    MAX_DAILY_TRADES: int = 25         # v1.3: was 20, now 25
     MAX_CONSECUTIVE_LOSSES: int = 5    # optimized (was 4)
 
     # ─── Spread Filter ────────────────────────────────────────────
     MAX_SPREAD_POINTS: float = 3.5     # skip if spread > $3.50
     SPREAD_CHECK_ENABLED: bool = True
 
-    # ─── Scalp SL/TP (OPTIMIZED) ────────────────────────────────
+    # ─── Scalp SL/TP (v4 SIGNAL AUDIT OPTIMIZED) ────────────────
     ATR_PERIOD: int = 10               # shorter ATR for scalping
-    ATR_SL_MULTIPLIER: float = 1.0     # optimized (was 0.8)
-    MIN_SL_POINTS: float = 2.0         # optimized (was 1.5)
-    MAX_SL_POINTS: float = 10.0        # optimized (was 6.0)
-    DEFAULT_RR_RATIO: float = 2.5      # optimized (was 1.5)
-    LONDON_RR_RATIO: float = 2.5       # optimized (was 1.5)
-    NY_RR_RATIO: float = 2.5           # optimized (was 2.0)
-    OVERLAP_RR_RATIO: float = 2.5      # optimized (was 1.8)
+    ATR_SL_MULTIPLIER: float = 2.0     # v4: was 1.0, now 2.0 (ruimer = minder SL hits)
+    MIN_SL_POINTS: float = 2.0         # optimized
+    MAX_SL_POINTS: float = 10.0        # optimized
+    DEFAULT_RR_RATIO: float = 2.0      # v4: was 2.5, now 2.0 (meer TP hits = hogere WR)
+    LONDON_RR_RATIO: float = 2.0       # v4 optimized
+    NY_RR_RATIO: float = 2.0           # v4 optimized
+    OVERLAP_RR_RATIO: float = 2.0      # v4 optimized
 
-    # ─── Partial Close (OPTIMIZED) ───────────────────────────────
+    # ─── Partial Close (v4 OPTIMIZED) ────────────────────────────
     PARTIAL_PERCENT: float = 0.50      # close 50% at TP1
-    TP1_RR_RATIO: float = 0.8          # optimized (was 1.0) — earlier partial
+    TP1_RR_RATIO: float = 0.6          # v4: was 0.8, now 0.6 (sneller partial = meer wins)
     MOVE_SL_TO_BE: bool = True         # breakeven after TP1
 
     # ─── SMC Scalp Parameters ────────────────────────────────────
@@ -159,9 +154,9 @@ class ScalpConfig:
     MAIN_LOOP_SECONDS: int = 10        # fast 10-second cycle
     WATCHDOG_TIMEOUT: int = 600          # 10 min (was 180, too aggressive)
 
-    # ─── Cooldown (OPTIMIZED) ────────────────────────────────────
-    TRADE_COOLDOWN_SECONDS: int = 60   # optimized: 6 bars × 10s = 60s (was 120)
-    LOSS_COOLDOWN_SECONDS: int = 150   # optimized: 15 bars × 10s = 150s (was 300)
+    # ─── Cooldown (v4 SIGNAL AUDIT OPTIMIZED) ───────────────────
+    TRADE_COOLDOWN_SECONDS: int = 30   # v4: was 45, now 30s (CD 3 bars)
+    LOSS_COOLDOWN_SECONDS: int = 50    # v4: was 90, now 50s (CD 5 bars)
 
     # ─── Database ─────────────────────────────────────────────────
     DB_PATH: str = "gold_scalper.db"
@@ -266,6 +261,16 @@ class BotState:
         # Telegram
         self.last_tg_time: float = 0.0
         self.last_heartbeat_time: float = 0.0
+
+        # v1.3: Session level tracking
+        self.prev_session_high: float = 0.0
+        self.prev_session_low: float = 999999.0
+        self.current_session_high: float = 0.0
+        self.current_session_low: float = 999999.0
+        self.session_tracking_kz: str = ""
+
+        # v1.3: VWAP
+        self.vwap: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -843,6 +848,147 @@ class ScalpAnalyzer:
         reason_str = "MR:" + "+".join(reasons)
         return direction, score, reason_str
 
+    # ─── v1.3: VWAP Calculation ───────────────────────────────────
+    def calculate_vwap(self, candles: List[dict]) -> float:
+        """Volume Weighted Average Price — institutional reference level."""
+        if len(candles) < 5:
+            return 0.0
+        total_vp = 0.0
+        total_vol = 0.0
+        for c in candles:
+            typical = (c.get("high", 0) + c.get("low", 0) + c.get("close", 0)) / 3
+            vol = c.get("tickVolume", c.get("volume", 1))
+            if vol <= 0:
+                vol = 1
+            total_vp += typical * vol
+            total_vol += vol
+        return total_vp / total_vol if total_vol > 0 else 0.0
+
+    # ─── v1.3: Previous Session High/Low ──────────────────────────
+    def check_session_level_reaction(self, price: float, candle: dict,
+                                      session_high: float, session_low: float
+                                      ) -> Optional[Direction]:
+        """Check if price is reacting at previous session high/low."""
+        if session_high <= 0 or session_low >= 999999:
+            return None
+        buf = abs(session_high - session_low) * 0.05  # 5% buffer
+
+        ch = candle.get("high", 0)
+        cl = candle.get("low", 0)
+        cc = candle.get("close", 0)
+
+        # Rejection at previous session high → short
+        if ch >= session_high - buf and cc < session_high:
+            wick = ch - max(cc, candle.get("open", cc))
+            if wick > 0:
+                return Direction.SHORT
+
+        # Rejection at previous session low → long
+        if cl <= session_low + buf and cc > session_low:
+            wick = min(cc, candle.get("open", cc)) - cl
+            if wick > 0:
+                return Direction.LONG
+
+        return None
+
+    # ─── v1.3: Double Bottom / Top Detection ──────────────────────
+    def detect_double_pattern(self, candles: List[dict],
+                               swing_highs: List['SwingPoint'],
+                               swing_lows: List['SwingPoint']
+                               ) -> Optional[Direction]:
+        """Detect double bottom (buy) or double top (sell)."""
+        if len(candles) < 10:
+            return None
+
+        price = candles[-1].get("close", 0)
+        atr = self.atr(candles)
+        tolerance = atr * 0.3  # price must be within 30% of ATR
+
+        # Double bottom: two lows at similar level, price bouncing
+        if len(swing_lows) >= 2:
+            l1 = swing_lows[-2].price
+            l2 = swing_lows[-1].price
+            if abs(l1 - l2) < tolerance and price > max(l1, l2):
+                return Direction.LONG
+
+        # Double top: two highs at similar level, price falling
+        if len(swing_highs) >= 2:
+            h1 = swing_highs[-2].price
+            h2 = swing_highs[-1].price
+            if abs(h1 - h2) < tolerance and price < min(h1, h2):
+                return Direction.SHORT
+
+        return None
+
+    # ─── v1.3: ADX Trend Strength ─────────────────────────────────
+    def calculate_adx(self, candles: List[dict], period: int = 14) -> float:
+        """ADX: >25 = trending, <20 = ranging. Only trade when trending."""
+        if len(candles) < period * 2:
+            return 25.0  # default: neutral
+
+        plus_dm_list = []
+        minus_dm_list = []
+        tr_list = []
+
+        for i in range(1, len(candles)):
+            h = candles[i].get("high", 0)
+            l = candles[i].get("low", 0)
+            c = candles[i - 1].get("close", 0)
+            ph = candles[i - 1].get("high", 0)
+            pl = candles[i - 1].get("low", 0)
+
+            tr = max(h - l, abs(h - c), abs(l - c))
+            plus_dm = max(h - ph, 0) if (h - ph) > (pl - l) else 0
+            minus_dm = max(pl - l, 0) if (pl - l) > (h - ph) else 0
+
+            tr_list.append(tr)
+            plus_dm_list.append(plus_dm)
+            minus_dm_list.append(minus_dm)
+
+        if len(tr_list) < period:
+            return 25.0
+
+        # Smoothed averages
+        atr_smooth = sum(tr_list[:period])
+        plus_smooth = sum(plus_dm_list[:period])
+        minus_smooth = sum(minus_dm_list[:period])
+
+        dx_list = []
+        for i in range(period, len(tr_list)):
+            atr_smooth = atr_smooth - (atr_smooth / period) + tr_list[i]
+            plus_smooth = plus_smooth - (plus_smooth / period) + plus_dm_list[i]
+            minus_smooth = minus_smooth - (minus_smooth / period) + minus_dm_list[i]
+
+            if atr_smooth > 0:
+                plus_di = (plus_smooth / atr_smooth) * 100
+                minus_di = (minus_smooth / atr_smooth) * 100
+            else:
+                plus_di = minus_di = 0
+
+            di_sum = plus_di + minus_di
+            if di_sum > 0:
+                dx = abs(plus_di - minus_di) / di_sum * 100
+            else:
+                dx = 0
+            dx_list.append(dx)
+
+        if len(dx_list) < period:
+            return 25.0
+
+        adx = sum(dx_list[-period:]) / period
+        return adx
+
+    # ─── v1.3: VWAP Direction ─────────────────────────────────────
+    def vwap_signal(self, price: float, vwap: float) -> Optional[Direction]:
+        """Price above VWAP = bullish bias, below = bearish bias."""
+        if vwap <= 0:
+            return None
+        if price > vwap * 1.001:
+            return Direction.LONG
+        elif price < vwap * 0.999:
+            return Direction.SHORT
+        return None
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  SIGNAL GENERATOR
@@ -987,17 +1133,16 @@ class ScalpSignal:
             direction_votes[momentum] += 1
             reasons.append("momentum")
 
-        # 7. Exhaustion candle (reversal)
-        exhaustion = self.az.is_exhaustion_candle(last_candle)
-        if exhaustion:
-            direction_votes[exhaustion] += 1
-            reasons.append("exhaustion")
+        # 7. Exhaustion candle — DISABLED by v4 Signal Audit (costs $393)
+        # exhaustion = self.az.is_exhaustion_candle(last_candle)
+        # if exhaustion:
+        #     direction_votes[exhaustion] += 1
+        #     reasons.append("exhaustion")
 
-        # 8. Round number reaction
-        if self.az.near_round_number(price):
-            # round number adds to confluence but doesn't set direction
-            confluence += 1
-            reasons.append("round_num")
+        # 8. Round number — DISABLED by v4 Signal Audit (costs $853)
+        # if self.az.near_round_number(price):
+        #     confluence += 1
+        #     reasons.append("round_num")
 
         # 9. Mean Reversion (Bollinger + RSI + StochRSI)
         mr_signal = self.az.mean_reversion(self.state.candles_1m, price, self.cfg)
@@ -1005,6 +1150,35 @@ class ScalpSignal:
             mr_dir, mr_score, mr_reason = mr_signal
             direction_votes[mr_dir] += self.cfg.MR_CONFLUENCE_SCORE
             reasons.append(mr_reason)
+
+        # 10. v1.3: VWAP — DISABLED by v4 Signal Audit (costs $714)
+        # vwap_dir = self.az.vwap_signal(price, self.state.vwap)
+        # if vwap_dir:
+        #     direction_votes[vwap_dir] += 1
+        #     reasons.append("vwap")
+
+        # 11. v1.3: Session levels — DISABLED by v4 Signal Audit (costs $105)
+        # session_reaction = self.az.check_session_level_reaction(
+        #     price, last_candle,
+        #     self.state.prev_session_high, self.state.prev_session_low
+        # )
+        # if session_reaction:
+        #     direction_votes[session_reaction] += 2
+        #     reasons.append("session_lvl")
+
+        # 12. v1.3: Double bottom/top
+        double_pattern = self.az.detect_double_pattern(
+            self.state.candles_1m, highs_1m, lows_1m
+        )
+        if double_pattern:
+            direction_votes[double_pattern] += 1
+            reasons.append("dbl_pattern")
+
+        # 13. v1.3: ADX trend strength (skip if market is ranging)
+        adx = self.az.calculate_adx(self.state.candles_5m)
+        if adx >= 25:
+            confluence += 1  # trending market bonus
+            reasons.append(f"adx_{adx:.0f}")
 
         # ─── Determine direction ─────────────────────────────────
         long_score = direction_votes[Direction.LONG]
@@ -1251,12 +1425,13 @@ class GoldScalper:
 
         log.info(f"Connected! Balance: ${self.state.start_balance:.2f}")
         await self.tg.send(
-            f"🤖 <b>Gold Scalper v1.2 OPTIMIZED</b>\n"
+            f"🤖 <b>Gold Scalper v1.4 SIGNAL AUDIT</b>\n"
             f"Balance: ${self.state.start_balance:.2f}\n"
-            f"Mode: Scalping 1M/5M\n"
-            f"SL: ATR×1.0 | RR: 1:2.5 | TP1: 0.8R\n"
-            f"Backtest: PF 1.31 | WR 55.8%\n"
-            f"Max trades/day: {self.cfg.MAX_DAILY_TRADES}\n"
+            f"SL: ATR×2.0 | RR: 1:2.0 | TP1: 0.6R\n"
+            f"Signals: EMA|Sweep|OB|FVG|Mom|MR|RSI|Dbl\n"
+            f"Removed: RN|Wick|VWAP|Exh|Session\n"
+            f"Backtest: WR 63.2% | PF 1.31 | DD 3.3%\n"
+            f"Max concurrent: {self.cfg.MAX_CONCURRENT_TRADES}\n"
             f"Risk: {self.cfg.RISK_PERCENT}%"
         )
 
@@ -1354,7 +1529,29 @@ class GoldScalper:
 
         # Update session
         hour = datetime.now(timezone.utc).hour
-        self.state.session = self.sm.get(hour)
+        new_session = self.sm.get(hour)
+
+        # v1.3: Track session high/low for previous session levels
+        if new_session != self.state.session and self.state.session != Session.OFF:
+            # Session changed — save current as previous
+            self.state.prev_session_high = self.state.current_session_high
+            self.state.prev_session_low = self.state.current_session_low
+            self.state.current_session_high = price
+            self.state.current_session_low = price
+            log.info(f"Session changed: {self.state.session.value} → {new_session.value} | "
+                     f"Prev H/L: ${self.state.prev_session_high:.2f}/${self.state.prev_session_low:.2f}")
+        else:
+            # Update current session high/low
+            if price > self.state.current_session_high:
+                self.state.current_session_high = price
+            if price < self.state.current_session_low:
+                self.state.current_session_low = price
+
+        self.state.session = new_session
+
+        # v1.3: Calculate VWAP from 5M candles
+        if self.state.candles_5m:
+            self.state.vwap = self.az.calculate_vwap(self.state.candles_5m)
 
         # Sync closed trades
         await self.pos.sync_positions()
@@ -1377,7 +1574,9 @@ class GoldScalper:
                 f"Session: {self.state.session.value} | Tradeable: {tradeable} | "
                 f"5M: {len(self.state.candles_5m)}c | 1M: {len(self.state.candles_1m)}c | "
                 f"Trades: {self.state.daily_trades}/{self.cfg.MAX_DAILY_TRADES} | "
-                f"EMA: {self.state.ema_fast:.2f}/{self.state.ema_slow:.2f}"
+                f"EMA: {self.state.ema_fast:.2f}/{self.state.ema_slow:.2f} | "
+                f"VWAP: ${self.state.vwap:.2f} | "
+                f"PrevHL: ${self.state.prev_session_high:.2f}/${self.state.prev_session_low:.2f}"
             )
 
         # Check for new signal
