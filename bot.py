@@ -72,7 +72,7 @@ class ScalpConfig:
     OVERLAP_END: int = 15
 
     # ─── Risk Management (v1.3 MORE TRADES) ─────────────────────
-    RISK_PERCENT: float = 0.5          # lower risk per scalp
+    RISK_PERCENT: float = 1.0          # v1.5 optimized: $131/dag avg, 70.7% WR, DD 4.2%
     MAX_DAILY_LOSS_PERCENT: float = 3.0
     MAX_TOTAL_DRAWDOWN_PERCENT: float = 10.0  # optimized (was 6.0)
     MAX_CONCURRENT_TRADES: int = 3     # v1.3: was 2, now 3
@@ -99,7 +99,7 @@ class ScalpConfig:
     MOVE_SL_TO_BE: bool = True         # breakeven after TP1
 
     # ─── Trailing Stop for 33% Runner ────────────────────────────
-    USE_TRAILING_STOP: bool = True     # trail the runner after TP1
+    USE_TRAILING_STOP: bool = False    # backtest showed trail hurts PnL
     TRAIL_ACTIVATION_RR: float = 1.0   # start trailing at 1.0R profit
     TRAIL_DISTANCE_ATR: float = 0.8    # trail SL at ATR × 0.8 behind price
     TRAIL_STEP_POINTS: float = 0.5     # only move SL if it improves by $0.50+
