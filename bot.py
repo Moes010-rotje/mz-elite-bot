@@ -1,7 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           XAUUSD GOLD SCALPER v1.5 (73% WR)                ║
+║           XAUUSD GOLD SCALPER v1.5 (73% WR + RUNNER)        ║
 ║    ATR×2.5 | RR 1:2.0 | TP1 0.4R | 67% partial             ║
+║    33% runner with trailing stop — catches big moves         ║
 ║    Backtest: WR 73.7% | PF 1.46 | DD 2.4% | +72%           ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -96,6 +97,13 @@ class ScalpConfig:
     PARTIAL_PERCENT: float = 0.67      # v5: was 0.50, now 67% (meer winst pakken)
     TP1_RR_RATIO: float = 0.4          # v5: was 0.6, now 0.4 (sneller partial = hogere WR)
     MOVE_SL_TO_BE: bool = True         # breakeven after TP1
+
+    # ─── Trailing Stop for 33% Runner ────────────────────────────
+    USE_TRAILING_STOP: bool = True     # trail the runner after TP1
+    TRAIL_ACTIVATION_RR: float = 1.0   # start trailing at 1.0R profit
+    TRAIL_DISTANCE_ATR: float = 0.8    # trail SL at ATR × 0.8 behind price
+    TRAIL_STEP_POINTS: float = 0.5     # only move SL if it improves by $0.50+
+    REMOVE_TP_ON_TRAIL: bool = True    # remove fixed TP, let runner run
 
     # ─── SMC Scalp Parameters ────────────────────────────────────
     SWING_LOOKBACK: int = 3            # faster swing detection
@@ -380,7 +388,20 @@ class Telegram:
         )
 
     async def scalp_partial(self, t: ScalpTrade):
-        await self.send(f"✂️ <b>50% CLOSED</b> @ ${t.tp1:.2f} → SL to BE", silent=True)
+        await self.send(
+            f"✂️ <b>67% CLOSED</b> @ ${t.tp1:.2f} → SL to BE\n"
+            f"🏃 33% runner active — trailing enabled",
+            silent=True
+        )
+
+    async def runner_trailing(self, t: ScalpTrade, new_sl: float, profit_r: float):
+        if profit_r >= 2.0:  # only notify at significant levels
+            await self.send(
+                f"🎯 <b>RUNNER TRAILING</b>\n"
+                f"SL → ${new_sl:.2f} | Locked: {profit_r:.1f}R\n"
+                f"Entry: ${t.entry:.2f} | Let it run! 🏃",
+                silent=True
+            )
 
     async def scalp_closed(self, t: ScalpTrade):
         e = "✅" if t.pnl > 0 else "❌"
@@ -1315,6 +1336,73 @@ class PositionMgr:
             except Exception as e:
                 log.error(f"Partial error: {e}")
 
+    async def manage_trailing_stops(self, price: float):
+        """Trail SL on 33% runner after TP1 hit — catches big moves."""
+        if not self.cfg.USE_TRAILING_STOP:
+            return
+
+        for tid, t in list(self.state.active_trades.items()):
+            if t.phase != TradePhase.TP1_HIT:
+                continue
+
+            sl_dist_original = abs(t.entry - t.sl) if t.sl != t.entry else abs(t.tp - t.entry) / self.cfg.DEFAULT_RR_RATIO
+
+            # Calculate current profit in R
+            if t.direction == Direction.LONG:
+                current_profit = price - t.entry
+            else:
+                current_profit = t.entry - price
+
+            profit_r = current_profit / sl_dist_original if sl_dist_original > 0 else 0
+
+            # Only start trailing after activation level
+            if profit_r < self.cfg.TRAIL_ACTIVATION_RR:
+                continue
+
+            # Calculate new trailing SL
+            # Use ATR for trail distance, fallback to fixed if no candles
+            atr = self.az.atr(self.state.candles_1m) if self.state.candles_1m else 5.0
+            trail_dist = atr * self.cfg.TRAIL_DISTANCE_ATR
+
+            if t.direction == Direction.LONG:
+                new_sl = price - trail_dist
+                # Only move SL up, never down
+                if new_sl > t.sl + self.cfg.TRAIL_STEP_POINTS:
+                    try:
+                        # Remove TP to let runner run, or keep it
+                        tp_val = 0 if self.cfg.REMOVE_TP_ON_TRAIL else t.tp
+                        await asyncio.wait_for(
+                            self.conn.modify_position(tid, stop_loss=new_sl, take_profit=tp_val if tp_val > 0 else None),
+                            timeout=10
+                        )
+                        old_sl = t.sl
+                        t.sl = new_sl
+                        locked_profit = new_sl - t.entry
+                        log.info(f"🎯 TRAIL: {tid} | SL ${old_sl:.2f} → ${new_sl:.2f} | "
+                                f"Locked: ${locked_profit:.2f} ({profit_r:.1f}R) | Price: ${price:.2f}")
+                        await self.tg.runner_trailing(t, new_sl, profit_r)
+                    except Exception as e:
+                        log.error(f"Trail modify error: {e}")
+
+            elif t.direction == Direction.SHORT:
+                new_sl = price + trail_dist
+                # Only move SL down, never up
+                if new_sl < t.sl - self.cfg.TRAIL_STEP_POINTS:
+                    try:
+                        tp_val = 0 if self.cfg.REMOVE_TP_ON_TRAIL else t.tp
+                        await asyncio.wait_for(
+                            self.conn.modify_position(tid, stop_loss=new_sl, take_profit=tp_val if tp_val > 0 else None),
+                            timeout=10
+                        )
+                        old_sl = t.sl
+                        t.sl = new_sl
+                        locked_profit = t.entry - new_sl
+                        log.info(f"🎯 TRAIL: {tid} | SL ${old_sl:.2f} → ${new_sl:.2f} | "
+                                f"Locked: ${locked_profit:.2f} ({profit_r:.1f}R) | Price: ${price:.2f}")
+                        await self.tg.runner_trailing(t, new_sl, profit_r)
+                    except Exception as e:
+                        log.error(f"Trail modify error: {e}")
+
     async def sync_positions(self):
         try:
             positions = await self.conn.get_positions()
@@ -1417,10 +1505,11 @@ class GoldScalper:
 
         log.info(f"Connected! Balance: ${self.state.start_balance:.2f}")
         await self.tg.send(
-            f"🤖 <b>Gold Scalper v1.5 — 73% WR</b>\n"
+            f"🤖 <b>Gold Scalper v1.5 — 73% WR + RUNNER</b>\n"
             f"Balance: ${self.state.start_balance:.2f}\n"
             f"SL: ATR×2.5 | RR: 1:2.0 | TP1: 0.4R\n"
-            f"Partial: 67% | PF: 1.46 | DD: 2.4%\n"
+            f"67% partial → 33% runner with trailing SL\n"
+            f"Trail: ATR×0.8 after 1.0R profit\n"
             f"Max trades/day: {self.cfg.MAX_DAILY_TRADES}\n"
             f"Risk: {self.cfg.RISK_PERCENT}%"
         )
@@ -1548,6 +1637,9 @@ class GoldScalper:
 
         # Manage partials
         await self.pos.manage_partials(price)
+
+        # Trail runner after TP1
+        await self.pos.manage_trailing_stops(price)
 
         # Heartbeat to Telegram
         open_count = len(self.state.active_trades)
