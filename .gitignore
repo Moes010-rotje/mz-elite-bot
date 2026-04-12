@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+gold_scalper.log
+gold_scalper.db
+*.egg-info/
