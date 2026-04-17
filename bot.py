@@ -86,7 +86,7 @@ class ScalpConfig:
     # ─── Scalp SL/TP (v4 SIGNAL AUDIT OPTIMIZED) ────────────────
     ATR_PERIOD: int = 10               # shorter ATR for scalping
     ATR_SL_MULTIPLIER: float = 2.5     # v1.5 (73.7% WR winner)
-    MIN_SL_POINTS: float = 2.0         # optimized
+    MIN_SL_POINTS: float = 3.0         # v1.5.1: was 2.0, te krap voor XAUUSD noise
     MAX_SL_POINTS: float = 10.0        # optimized
     DEFAULT_RR_RATIO: float = 2.0      # v4: was 2.5, now 2.0 (meer TP hits = hogere WR)
     LONDON_RR_RATIO: float = 2.0       # v4 optimized
