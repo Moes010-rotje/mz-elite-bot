@@ -937,7 +937,7 @@ class ScalpAnalyzer:
     def calculate_adx(self, candles: List[dict], period: int = 14) -> float:
         """ADX: >25 = trending, <20 = ranging. Only trade when trending."""
         if len(candles) < period * 2:
-            return 25.0  # default: neutral
+            return 0.0
 
         plus_dm_list = []
         minus_dm_list = []
@@ -959,7 +959,7 @@ class ScalpAnalyzer:
             minus_dm_list.append(minus_dm)
 
         if len(tr_list) < period:
-            return 25.0
+            return 0.0
 
         # Smoothed averages
         atr_smooth = sum(tr_list[:period])
@@ -986,7 +986,7 @@ class ScalpAnalyzer:
             dx_list.append(dx)
 
         if len(dx_list) < period:
-            return 25.0
+            return 0.0
 
         adx = sum(dx_list[-period:]) / period
         return adx
@@ -1412,32 +1412,32 @@ class PositionMgr:
                 if tid not in open_ids and t.phase != TradePhase.CLOSED:
                     t.phase = TradePhase.CLOSED
 
-                    # Calculate PnL from price difference
+                    # PnL: try deals history first (accurate broker PnL)
                     try:
-                        tick = await self.conn.get_symbol_price(self.cfg.SYMBOL)
-                        close_price = tick.get("bid", 0) if t.direction == Direction.LONG else tick.get("ask", 0)
-                        if close_price > 0:
-                            if t.direction == Direction.LONG:
-                                t.pnl = (close_price - t.entry) * t.lots * 100  # 100 oz per lot
-                            else:
-                                t.pnl = (t.entry - close_price) * t.lots * 100
+                        now = datetime.now(timezone.utc).replace(tzinfo=None)
+                        start = now - timedelta(hours=1)
+                        history = await asyncio.wait_for(
+                            self.conn.get_deals_by_time_range(start, now),
+                            timeout=10
+                        )
+                        if history:
+                            for deal in history:
+                                if deal.get("positionId") == tid and deal.get("profit", 0) != 0:
+                                    t.pnl = deal.get("profit", 0) + deal.get("swap", 0) + deal.get("commission", 0)
+                                    break
                     except Exception:
                         pass
 
-                    # Fallback: try deals history
+                    # Fallback: estimate from current price
                     if t.pnl == 0:
                         try:
-                            now = datetime.now(timezone.utc).replace(tzinfo=None)
-                            start = now - timedelta(hours=1)
-                            history = await asyncio.wait_for(
-                                self.conn.get_deals_by_time_range(start, now),
-                                timeout=10
-                            )
-                            if history:
-                                for deal in history:
-                                    if deal.get("positionId") == tid and deal.get("profit", 0) != 0:
-                                        t.pnl = deal.get("profit", 0) + deal.get("swap", 0) + deal.get("commission", 0)
-                                        break
+                            tick = await self.conn.get_symbol_price(self.cfg.SYMBOL)
+                            close_price = tick.get("bid", 0) if t.direction == Direction.LONG else tick.get("ask", 0)
+                            if close_price > 0:
+                                if t.direction == Direction.LONG:
+                                    t.pnl = (close_price - t.entry) * t.lots * 100
+                                else:
+                                    t.pnl = (t.entry - close_price) * t.lots * 100
                         except Exception:
                             pass
 
@@ -1667,14 +1667,72 @@ class GoldScalper:
             direction, sl, tp1, tp, confluence, reason = signal
             await self.pos.open_scalp(direction, price, sl, tp1, tp, confluence, reason)
 
+    async def _reconnect(self):
+        """Reconnect to MetaAPI with 3 attempts + final attempt after 2 min."""
+        delays = [5, 10, 20]
+        for attempt, delay in enumerate(delays, 1):
+            try:
+                log.warning(f"Reconnect attempt {attempt}/3...")
+                if self.conn:
+                    try:
+                        await self.conn.close()
+                    except Exception:
+                        pass
+                await asyncio.sleep(delay)
+                self.conn = self.account.get_rpc_connection()
+                await self.conn.connect()
+                await asyncio.wait_for(self.conn.wait_synchronized(), timeout=30)
+                self.pos = PositionMgr(self.state, self.conn, self.db, self.tg)
+                log.info(f"Reconnected on attempt {attempt}")
+                await self.tg.send(f"🔄 <b>Reconnected</b> (attempt {attempt})")
+                return True
+            except Exception as e:
+                log.error(f"Reconnect attempt {attempt} failed: {e}")
+
+        # Final attempt after 2 min wait
+        log.warning("Final reconnect attempt after 2 min cooldown...")
+        await asyncio.sleep(120)
+        try:
+            if self.conn:
+                try:
+                    await self.conn.close()
+                except Exception:
+                    pass
+            self.conn = self.account.get_rpc_connection()
+            await self.conn.connect()
+            await asyncio.wait_for(self.conn.wait_synchronized(), timeout=60)
+            self.pos = PositionMgr(self.state, self.conn, self.db, self.tg)
+            log.info("Reconnected on final attempt")
+            await self.tg.send("🔄 <b>Reconnected</b> (final attempt)")
+            return True
+        except Exception as e:
+            log.critical(f"All reconnect attempts failed: {e}")
+            await self.tg.send(f"🛑 <b>Reconnect failed</b> — restarting bot")
+            return False
+
+    def _is_connection_error(self, error: Exception) -> bool:
+        err_str = str(error).lower()
+        return any(kw in err_str for kw in ("socket", "not connected", "timed out", "timeout", "connection", "disconnected"))
+
     async def run(self):
         log.info(f"Main loop started (cycle: {self.cfg.MAIN_LOOP_SECONDS}s)")
+        consecutive_errors = 0
         while self.state.running:
             try:
                 await self.cycle()
+                consecutive_errors = 0
             except Exception as e:
                 log.error(f"Cycle error: {e}", exc_info=True)
-                await self.tg.send(f"⚠️ Error: {str(e)[:100]}")
+                if self._is_connection_error(e):
+                    consecutive_errors += 1
+                    log.warning(f"Connection error {consecutive_errors}/3")
+                    if consecutive_errors >= 3:
+                        success = await self._reconnect()
+                        if not success:
+                            os._exit(1)
+                        consecutive_errors = 0
+                else:
+                    await self.tg.send(f"⚠️ Error: {str(e)[:100]}")
             await asyncio.sleep(self.cfg.MAIN_LOOP_SECONDS)
 
     async def start(self):
