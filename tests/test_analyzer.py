@@ -429,7 +429,7 @@ class TestADX:
 
     def test_adx_default_insufficient_data(self, analyzer):
         candles = [make_candle(100, 101, 99, 100)] * 5
-        assert analyzer.calculate_adx(candles) == 0.0
+        assert analyzer.calculate_adx(candles) == 25.0
 
     def test_adx_high_in_strong_trend(self, analyzer):
         candles = make_candles_uptrend(60, start=2000, step=5.0)

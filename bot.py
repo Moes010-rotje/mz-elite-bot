@@ -937,7 +937,7 @@ class ScalpAnalyzer:
     def calculate_adx(self, candles: List[dict], period: int = 14) -> float:
         """ADX: >25 = trending, <20 = ranging. Only trade when trending."""
         if len(candles) < period * 2:
-            return 0.0
+            return 25.0
 
         plus_dm_list = []
         minus_dm_list = []
@@ -959,7 +959,7 @@ class ScalpAnalyzer:
             minus_dm_list.append(minus_dm)
 
         if len(tr_list) < period:
-            return 0.0
+            return 25.0
 
         # Smoothed averages
         atr_smooth = sum(tr_list[:period])
@@ -986,7 +986,7 @@ class ScalpAnalyzer:
             dx_list.append(dx)
 
         if len(dx_list) < period:
-            return 0.0
+            return 25.0
 
         adx = sum(dx_list[-period:]) / period
         return adx
