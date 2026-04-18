@@ -1,9 +1,10 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           XAUUSD GOLD SCALPER v1.5.1 (BUGFIX)              ║
-║    ATR×2.5 | RR 1:2.0 | TP1 0.4R | 67% partial | 1% risk  ║
-║    Fixes: ADX always-pass, PnL tracking, reconnect logic    ║
-║    Backtest: WR 73.7% | PF 1.46 | DD 2.4%                  ║
+║           XAUUSD GOLD SCALPER v1.5.2 (WEEKLY TUNED)         ║
+║    Removed: Double Bottom (-$1,206), Sweep (-$284)           ║
+║    Skip: 07:00, 12:00, 16:00 UTC (bad hours)                ║
+║    Active: EMA, OB, FVG, Momentum, MR, ADX                  ║
+║    Expected: WR 76.8% | PF 1.53 | Consistent weekly green   ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -1025,6 +1026,11 @@ class ScalpSignal:
         if not self.sm.is_tradeable(hour):
             return None
 
+        # ─── Gate 1b: Skip bad hours (Weekly Analysis) ────────────
+        # 07:00 UTC = -$245, 12:00 UTC = -$518, 16:00 UTC = -$283
+        if hour in (7, 12, 16):
+            return None
+
         # ─── Gate 2: Spread ──────────────────────────────────────
         if self.cfg.SPREAD_CHECK_ENABLED and spread > self.cfg.MAX_SPREAD_POINTS:
             return None
@@ -1098,21 +1104,22 @@ class ScalpSignal:
             direction_votes[self.state.trend_5m] += 1
             reasons.append(f"ema_{self.state.trend_5m.value}")
 
-        # 2. Liquidity sweep on 1M
-        sweep = self.az.liquidity_sweep(self.state.candles_1m, highs_1m, lows_1m)
-        if sweep:
-            direction_votes[sweep] += 2
-            reasons.append("liq_sweep")
+        # 2. Liquidity sweep — DISABLED by Weekly Analysis (costs $284)
+        # sweep = self.az.liquidity_sweep(self.state.candles_1m, highs_1m, lows_1m)
+        # if sweep:
+        #     direction_votes[sweep] += 2
+        #     reasons.append("liq_sweep")
 
-        # 3. Asia range sweep (during London)
+        # 3. Asia range sweep — DISABLED by Weekly Analysis
+        # session = self.sm.get(hour)
+        # if session == Session.LONDON:
+        #     asia_sweep = self.az.asia_sweep(
+        #         price, self.state.asia_high, self.state.asia_low, last_candle
+        #     )
+        #     if asia_sweep:
+        #         direction_votes[asia_sweep] += 2
+        #         reasons.append("asia_sweep")
         session = self.sm.get(hour)
-        if session == Session.LONDON:
-            asia_sweep = self.az.asia_sweep(
-                price, self.state.asia_high, self.state.asia_low, last_candle
-            )
-            if asia_sweep:
-                direction_votes[asia_sweep] += 2
-                reasons.append("asia_sweep")
 
         # 4. Order block
         for ob in obs_1m:
@@ -1179,13 +1186,13 @@ class ScalpSignal:
         #     direction_votes[session_reaction] += 2
         #     reasons.append("session_lvl")
 
-        # 12. v1.3: Double bottom/top
-        double_pattern = self.az.detect_double_pattern(
-            self.state.candles_1m, highs_1m, lows_1m
-        )
-        if double_pattern:
-            direction_votes[double_pattern] += 1
-            reasons.append("dbl_pattern")
+        # 12. v1.3: Double bottom/top — DISABLED by Weekly Analysis (costs $1,206!)
+        # double_pattern = self.az.detect_double_pattern(
+        #     self.state.candles_1m, highs_1m, lows_1m
+        # )
+        # if double_pattern:
+        #     direction_votes[double_pattern] += 1
+        #     reasons.append("dbl_pattern")
 
         # 13. v1.3: ADX trend strength (skip if market is ranging)
         adx = self.az.calculate_adx(self.state.candles_5m)
@@ -1506,12 +1513,13 @@ class GoldScalper:
 
         log.info(f"Connected! Balance: ${self.state.start_balance:.2f}")
         await self.tg.send(
-            f"🤖 <b>Gold Scalper v1.5.1 BUGFIX</b>\n"
+            f"🤖 <b>Gold Scalper v1.5.2 WEEKLY TUNED</b>\n"
             f"Balance: ${self.state.start_balance:.2f}\n"
             f"SL: ATR×2.5 | RR: 1:2.0 | TP1: 0.4R\n"
-            f"Partial: 67% | Risk: {self.cfg.RISK_PERCENT}%\n"
-            f"Fixes: ADX, PnL tracking, reconnect\n"
-            f"Max trades/day: {self.cfg.MAX_DAILY_TRADES}"
+            f"Removed: Sweep, Double Pattern\n"
+            f"Skip hours: 07, 12, 16 UTC\n"
+            f"Active: EMA|OB|FVG|Mom|MR|ADX\n"
+            f"Risk: {self.cfg.RISK_PERCENT}%"
         )
 
     async def fetch_data(self):
