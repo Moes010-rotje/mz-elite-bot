@@ -72,7 +72,7 @@ class ScalpConfig:
     OVERLAP_END: int = 15
 
     # ─── Risk Management (v1.3 MORE TRADES) ─────────────────────
-    RISK_PERCENT: float = 1.0          # v1.5 optimized: $131/dag avg, 70.7% WR, DD 4.2%
+    RISK_PERCENT: float = 1.5          # v1.5.3: was 1.0, now 1.5 ($109/dag, DD 6.4%, alle maanden groen)
     MAX_DAILY_LOSS_PERCENT: float = 3.0
     MAX_TOTAL_DRAWDOWN_PERCENT: float = 10.0  # optimized (was 6.0)
     MAX_CONCURRENT_TRADES: int = 3     # v1.3: was 2, now 3
