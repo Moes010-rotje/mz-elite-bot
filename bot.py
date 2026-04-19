@@ -1,10 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║           XAUUSD GOLD SCALPER v1.5.2 (WEEKLY TUNED)         ║
-║    Removed: Double Bottom (-$1,206), Sweep (-$284)           ║
-║    Skip: 07:00, 12:00, 16:00 UTC (bad hours)                ║
-║    Active: EMA, OB, FVG, Momentum, MR, ADX                  ║
-║    Expected: WR 76.8% | PF 1.53 | Consistent weekly green   ║
+║           XAUUSD GOLD SCALPER v1.5.3 (MAX PROFIT)           ║
+║    ATR×2.5 | RR 1:2.0 | TP1 0.5R | 67% partial | 1% risk  ║
+║    Skip: 07, 12, 16 UTC | 6 signals active                  ║
+║    Backtest: +$6,784 | WR 73.7% | PF 1.62 | 10/11 GW       ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -96,7 +95,7 @@ class ScalpConfig:
 
     # ─── Partial Close (v4 OPTIMIZED) ────────────────────────────
     PARTIAL_PERCENT: float = 0.67      # v5: was 0.50, now 67% (meer winst pakken)
-    TP1_RR_RATIO: float = 0.4          # v5: was 0.6, now 0.4 (sneller partial = hogere WR)
+    TP1_RR_RATIO: float = 0.5          # v1.5.3: was 0.4, now 0.5 (+$1,243 meer winst)
     MOVE_SL_TO_BE: bool = True         # breakeven after TP1
 
     # ─── Trailing Stop for 33% Runner ────────────────────────────
@@ -1513,12 +1512,11 @@ class GoldScalper:
 
         log.info(f"Connected! Balance: ${self.state.start_balance:.2f}")
         await self.tg.send(
-            f"🤖 <b>Gold Scalper v1.5.2 WEEKLY TUNED</b>\n"
+            f"🤖 <b>Gold Scalper v1.5.3 MAX PROFIT</b>\n"
             f"Balance: ${self.state.start_balance:.2f}\n"
-            f"SL: ATR×2.5 | RR: 1:2.0 | TP1: 0.4R\n"
-            f"Removed: Sweep, Double Pattern\n"
-            f"Skip hours: 07, 12, 16 UTC\n"
-            f"Active: EMA|OB|FVG|Mom|MR|ADX\n"
+            f"SL: ATR×2.5 | RR: 1:2.0 | TP1: 0.5R\n"
+            f"Partial: 67% | Skip: 07,12,16 UTC\n"
+            f"Backtest: +$6,784 | 10/11 green weeks\n"
             f"Risk: {self.cfg.RISK_PERCENT}%"
         )
 
